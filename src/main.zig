@@ -611,7 +611,7 @@ pub fn main(init: std.process.Init) !void {
         // credential here (a failed probe would feed the brute-force lockout and
         // could lock the real admin out across restarts); instead advise operators
         // unconditionally to rotate it before exposing the server.
-        log.warn("SECURITY: ensure the bootstrap 'admin' account's default password ('admin') has been changed (ALTER USER admin PASSWORD ...) before exposing this server", .{});
+        log.warn("SECURITY: ensure the bootstrap 'admin' account's default password ('admin') has been changed (ALTER USER admin IDENTIFIED BY '...') before exposing this server", .{});
     }
 
     // Apply the configured result-materialisation cap before any connection is

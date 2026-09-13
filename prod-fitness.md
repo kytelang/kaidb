@@ -262,8 +262,10 @@ section 5.A are only warranted if kaidb targets general-purpose use.
    `exportSnapshot` live, so backups do not require a stopped server.
 5. **TLS-gate the password path** [DONE]. `security.require_tls_for_auth` refuses the
    cleartext-password challenge on a non-TLS connection (SQLSTATE 28000) and the data-plane
-   `TcpServer` now honours `config.tls` (4.3). Remaining follow-up: force/rotate the
-   bootstrap `admin` credential (still advisory-only).
+   `TcpServer` now honours `config.tls` (4.3). Credential rotation is now possible via
+   `ALTER USER name IDENTIFIED BY 'newpw'` (added this session; role preserved). Remaining
+   follow-up: *force* rotation of the bootstrap `admin` credential at startup (today it is
+   advisory-only, but the operator now has a working command to do it).
 6. **Connection governance** [small-medium]. Idle timeout, backpressure; surface the
    existing per-query deadline + memory cap in config.
 7. **Replication operations** [medium]. Lag monitoring, `promote`/failover command,

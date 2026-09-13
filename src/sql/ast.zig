@@ -92,6 +92,8 @@ pub const Statement = union(enum) {
     create_user: CreateUserStmt,
     /// `DROP USER`. See [`DropUserStmt`].
     drop_user: DropUserStmt,
+    /// `ALTER USER ... IDENTIFIED BY`. See [`AlterUserStmt`].
+    alter_user: AlterUserStmt,
     /// `LOGIN`, authenticate a session. See [`LoginStmt`].
     login: LoginStmt,
     /// `ALTER TABLE`, add a column or rename the table. See [`AlterTableStmt`].
@@ -675,6 +677,15 @@ pub const CreateUserStmt = struct {
 pub const DropUserStmt = struct {
     /// The user to remove.
     username: []const u8,
+};
+
+/// `ALTER USER name IDENTIFIED BY 'password'`, rotates a user's password.
+/// The role is preserved; only the stored credential changes.
+pub const AlterUserStmt = struct {
+    /// The user whose password is being changed.
+    username: []const u8,
+    /// The new password (as supplied in the statement text).
+    password: []const u8,
 };
 
 /// `LOGIN`, authenticates the current session as a user.

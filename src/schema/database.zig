@@ -1563,6 +1563,37 @@ pub const Database = struct {
         }
     }
 
+    /// Rotates an existing user's password in `sys.users`, preserving their role.
+    ///
+    /// Reads the live row to recover the current role string, then re-writes the
+    /// row through [`Database.registerUser`] (an MVCC update keyed on username)
+    /// with the new `password_hash`. Returns [`error.UserNotFound`] when there is
+    /// no live version. This is the storage half of `ALTER USER ... IDENTIFIED BY`.
+    pub fn updateUserPassword(self: *Database, username: []const u8, password_hash: []const u8, tx_id: u64) !void {
+        const user_table = self.catalog.getTable("sys.users") orelse return error.SystemTableNotFound;
+        const users_root = self.table_roots.get("sys.users") orelse return error.SystemTableNotFound;
+        var tree = try BPlusTree.init(self.pool, users_root, self.allocator);
+        defer tree.deinit();
+
+        const val = (try tree.search(username, self.allocator)) orelse return error.UserNotFound;
+        defer self.allocator.free(val);
+
+        const versions = try self.reconstructVersionChain(val, self.allocator);
+        defer {
+            for (versions) |*v| v.deinit(self.allocator);
+            self.allocator.free(versions);
+        }
+        if (versions.len == 0) return error.UserNotFound;
+        const latest = versions[versions.len - 1];
+        if (latest.xmax > 0) return error.UserNotFound;
+
+        const reader = row.RowReader.init(user_table, latest.fixed, latest.heap);
+        const role_str = try reader.readToString(self.allocator, "role");
+        defer self.allocator.free(role_str);
+
+        try self.registerUser(username, password_hash, role_str, tx_id);
+    }
+
     /// Marks a user as deleted in `sys.users` (MVCC tombstone) and logs it.
     ///
     /// Rather than erasing the row, it finds the live version (the one with

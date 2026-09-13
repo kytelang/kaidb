@@ -458,7 +458,14 @@ pub const SecurityManager = struct {
             }
 
             if (versions.len == 0) continue;
-            const latest = versions[versions.len - 1];
+            // `reconstructVersionChain` returns newest-first (index 0 is the
+            // current stored version; any undo history follows). The current
+            // state of the row is therefore versions[0]: a tombstone (xmax > 0)
+            // means the user is deleted, otherwise it is the live credential.
+            // (Reading versions[len-1] would pick the OLDEST image, which is only
+            // the same element for a never-updated single-version row; an in-place
+            // update such as ALTER USER would otherwise resurrect a stale row.)
+            const latest = versions[0];
             if (latest.xmax > 0) continue;
 
             const reader = RowReader.init(user_table, latest.fixed, latest.heap);

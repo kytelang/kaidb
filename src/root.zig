@@ -4363,6 +4363,65 @@ test "O4-TLS: require_tls_for_auth refuses cleartext password on a plaintext lin
     }
 }
 
+test "ALTER USER: IDENTIFIED BY rotates the password and preserves the role" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+
+    const p = "test_alteruser.db";
+    Io.Dir.deleteFile(.cwd(), io, p) catch {};
+    defer Io.Dir.deleteFile(.cwd(), io, p) catch {};
+
+    var db = try Database.open(allocator, io, p, 64, null);
+    defer db.close();
+    db.security_manager.enabled = true;
+
+    var ex = QueryExecutor.init(allocator, db);
+    defer ex.deinit();
+
+    var admin_token: ?[]const u8 = null;
+    defer if (admin_token) |t| allocator.free(t);
+    {
+        const res = try ex.execute(.{ .sql = "LOGIN admin 'admin'" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+        admin_token = try allocator.dupe(u8, res.rows[0][0]);
+    }
+    {
+        const res = try ex.execute(.{ .sql = "CREATE USER bob IDENTIFIED BY 'oldpw' ROLE 'read_only'", .session_token = admin_token });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+    }
+    // Old password authenticates before the change.
+    _ = try db.security_manager.authenticate("bob", "oldpw", null);
+
+    {
+        const res = try ex.execute(.{ .sql = "ALTER USER bob IDENTIFIED BY 'newpw'", .session_token = admin_token });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+        try std.testing.expectEqual(@as(u64, 1), res.rows_affected);
+    }
+
+    // Old password now rejected; new password accepted.
+    try std.testing.expectError(error.InvalidCredentials, db.security_manager.authenticate("bob", "oldpw", null));
+    _ = try db.security_manager.authenticate("bob", "newpw", null);
+
+    // Role preserved across the password change.
+    const sec = db.security_manager;
+    const bob = sec.users.get("bob") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@import("concurrency/security.zig").Role.read_only, bob.role);
+
+    // ALTER USER on a non-existent principal is a clean error, not a crash.
+    {
+        const res = try ex.execute(.{ .sql = "ALTER USER ghost IDENTIFIED BY 'x'", .session_token = admin_token });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message != null);
+    }
+}
+
 test "WRITER-CACHE: concurrent writers past the query-cache cap don't corrupt (regression)" {
     const alloc = std.heap.c_allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});

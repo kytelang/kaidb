@@ -1412,6 +1412,18 @@ pub const Parser = struct {
     /// `error.ExpectedDefaultValue` for a malformed `DEFAULT`.
     fn parseAlter(self: *Parser) !ast.Statement {
         self.eat();
+        // `ALTER USER name IDENTIFIED BY 'password'` rotates a credential; every
+        // other `ALTER` is `ALTER TABLE ...`.
+        if (self.current().type == .USER) {
+            self.eat();
+            const user_tok = try self.expect(.IDENTIFIER);
+            const username = self.sliceText(user_tok);
+            _ = try self.expect(.IDENTIFIED);
+            _ = try self.expect(.BY);
+            const pw_tok = try self.expect(.STRING);
+            const password = self.sliceText(pw_tok);
+            return .{ .alter_user = .{ .username = username, .password = password } };
+        }
         _ = try self.expect(.TABLE);
         const table_tok = try self.expect(.IDENTIFIER);
         const table_name = self.sliceText(table_tok);

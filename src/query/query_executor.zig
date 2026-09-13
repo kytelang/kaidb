@@ -454,7 +454,7 @@ fn mapSqlType(type_name: []const u8) ColumnType {
 /// writes. Read/transaction-control statements return false.
 fn isWriteStmt(stmt: ast.Statement) bool {
     return switch (stmt) {
-        .insert, .update, .delete, .create_table, .create_index, .create_sequence, .create_foreign_key, .drop_table, .drop_index, .drop_sequence, .drop_foreign_key, .import_stmt, .create_user, .drop_user, .alter_table, .create_role, .grant, .revoke => true,
+        .insert, .update, .delete, .create_table, .create_index, .create_sequence, .create_foreign_key, .drop_table, .drop_index, .drop_sequence, .drop_foreign_key, .import_stmt, .create_user, .drop_user, .alter_user, .alter_table, .create_role, .grant, .revoke => true,
         else => false,
     };
 }
@@ -4731,6 +4731,30 @@ pub const QueryExecutor = struct {
             .drop_user => |du| {
                 const tx_id = self.current_tx_id orelse 1;
                 try self.db.unregisterUser(du.username, tx_id);
+                try self.db.security_manager.loadUsers(self.db);
+
+                return QueryResponse{ .rows_affected = 1 };
+            },
+            .alter_user => |au| {
+                const tx_id = self.current_tx_id orelse 1;
+
+                var salt: [32]u8 = undefined;
+                std.Io.random(self.db.pool.pager.io, &salt);
+
+                const hash = try self.db.security_manager.hashKey(au.password, salt);
+                const hex_hash = try hexEncode(self.allocator, &hash);
+                defer self.allocator.free(hex_hash);
+                const hex_salt = try hexEncode(self.allocator, &salt);
+                defer self.allocator.free(hex_salt);
+                const password_hash = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ hex_hash, hex_salt });
+                defer self.allocator.free(password_hash);
+
+                self.db.updateUserPassword(au.username, password_hash, tx_id) catch |err| {
+                    if (err == error.UserNotFound) {
+                        return QueryResponse{ .error_message = try std.fmt.allocPrint(self.allocator, "user '{s}' does not exist", .{au.username}) };
+                    }
+                    return err;
+                };
                 try self.db.security_manager.loadUsers(self.db);
 
                 return QueryResponse{ .rows_affected = 1 };
