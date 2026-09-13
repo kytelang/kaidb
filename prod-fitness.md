@@ -8,12 +8,22 @@ Everything else is **[verified]** by reading the cited code.
 
 ## 1. Scope this audit judges against
 
-kaidb is scoped (decision of record) as the **embedded control-plane / config store
-for the Nova/Kyte orchestrator**: small, bounded, low-churn data (workload specs,
-leader leases, membership, manifests), typically fitting in RAM on a single node or a
-small primary+follower set. It is explicitly **not** positioned as a general-purpose
-OLTP/analytics engine. This document judges fitness for that scoped role first, and
-separately notes what a general-purpose ambition would additionally require.
+kaidb is positioned as a **single-node embedded relational engine for read-heavy,
+mostly-in-RAM workloads** (SQL, MVCC, WAL-backed durability, optional primary+follower
+replication). Its original narrower framing, the **control-plane / config store for the
+Nova/Kyte orchestrator**, remains the primary proven deployment; the wider framing is
+supported by this session's measurements (parity-to-2x of Postgres and ahead of
+InnoDB on 1M rows through an identical client) and is adopted deliberately.
+
+Three boundaries are explicit and non-negotiable rather than hand-waved:
+1. **Clustered-storage cost** on large secondary-index fan-out (see 4.8): fine until a
+   workload routinely ships thousands of rows via secondary indexes.
+2. **Single node**: no horizontal scale/sharding.
+3. **Operational surface** must be present for the wider claim (metrics/health landed
+   this session; PITR remains, see 5.B).
+
+This document judges fitness for that single-node relational role, and separately notes
+what a distributed/general-purpose ambition would additionally require.
 
 "Production-ready" here means: durable across crashes, safe under concurrency,
 authenticated, backup/restorable, observable, and operable. Benchmark speed is
@@ -36,7 +46,7 @@ with citations. Treat the verdicts as reliable; treat effort sizes as estimates.
 | Backup / restore | READY (cold) / hot is a follow-up | `main.zig`, `schema/database.zig` snapshot |
 | Replication / HA | USABLE, ops-thin | `schema/database.zig` fence + follower |
 | Resource governance | PARTIAL | `query_executor.zig`, `tcp_server.zig` |
-| Observability / metrics | MISSING | no `/metrics`, logs only |
+| Observability / metrics | PARTIAL (basics landed) | `main.zig` `/metrics` `/healthz` `/readyz` |
 | Point-in-time recovery | MISSING | snapshot+WAL primitives exist, no archiving |
 | Scale (general-purpose) | NOT A GOAL for scoped role | `btree.zig` clustered design |
 
@@ -154,15 +164,20 @@ Gaps [verified/estimate]: no idle-connection timeout, no explicit backpressure s
 when the pool is saturated, and the memory cap is per-query not global. Adequate for a
 low-connection control-plane client; needs the timeouts for a broader front door.
 
-### 4.7 Observability: MISSING (the biggest operability gap)
+### 4.7 Observability: PARTIAL (basics landed this session)
 
-- Only scoped `std.log` logging exists (e.g. `main.zig` `log.info`/`log.warn`). There is
-  **no metrics endpoint** (no `/metrics`), no health/readiness probe, and no structured
-  (JSON) log option. The HTTP front door exists (`main.zig` `schnell.Server`) and could
-  host these, but they are not implemented.
+- **Landed [measured]:** `GET /healthz` (liveness), `GET /readyz` (503 until the
+  database is open/not-closed), and a Prometheus `GET /metrics` on the existing HTTP
+  front door (`main.zig` `handleHttp`). `/metrics` exposes real counters: buffer-pool
+  size + resident pages, `fetches_total`, `evictions_total`, mmap borrow vs pread
+  serves, checksum failures, `next_tx_id`, and `current_lsn`. Verified live over HTTP.
+- **Still missing [verified]:** request-rate / latency histograms (no per-query timing
+  export yet), a split hit/miss ratio (only combined `fetches_total` today), WAL-size
+  and checkpoint-lag gauges, active-transaction and lock-wait gauges, replication-lag,
+  and a structured (JSON) log option.
 
-Assessment: this is the item most likely to bite in real operation, and it is entirely
-absent. High priority for the scoped role (see 5.B.3, 5.B.4).
+Assessment: the operability floor is now met (health, readiness, core engine
+counters); the richer query/replication telemetry remains a follow-up.
 
 ### 4.8 Storage design and scale: intentional trade-off
 
@@ -214,11 +229,11 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 
 ### 5.B Operational tooling (needed for the scoped role, in priority order)
 
-1. **Observability `/metrics`** [medium]. QPS, latency histogram, buffer-pool hit rate,
-   WAL size + checkpoint lag, active txns, lock waits, error counters, replication lag.
-   Host on the existing HTTP server. **Highest operational priority.**
-2. **Health / readiness probes + JSON logs** [small]. `/healthz`, `/readyz`
-   (recovered? follower caught up?), structured logging.
+1. **Observability `/metrics`** [DONE-partial]. Prometheus `/metrics` with core engine
+   counters is live (4.7). Remaining follow-ups: QPS/latency histograms, hit/miss split,
+   WAL-size + checkpoint-lag, active-txn/lock-wait, replication-lag gauges.
+2. **Health / readiness probes** [DONE]. `/healthz` + `/readyz` live (4.7). JSON
+   structured logging remains a small follow-up.
 3. **Point-in-time recovery** [medium]. Archive WAL segments (currently truncated after
    checkpoint by `runBgWriterTask`) + a `restore --target-lsn/--target-time` over a base
    snapshot. The snapshot + replay primitives already exist (4.4).
@@ -238,11 +253,14 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 
 ## 6. Recommended path for the scoped role
 
-To call kaidb production-ready **as the orchestrator control-plane store**, the
-required work is small and bounded: 5.B.1 (metrics), 5.B.2 (health probes), 5.B.3
-(PITR), and 5.B.5 (TLS-gate auth). None of the section 5.A scale items are needed for
-that role. If the ambition later widens to a general-purpose database, 5.A.1 (physical
-locator) is the first and largest lever.
+For the **single-node relational** role, the operability floor is now largely met:
+5.B.1 (metrics) and 5.B.2 (health/readiness) landed this session. The remaining
+required items are **5.B.3 (PITR)** and **5.B.5 (TLS-gate the password path)**; the
+richer telemetry (histograms, replication-lag) is a quality follow-up, not a gate.
+None of the section 5.A scale items are required for this role; the clustered-storage
+cost (4.8) is the boundary that bounds it. If the ambition later widens to a
+distributed/general-purpose database, 5.A.1 (physical row locator) is the first and
+largest lever, followed by 5.A.8 (partitioning).
 
 ## 7. Limitations of this audit
 

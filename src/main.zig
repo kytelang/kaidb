@@ -197,10 +197,72 @@ fn handleHttp(allocator: std.mem.Allocator, raw_request: []const u8, ctx: ?*anyo
     const s_ctx: *ServerContext = @ptrCast(@alignCast(ctx orelse return error.MissingServerContext));
 
     if (std.mem.startsWith(u8, raw_request, "GET ")) {
+        const path_end = std.mem.indexOf(u8, raw_request, " HTTP/") orelse raw_request.len;
+        const path = if (path_end > 4) raw_request[4..path_end] else "/";
+
+        // Operational endpoints (liveness, readiness, Prometheus metrics). Checked
+        // before the static store so they cannot be shadowed by a served file.
+        if (std.mem.eql(u8, path, "/healthz")) {
+            const body = "ok\n";
+            return try std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+        }
+        if (std.mem.eql(u8, path, "/readyz")) {
+            const ready = !@atomicLoad(bool, &s_ctx.executor.db.is_closed, .seq_cst);
+            const body: []const u8 = if (ready) "ready\n" else "not ready\n";
+            const status: []const u8 = if (ready) "200 OK" else "503 Service Unavailable";
+            return try std.fmt.allocPrint(allocator, "HTTP/1.1 {s}\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\n\r\n{s}", .{ status, body.len, body });
+        }
+        if (std.mem.eql(u8, path, "/metrics")) {
+            const pool = s_ctx.executor.db.pool;
+            const body = try std.fmt.allocPrint(allocator,
+                \\# HELP kaidb_up 1 when the server is serving.
+                \\# TYPE kaidb_up gauge
+                \\kaidb_up 1
+                \\# HELP kaidb_buffer_pool_size_pages Configured buffer-pool size in pages.
+                \\# TYPE kaidb_buffer_pool_size_pages gauge
+                \\kaidb_buffer_pool_size_pages {d}
+                \\# HELP kaidb_buffer_pool_resident_pages Pages currently backed by the file.
+                \\# TYPE kaidb_buffer_pool_resident_pages gauge
+                \\kaidb_buffer_pool_resident_pages {d}
+                \\# HELP kaidb_buffer_pool_fetches_total Total fetchPage calls (hits + misses).
+                \\# TYPE kaidb_buffer_pool_fetches_total counter
+                \\kaidb_buffer_pool_fetches_total {d}
+                \\# HELP kaidb_buffer_pool_evictions_total Total pages evicted.
+                \\# TYPE kaidb_buffer_pool_evictions_total counter
+                \\kaidb_buffer_pool_evictions_total {d}
+                \\# HELP kaidb_mmap_borrow_serves_total Read misses served from the mmap borrow.
+                \\# TYPE kaidb_mmap_borrow_serves_total counter
+                \\kaidb_mmap_borrow_serves_total {d}
+                \\# HELP kaidb_pread_serves_total Read misses served by a pread copy.
+                \\# TYPE kaidb_pread_serves_total counter
+                \\kaidb_pread_serves_total {d}
+                \\# HELP kaidb_checksum_failures_total Page checksum validation failures.
+                \\# TYPE kaidb_checksum_failures_total counter
+                \\kaidb_checksum_failures_total {d}
+                \\# HELP kaidb_next_tx_id Next transaction id (monotonic; proxy for txns started).
+                \\# TYPE kaidb_next_tx_id counter
+                \\kaidb_next_tx_id {d}
+                \\# HELP kaidb_current_lsn Current log sequence number / durability watermark.
+                \\# TYPE kaidb_current_lsn counter
+                \\kaidb_current_lsn {d}
+                \\
+            , .{
+                pool.pool_size,
+                pool.pager.num_pages,
+                pool.fetch_count.load(.monotonic),
+                pool.evict_count.load(.monotonic),
+                pool.borrow_serves.load(.monotonic),
+                pool.pread_serves.load(.monotonic),
+                pool.checksum_failed,
+                s_ctx.executor.db.txn_manager.next_tx_id,
+                pool.current_lsn.load(.monotonic),
+            });
+            defer allocator.free(body);
+            return try std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+        }
+
         if (s_ctx.static_store) |store| {
-            const path_end = std.mem.indexOf(u8, raw_request, " HTTP/") orelse raw_request.len;
             if (path_end > 4) {
-                const path = raw_request[4..path_end];
                 if (store.lookup(path)) |file| {
                     return try std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\n" ++
                         "Content-Type: {s}\r\n" ++
