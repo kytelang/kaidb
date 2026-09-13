@@ -99,6 +99,12 @@ pub const Config = struct {
         /// When true, a commit blocks until its WAL record is fsynced;
         /// when false it returns after buffering and relies on the flusher.
         synchronous_commit: bool = false,
+        /// Directory to which retired WAL segments are archived before deletion.
+        /// When non-empty, checkpoints and the age-based GC copy each segment
+        /// here first, preserving the complete WAL history for point-in-time
+        /// recovery. Empty (the default) means no archiving: segments are simply
+        /// removed once a checkpoint has made them redundant.
+        wal_archive_dir: []const u8 = "",
     } = .{},
     /// Size of the buffer pool in pages. `0` (the default) means **auto**: the
     /// server sizes the pool from physical RAM at startup (see

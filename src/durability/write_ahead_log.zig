@@ -435,6 +435,16 @@ pub const WriteAheadLog = struct {
     /// Retention window in days for [`WriteAheadLog.truncate`]'s age-based GC.
     retain_logs_days: u32,
 
+    /// When true, a segment about to be removed by a checkpoint truncation or by
+    /// the age-based GC is first copied to [`WriteAheadLog.archive_dir`]. This is
+    /// the retention half of point-in-time recovery: it preserves the complete
+    /// WAL history past the base backup so a later restore can replay forward to
+    /// any target LSN. Off by default (segments are just deleted).
+    log_archive_enabled: bool = false,
+    /// Destination directory for archived segments, duped into the log's own
+    /// allocator. Null when archiving is disabled.
+    archive_dir: ?[]const u8 = null,
+
     /// When true, every append flushes and syncs immediately (no batching). Set
     /// from [`WalConfigData.skip_buffers`].
     skip_buffers: bool = false,
@@ -478,6 +488,11 @@ pub const WriteAheadLog = struct {
             .max_buffer_size = buf_size,
             .max_file_size = config.max_file_size,
             .retain_logs_days = config.retain_logs_days,
+            .log_archive_enabled = config.log_archive_enabled,
+            .archive_dir = if (config.log_archive_enabled and config.log_archive_dest_path.len > 0)
+                try allocator.dupe(u8, config.log_archive_dest_path)
+            else
+                null,
             .header = .{},
             .now = Now{ .io = io },
             .flush_interval_in_ms = config.flush_interval_in_ms,
@@ -545,6 +560,7 @@ pub const WriteAheadLog = struct {
         }
         self.buffer.deinit();
         self.allocator.free(self.dir_path);
+        if (self.archive_dir) |ad| self.allocator.free(ad);
         self.allocator.destroy(self);
     }
 
@@ -824,6 +840,43 @@ pub const WriteAheadLog = struct {
     /// number, and unlinks the older ones. Individual delete failures are logged
     /// and skipped rather than aborting the sweep, and a directory it cannot open
     /// is treated as nothing to do.
+    /// Enables (or reconfigures) WAL archiving at runtime. Duplicates `dir` into
+    /// the log's own allocator and creates it. Used by the server to turn on
+    /// point-in-time-recovery retention from configuration after the log opens,
+    /// without threading the setting through every `open` signature.
+    pub fn setArchive(self: *WriteAheadLog, dir: []const u8) !void {
+        self.wal_mutex.lockUncancelable(self.io);
+        defer self.wal_mutex.unlock(self.io);
+        if (self.archive_dir) |old| self.allocator.free(old);
+        Dir.createDirPath(.cwd(), self.io, dir) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+        self.archive_dir = try self.allocator.dupe(u8, dir);
+        self.log_archive_enabled = true;
+    }
+
+    /// Copies segment `seq` from the active WAL directory to the archive
+    /// directory, preserving its name. A no-op when archiving is disabled. A
+    /// failure to archive is fatal to the truncation that would follow, because
+    /// deleting a segment we failed to archive would silently punch a hole in the
+    /// point-in-time-recovery history.
+    fn archiveSegment(self: *WriteAheadLog, seq: u64) !void {
+        const dest_dir = self.archive_dir orelse return;
+        const src = self.getFilePath(seq) catch return;
+        defer self.allocator.free(src);
+        const dst = try fmt.allocPrint(self.allocator, "{s}/{d:0>6}.wal", .{ dest_dir, seq });
+        defer self.allocator.free(dst);
+        const bytes = Dir.readFileAlloc(.cwd(), self.io, src, self.allocator, .unlimited) catch |err| {
+            if (err == error.FileNotFound) return;
+            return err;
+        };
+        defer self.allocator.free(bytes);
+        const of = try Dir.createFile(.cwd(), self.io, dst, .{ .truncate = true });
+        defer of.close(self.io);
+        try of.writeStreamingAll(self.io, bytes);
+        try of.sync(self.io);
+    }
+
     pub fn truncateActiveLogs(self: *WriteAheadLog, checkpoint_seq: u64) !void {
         var wal_dir = Dir.openDir(.cwd(), self.io, self.dir_path, .{ .iterate = true }) catch return;
         defer wal_dir.close(self.io);
@@ -836,6 +889,13 @@ pub const WriteAheadLog = struct {
             const seq = fmt.parseUnsigned(u64, seq_str, 10) catch continue;
 
             if (seq < checkpoint_seq) {
+                if (self.log_archive_enabled) {
+                    self.archiveSegment(seq) catch |err| {
+                        // Keep the segment rather than lose PITR history.
+                        log.warn("truncateActiveLogs: archive of {s} failed ({}); retaining segment", .{ entry.name, err });
+                        continue;
+                    };
+                }
                 const file_path = self.getFilePath(seq) catch continue;
                 defer self.allocator.free(file_path);
                 Dir.deleteFile(.cwd(), self.io, file_path) catch |err| {
@@ -888,6 +948,13 @@ pub const WriteAheadLog = struct {
 
             const file_mtime: i128 = stat.mtime.toNanoseconds();
             if (file_mtime >= cutoff_ns) continue;
+
+            if (self.log_archive_enabled) {
+                self.archiveSegment(seq) catch |err| {
+                    log.warn("truncate: archive of {s} failed ({}); retaining segment", .{ entry.name, err });
+                    continue;
+                };
+            }
 
             Dir.deleteFile(.cwd(), self.io, file_path) catch |err| {
                 log.warn("truncate: failed to delete {s}: {}", .{ entry.name, err });

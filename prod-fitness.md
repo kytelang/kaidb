@@ -19,8 +19,8 @@ Three boundaries are explicit and non-negotiable rather than hand-waved:
 1. **Clustered-storage cost** on large secondary-index fan-out (see 4.8): fine until a
    workload routinely ships thousands of rows via secondary indexes.
 2. **Single node**: no horizontal scale/sharding.
-3. **Operational surface** must be present for the wider claim (metrics/health landed
-   this session; PITR remains, see 5.B).
+3. **Operational surface** must be present for the wider claim (metrics/health/PITR
+   landed this session; TLS-gating the password path remains, see 5.B).
 
 This document judges fitness for that single-node relational role, and separately notes
 what a distributed/general-purpose ambition would additionally require.
@@ -47,10 +47,10 @@ with citations. Treat the verdicts as reliable; treat effort sizes as estimates.
 | Replication / HA | USABLE, ops-thin | `schema/database.zig` fence + follower |
 | Resource governance | PARTIAL | `query_executor.zig`, `tcp_server.zig` |
 | Observability / metrics | PARTIAL (basics landed) | `main.zig` `/metrics` `/healthz` `/readyz` |
-| Point-in-time recovery | MISSING | snapshot+WAL primitives exist, no archiving |
+| Point-in-time recovery | READY (LSN target) | WAL archiving + `restore --archive --target-lsn`; time-target follow-up |
 | Scale (general-purpose) | NOT A GOAL for scoped role | `btree.zig` clustered design |
 
-Bottom line: **fit for the scoped control-plane role once observability + PITR land**;
+Bottom line: **fit for the scoped control-plane role** (observability + PITR now landed);
 not intended as a general-purpose DB, and the scale items are only required if that
 ambition changes.
 
@@ -135,7 +135,9 @@ Assessment: the mechanism is real and enforceable; production use requires enabl
   (run against a stopped server). A live/hot backup would call `exportSnapshot` in-process
   via a server command (see 5.B.2).
 
-Assessment: reliable cold backup/restore today; hot backup and PITR are the gaps.
+Assessment: reliable cold backup/restore today; PITR (LSN target) landed this session
+via WAL archiving + `restore --archive --target-lsn` (see 5.B.3); hot (online) backup
+is the remaining gap.
 
 ### 4.5 Replication and HA: USABLE, operationally thin
 
@@ -234,9 +236,18 @@ section 5.A are only warranted if kaidb targets general-purpose use.
    WAL-size + checkpoint-lag, active-txn/lock-wait, replication-lag gauges.
 2. **Health / readiness probes** [DONE]. `/healthz` + `/readyz` live (4.7). JSON
    structured logging remains a small follow-up.
-3. **Point-in-time recovery** [medium]. Archive WAL segments (currently truncated after
-   checkpoint by `runBgWriterTask`) + a `restore --target-lsn/--target-time` over a base
-   snapshot. The snapshot + replay primitives already exist (4.4).
+3. **Point-in-time recovery** [DONE (LSN target); time-target is a follow-up].
+   WAL archiving landed this session: with `durability.wal_archive_dir` set, a checkpoint
+   truncation and the age-based GC copy each retired segment into the archive before
+   deleting it (`write_ahead_log.zig` `setArchive`/`archiveSegment`, hooked into
+   `truncateActiveLogs` and `truncate`), so the full history past a base backup survives.
+   `novadb restore <snap> <dest> --archive=<dir> --target-lsn=N` (`main.zig`) lays down the
+   base snapshot, merges the archived segments (archive-wins on overlap), then opens with
+   `openAt(target_lsn=N)` and closes, materialising the database exactly as of LSN N.
+   Proven by a red->green test ("P7 PITR: archived WAL survives checkpoints and restores to
+   a target LSN", `root.zig`) that checkpoints the target segments out of the live WAL and
+   restores from snapshot + archive only. Remaining follow-up: a `--target-time` wall-clock
+   selector (needs a timestamp index over archived segments; LSN targeting is the primitive).
 4. **Hot (online) backup** [medium]. Server-side `BACKUP DATABASE TO ...` using
    `exportSnapshot` live, so backups do not require a stopped server.
 5. **TLS-gate the password path** [small]. Refuse cleartext-password startup on a
@@ -254,8 +265,8 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 ## 6. Recommended path for the scoped role
 
 For the **single-node relational** role, the operability floor is now largely met:
-5.B.1 (metrics) and 5.B.2 (health/readiness) landed this session. The remaining
-required items are **5.B.3 (PITR)** and **5.B.5 (TLS-gate the password path)**; the
+5.B.1 (metrics), 5.B.2 (health/readiness), and 5.B.3 (PITR, LSN target) landed this
+session. The remaining required item is **5.B.5 (TLS-gate the password path)**; the
 richer telemetry (histograms, replication-lag) is a quality follow-up, not a gate.
 None of the section 5.A scale items are required for this role; the clustered-storage
 cost (4.8) is the boundary that bounds it. If the ambition later widens to a

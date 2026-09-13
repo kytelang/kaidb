@@ -2850,6 +2850,132 @@ test "P7 PITR: openAt replays the archived WAL forward to a target seq" {
     }
 }
 
+test "P7 PITR: archived WAL survives checkpoints and restores to a target LSN" {
+    // This is the real point-in-time-recovery path: unlike the sibling test that
+    // copies the live WAL dir wholesale, here every relevant segment is retired by
+    // a CHECKPOINT (which truncates it out of the live dir) and survives ONLY
+    // because WAL archiving copied it aside first. The restore then reads from the
+    // base snapshot plus the ARCHIVE, never touching the live WAL, and still lands
+    // exactly on the target LSN.
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+
+    const src_path = "test_pitr2_src.db";
+    const src_wal = "test_pitr2_src_wal";
+    const arch_dir = "test_pitr2_archive";
+    const snap_dir = "test_pitr2_snapshot";
+    const dst_path = "test_pitr2_restored.db";
+    const dst_wal = "test_pitr2_restored_wal";
+    for ([_][]const u8{ src_path, dst_path }) |p| Io.Dir.deleteFile(.cwd(), io, p) catch {};
+    for ([_][]const u8{ src_wal, arch_dir, snap_dir, dst_wal }) |d| Io.Dir.deleteTree(.cwd(), io, d) catch {};
+    defer for ([_][]const u8{ src_path, dst_path }) |p| Io.Dir.deleteFile(.cwd(), io, p) catch {};
+    defer for ([_][]const u8{ src_wal, arch_dir, snap_dir, dst_wal }) |d| Io.Dir.deleteTree(.cwd(), io, d) catch {};
+
+    var cap = ReplCapture{ .allocator = allocator };
+    defer cap.deinit();
+    var target_l7: u64 = 0;
+    {
+        var db = try Database.open(allocator, io, src_path, 64, src_wal);
+        defer db.close();
+        try db.wal.?.setArchive(arch_dir);
+        db.wal.?.ship_callback = &ReplCapture.cb;
+        db.wal.?.replication_manager = @ptrCast(&cap);
+
+        var ex = QueryExecutor.init(allocator, db);
+        defer ex.deinit();
+        freeResp(allocator, try ex.execute(.{ .sql = "CREATE TABLE kv (id INT PRIMARY KEY, v TEXT)" }));
+
+        // Base data, checkpointed into the data file, then captured as the backup.
+        var i: i64 = 1;
+        while (i <= 5) : (i += 1) {
+            const sql = try std.fmt.allocPrint(allocator, "INSERT INTO kv (id, v) VALUES ({d}, 'row{d}')", .{ i, i });
+            defer allocator.free(sql);
+            freeResp(allocator, try ex.execute(.{ .sql = sql }));
+        }
+        try db.wal.?.checkpoint();
+        try db.exportSnapshot(snap_dir);
+
+        // Post-backup history. id 7 is our recovery target; everything after must
+        // be excluded by the replay.
+        while (i <= 15) : (i += 1) {
+            const sql = try std.fmt.allocPrint(allocator, "INSERT INTO kv (id, v) VALUES ({d}, 'row{d}')", .{ i, i });
+            defer allocator.free(sql);
+            freeResp(allocator, try ex.execute(.{ .sql = sql }));
+            if (i == 7) target_l7 = cap.records.items[cap.records.items.len - 1].lsn;
+        }
+
+        // Two checkpoints retire the segments holding ids 6..15 out of the live
+        // WAL directory. Archiving must have copied them aside first.
+        try db.wal.?.checkpoint();
+        try db.wal.?.checkpoint();
+    }
+    try std.testing.expect(target_l7 > 0);
+
+    // Prove the archive actually captured segments (the checkpoints truncated the
+    // live dir, so recovery must lean on these copies).
+    {
+        var ad = try Io.Dir.openDir(.cwd(), io, arch_dir, .{ .iterate = true });
+        defer ad.close(io);
+        var n: usize = 0;
+        var it = ad.iterate();
+        while (it.next(io) catch null) |e| {
+            if (e.kind == .file and std.mem.endsWith(u8, e.name, ".wal")) n += 1;
+        }
+        try std.testing.expect(n >= 1);
+    }
+
+    // Restore: base snapshot + archived WAL only. The live src_wal is never read.
+    try Database.restoreSnapshot(allocator, io, snap_dir, dst_path, dst_wal);
+    {
+        var asrc = try Io.Dir.openDir(.cwd(), io, arch_dir, .{ .iterate = true });
+        defer asrc.close(io);
+        var it = asrc.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".wal")) continue;
+            const sp = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ arch_dir, entry.name });
+            defer allocator.free(sp);
+            const b = std.Io.Dir.readFileAlloc(.cwd(), io, sp, allocator, .unlimited) catch continue;
+            defer allocator.free(b);
+            const dp = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dst_wal, entry.name });
+            defer allocator.free(dp);
+            const of = try std.Io.Dir.createFile(.cwd(), io, dp, .{ .truncate = true });
+            defer of.close(io);
+            try of.writeStreamingAll(io, b);
+            try of.sync(io);
+        }
+    }
+
+    {
+        var db = try Database.openAt(allocator, io, dst_path, 64, dst_wal, target_l7);
+        defer db.close();
+        var ex = QueryExecutor.init(allocator, db);
+        defer ex.deinit();
+        // At/under the target: present.
+        for ([_]i64{ 1, 5, 6, 7 }) |id| {
+            const sql = try std.fmt.allocPrint(allocator, "SELECT v FROM kv WHERE id = {d}", .{id});
+            defer allocator.free(sql);
+            const res = try ex.execute(.{ .sql = sql });
+            defer freeResp(allocator, res);
+            try std.testing.expect(res.error_message == null);
+            try std.testing.expectEqual(@as(usize, 1), res.rows.len);
+        }
+        // Past the target: absent.
+        for ([_]i64{ 8, 10, 12, 15 }) |id| {
+            const sql = try std.fmt.allocPrint(allocator, "SELECT v FROM kv WHERE id = {d}", .{id});
+            defer allocator.free(sql);
+            const res = try ex.execute(.{ .sql = sql });
+            defer freeResp(allocator, res);
+            try std.testing.expect(res.error_message == null);
+            try std.testing.expectEqual(@as(usize, 0), res.rows.len);
+        }
+    }
+}
+
 test "P8 chaos: a corrupted shipped frame is detected and never applied" {
     const allocator = std.testing.allocator;
     var threaded = std.Io.Threaded.init(allocator, .{});

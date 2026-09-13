@@ -420,9 +420,28 @@ pub fn main(init: std.process.Init) !void {
         // Restore: `novadb restore <snapshot_dir> <dest_base_dir>` reconstructs a data
         // directory from a snapshot (copies snapshot.db -> nova.db and the WAL back);
         // the next server start on <dest_base_dir> runs recovery over it.
+        //
+        // Point-in-time recovery (PITR): add
+        //   --archive=<dir>       merge archived WAL segments into the restored log
+        //   --target-lsn=<N>      replay only up to LSN N, then materialise that state
+        // Together these reconstruct the database as it was at LSN N: the base
+        // snapshot supplies pages up to its checkpoint, the archived segments
+        // supply the history past it, and the replay stops at the target.
         if (args.len >= 4 and std.mem.eql(u8, args[1], "restore")) {
             const snap = args[2];
             const dest_base = args[3];
+            var target_lsn: u64 = 0;
+            var archive_dir: ?[]const u8 = null;
+            for (args[4..]) |a| {
+                if (std.mem.startsWith(u8, a, "--target-lsn=")) {
+                    target_lsn = std.fmt.parseUnsigned(u64, a["--target-lsn=".len..], 10) catch {
+                        log.err("invalid --target-lsn value: {s}", .{a});
+                        return error.InvalidArgument;
+                    };
+                } else if (std.mem.startsWith(u8, a, "--archive=")) {
+                    archive_dir = a["--archive=".len..];
+                }
+            }
             try Io.Dir.createDirPath(.cwd(), io, dest_base);
             const dbf = try std.fmt.allocPrint(allocator, "{s}/nova.db", .{dest_base});
             defer allocator.free(dbf);
@@ -430,7 +449,48 @@ pub fn main(init: std.process.Init) !void {
             defer allocator.free(wdir);
             log.info("restoring {s} -> {s} ...", .{ snap, dest_base });
             try Database.restoreSnapshot(allocator, io, snap, dbf, wdir);
-            log.info("restore complete: {s}", .{dest_base});
+
+            // Merge archived segments into the restored WAL, filling the history
+            // between the snapshot's checkpoint and the target. The archive copy
+            // wins on overlap: an archived segment was sealed at truncation, so it
+            // is the final, complete version, whereas the snapshot may have caught
+            // that same segment mid-write. Segments only the snapshot carries (the
+            // tail segment that was never retired) are left in place.
+            if (archive_dir) |adir| {
+                var copied: usize = 0;
+                var asrc = Io.Dir.openDir(.cwd(), io, adir, .{ .iterate = true }) catch {
+                    log.err("could not open archive dir {s}", .{adir});
+                    return error.InvalidArgument;
+                };
+                defer asrc.close(io);
+                var ait = asrc.iterate();
+                while (ait.next(io) catch null) |entry| {
+                    if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".wal")) continue;
+                    const sp = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ adir, entry.name });
+                    defer allocator.free(sp);
+                    const b = Io.Dir.readFileAlloc(.cwd(), io, sp, allocator, .unlimited) catch continue;
+                    defer allocator.free(b);
+                    const dp = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ wdir, entry.name });
+                    defer allocator.free(dp);
+                    const of = try Io.Dir.createFile(.cwd(), io, dp, .{ .truncate = true });
+                    defer of.close(io);
+                    try of.writeStreamingAll(io, b);
+                    try of.sync(io);
+                    copied += 1;
+                }
+                log.info("merged {d} archived WAL segment(s) from {s}", .{ copied, adir });
+            }
+
+            if (target_lsn != 0) {
+                // Open at the target LSN so recovery replays only up to N, then
+                // close so the recovered-to-N state is checkpointed into nova.db.
+                // A later plain open sees a clean database as of the target.
+                var rdb = try Database.openAt(allocator, io, dbf, 8192, wdir, target_lsn);
+                rdb.close();
+                log.info("restore complete: {s} (point-in-time: LSN <= {d})", .{ dest_base, target_lsn });
+            } else {
+                log.info("restore complete: {s}", .{dest_base});
+            }
             return;
         }
     }
@@ -475,6 +535,20 @@ pub fn main(init: std.process.Init) !void {
         try Database.open(allocator, io, db_file_path, pool_pages, wal_dir);
     defer db.close();
     db.security_manager.enabled = config.security.enabled;
+
+    // Point-in-time-recovery retention: when an archive directory is configured,
+    // enable WAL archiving so checkpoints copy each retired segment aside instead
+    // of deleting it. A later `restore --target-lsn` replays the base backup
+    // forward over these segments to any point in the history.
+    if (config.durability.wal_archive_dir.len > 0) {
+        if (db.wal) |w| {
+            w.setArchive(config.durability.wal_archive_dir) catch |err| {
+                log.err("could not enable WAL archiving at {s}: {any}", .{ config.durability.wal_archive_dir, err });
+                return err;
+            };
+            log.info("WAL archiving enabled -> {s}", .{config.durability.wal_archive_dir});
+        }
+    }
 
     if (init.environ_map.get("PRIMARY")) |v| config.primary = std.mem.eql(u8, v, "true");
     if (init.environ_map.get("REPLICA_ENABLED")) |v| config.replica.enabled = std.mem.eql(u8, v, "true");
