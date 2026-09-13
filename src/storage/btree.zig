@@ -107,6 +107,12 @@ const Frame = page_pool.Frame;
 /// otherwise infinite loop into a clean error.
 const MAX_TREE_DEPTH: u32 = 32;
 
+/// TEST-ONLY: milliseconds `mergePages` sleeps between unpinning the merged-away
+/// page and discarding it. Zero in production (no effect). A test raises it to
+/// widen that window so any pin that wrongly outlives a merge is deterministically
+/// caught by `discardPage`'s pin check. See the pin-lifetime regression test.
+pub var fault_merge_yield_ms: u32 = 0;
+
 /// Forward, shared-latch cursor over the whole leaf chain.
 ///
 /// Yields cells in key order by walking `next_page_id` from a starting leaf.
@@ -870,8 +876,13 @@ pub const BPlusTree = struct {
 
             if (lid == self.root_page_id) {
                 if (!is_leaf and num_cells == 0) {
-                    const rf = try self.pool.fetchPage(self.root_page_id);
-                    defer self.pool.unpinPage(self.root_page_id, true);
+                    // `lid` IS the old root here (lid == self.root_page_id). Unpin `lid`
+                    // EXPLICITLY, not via `defer unpinPage(self.root_page_id)`: the defer
+                    // expression is evaluated at scope exit, by which point
+                    // self.root_page_id has been reassigned to new_root, so it would
+                    // unpin the NEW root and leave the OLD root pinned — tripping
+                    // PageStillPinned on the discard below (observed page=root pin=1).
+                    const rf = try self.pool.fetchPage(lid);
                     const root_p = self.pool.pageOf(rf);
                     const new_root = root_p.headerPtr().leftmost_child_id;
                     if (new_root != 0) {
@@ -879,7 +890,10 @@ pub const BPlusTree = struct {
                         const nrf = try self.pool.fetchPage(new_root);
                         self.pool.pageOf(nrf).headerPtr().parent_page_id = 0;
                         self.pool.unpinPage(new_root, true);
-                        try self.pool.discardPage(lid);
+                        self.pool.unpinPage(lid, true); // release old root before discard
+try self.pool.discardPage(lid);
+                    } else {
+                        self.pool.unpinPage(lid, true);
                     }
                 }
             } else {
@@ -1318,14 +1332,22 @@ pub const BPlusTree = struct {
                 return self.borrowFromRight(page_id, rid, parent_id, pos);
         }
 
+        // Compute the merge operands from the parent while it is pinned, then RELEASE
+        // our parent pin (the `defer` above) BEFORE calling mergePages: a root-level
+        // merge collapses the root and discards `parent_id`, which must not observe
+        // this frame's pin (that is the residual page=root pin=1 the fault window
+        // exposed). The defer still runs at return but is then a no-op (page gone, or
+        // pin already 0 — unpinPage's CAS floors at 0).
         if (pos > 0) {
             const lid = if (pos == 1)
                 pp.headerPtr().leftmost_child_id
             else
                 mem.readInt(PageId, pp.getCell(pos - 2).?.value[0..@sizeOf(PageId)], .little);
+            self.pool.unpinPage(parent_id, true);
             try self.mergePages(lid, page_id, parent_id, pos - 1, depth);
         } else {
             const rid = mem.readInt(PageId, pp.getCell(0).?.value[0..@sizeOf(PageId)], .little);
+            self.pool.unpinPage(parent_id, true);
             try self.mergePages(page_id, rid, parent_id, 0, depth);
         }
     }
@@ -1482,7 +1504,11 @@ pub const BPlusTree = struct {
         defer self.pool.unpinPage(left_id, true);
         const rf = try self.pool.fetchPage(right_id);
         const pf = try self.pool.fetchPage(parent_id);
-        defer self.pool.unpinPage(parent_id, true);
+        // NOTE: parent_id is unpinned EXPLICITLY on every exit path below, NOT via a
+        // `defer`. The tail of this function can discard parent_id (root collapse) or
+        // recurse into handleUnderflow(parent_id) which may merge it away; a lingering
+        // `defer` pin would still be held at that discard and trip PageStillPinned
+        // (observed as page pin_count=2 under a widened merge window).
         const left = self.pool.pageOf(lf);
         const right = self.pool.pageOf(rf);
         const par = self.pool.pageOf(pf);
@@ -1497,6 +1523,7 @@ pub const BPlusTree = struct {
         }
         if (@as(u32, left.freeSpace()) < need) {
             self.pool.unpinPage(right_id, false);
+            self.pool.unpinPage(parent_id, true);
             return;
         }
 
@@ -1530,18 +1557,38 @@ pub const BPlusTree = struct {
         try par.compact(sc);
 
         self.pool.unpinPage(right_id, false);
+        // TEST-ONLY fault injection: widen the unpin->discard window so any pin that
+        // outlives a merge (a pin held across a discard/recursion) is reliably observed
+        // by discardPage. Off (0) in production; a test sets `fault_merge_yield_ms` to
+        // turn the rare pin-lifetime race into a certainty. See the regression test.
+        if (fault_merge_yield_ms > 0)
+            self.pool.pager.io.sleep(std.Io.Duration.fromMilliseconds(fault_merge_yield_ms), .real) catch {};
         try self.pool.discardPage(right_id);
 
+        // Snapshot everything we still need from `par` while it is pinned, because the
+        // tail below releases the parent pin before it may discard or recurse on it.
+        const par_num_cells = par.headerPtr().num_cells;
+        const par_free = par.freeSpace();
+        const par_parent = par.headerPtr().parent_page_id;
+
         if (self.root_page_id == parent_id) {
-            if (par.headerPtr().num_cells == 0) {
+            if (par_num_cells == 0) {
                 self.root_page_id = left_id;
                 const nrf = try self.pool.fetchPage(left_id);
                 self.pool.pageOf(nrf).headerPtr().parent_page_id = 0;
                 self.pool.unpinPage(left_id, true);
-                try self.pool.discardPage(parent_id);
+                self.pool.unpinPage(parent_id, true); // release before discarding it
+try self.pool.discardPage(parent_id);
+                return;
             }
-        } else if (par.freeSpace() > (PAGE_SIZE - @sizeOf(page.PageHeader) - PAGE_SIZE / 2)) {
-            try self.handleUnderflow(parent_id, par.headerPtr().parent_page_id, depth + 1);
+            self.pool.unpinPage(parent_id, true);
+            return;
+        }
+        // Release the parent pin BEFORE any upward-propagating merge: handleUnderflow
+        // may merge parent_id into a sibling and discard it, which must not see our pin.
+        self.pool.unpinPage(parent_id, true);
+        if (par_free > (PAGE_SIZE - @sizeOf(page.PageHeader) - PAGE_SIZE / 2)) {
+            try self.handleUnderflow(parent_id, par_parent, depth + 1);
         }
     }
 

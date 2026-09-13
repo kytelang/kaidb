@@ -4950,6 +4950,91 @@ test "FUZZER (concurrent): OVERLAPPING-key writers on one tree stay self-consist
     try std.testing.expectEqual(scanned, scanned2);
 }
 
+test "REGRESSION: merge pin-lifetime -- concurrent delete storm with widened discard window" {
+    // Guards the fix for the merge/discard PageStillPinned race: mergePages,
+    // deleteExclusive's root collapse, and handleUnderflow all used to keep a page
+    // (parent / old root) pinned across a discardPage of that same page, so a
+    // delete that collapsed the tree tripped `error.PageStillPinned`. The natural
+    // race is rare, so this test turns on the fault hook (`fault_merge_yield_ms`)
+    // to WIDEN the unpin->discard window, making a reintroduced pin-lifetime bug
+    // fail deterministically. Delete-heavy on a tiny shared key space -> maximal
+    // split/merge/collapse churn. On the fixed code this passes with zero failures.
+    const alloc = std.heap.c_allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const PagePool = @import("storage/pool.zig").PagePool;
+    const bt = @import("storage/btree.zig");
+
+    const db_path = "regress_merge_pin.db";
+    Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+
+    const pool = try PagePool.init(alloc, io, db_path, 64);
+    defer pool.deinit() catch {};
+    const tree = try bt.BPlusTree.create(pool, alloc);
+    defer tree.deinit();
+
+    bt.fault_merge_yield_ms = 2; // widen the unpin->discard window
+    defer bt.fault_merge_yield_ms = 0;
+
+    const NW: u32 = 6;
+    const KS: u32 = 96; // tiny shared space -> constant split/merge/collapse
+    const OPS: usize = 5_000;
+
+    const Writer = struct {
+        tree: *bt.BPlusTree,
+        seed: u32,
+        ops: usize,
+        failed: bool = false,
+        detail: [96]u8 = undefined,
+        fn run(w: *@This()) void {
+            var prng = std.Random.DefaultPrng.init(0xC0FFEE00 + w.seed);
+            const rnd = prng.random();
+            var kbuf: [11]u8 = undefined;
+            var op: usize = 0;
+            while (op < w.ops and !w.failed) : (op += 1) {
+                const seq = rnd.uintLessThan(u32, KS);
+                const key = FuzzKey.encode(&kbuf, 0, seq);
+                if (rnd.uintLessThan(u8, 100) < 35) {
+                    var vbuf: [24]u8 = undefined;
+                    const val = std.fmt.bufPrint(&vbuf, "v{d}", .{seq}) catch unreachable;
+                    w.tree.insert(key, val) catch |e| {
+                        if (e != error.KeyAlreadyExists) {
+                            w.failed = true;
+                            _ = std.fmt.bufPrint(&w.detail, "insert {d}: {s}", .{ seq, @errorName(e) }) catch {};
+                        }
+                    };
+                } else {
+                    w.tree.delete(key) catch |e| {
+                        if (e != error.KeyNotFound) {
+                            w.failed = true;
+                            _ = std.fmt.bufPrint(&w.detail, "delete {d}: {s}", .{ seq, @errorName(e) }) catch {};
+                        }
+                    };
+                }
+            }
+        }
+    };
+
+    var ws: [NW]Writer = undefined;
+    var group = std.Io.Group.init;
+    for (&ws, 0..) |*w, k| {
+        w.* = .{ .tree = tree, .seed = @intCast(k), .ops = OPS };
+        group.async(io, Writer.run, .{w});
+    }
+    group.await(io) catch {};
+
+    for (&ws) |*w| {
+        if (w.failed) {
+            std.debug.print("merge pin-lifetime regression: writer {d} FAILED: {s}\n", .{ w.seed, std.mem.sliceTo(&w.detail, 0) });
+            return error.MergePinLifetimeRegression;
+        }
+    }
+    try tree.checkInvariants();
+}
+
 test "STRESS: parallel disjoint inserts all land -- concurrent writers admitted without lost writes" {
     // The correctness half of "writes are not serialized": 4 writers insert N disjoint keys concurrently
     // through the GroupLock (write mode) + per-tree structure_lock. If concurrent admission were broken
