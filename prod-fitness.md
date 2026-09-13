@@ -43,7 +43,7 @@ with citations. Treat the verdicts as reliable; treat effort sizes as estimates.
 | Crash recovery / durability | READY | `durability/`, `pool.zig` WAL-before-page + doublewrite |
 | Concurrency safety | READY (last known race fixed this session) | `btree.zig`, `root.zig` fuzzers |
 | Authentication / authorization | READY (opt-in; enforce + TLS-gate via config) | `concurrency/security.zig`, `proto/session.zig` |
-| Backup / restore | READY (cold) / hot is a follow-up | `main.zig`, `schema/database.zig` snapshot |
+| Backup / restore | READY (cold + hot) | `main.zig` CLI, `BACKUP DATABASE TO` (live), snapshot+WAL |
 | Replication / HA | USABLE, ops-thin | `schema/database.zig` fence + follower |
 | Resource governance | PARTIAL | `query_executor.zig`, `tcp_server.zig` |
 | Observability / metrics | PARTIAL (basics landed) | `main.zig` `/metrics` `/healthz` `/readyz` |
@@ -132,7 +132,7 @@ Assessment: the mechanism is real and enforceable; production use requires enabl
 `require_auth` (or `require_tls_for_auth`), rotating the bootstrap credential, and running
 over TLS.
 
-### 4.4 Backup and restore: READY (cold); hot backup is a follow-up
+### 4.4 Backup and restore: READY (cold + hot)
 
 - Consistent physical snapshot primitives exist and are replication-tested:
   `Database.exportSnapshot` (`schema/database.zig:2450`) flushes WAL, flushes all pages,
@@ -141,13 +141,21 @@ over TLS.
 - **Operator CLI added this session [measured]:** `novadb backup <base> <dest>` and
   `novadb restore <snap> <dest>` (`main.zig`), verified end-to-end (load → backup →
   restore into a fresh dir → byte-identical query results across all benchmark queries).
-- **Constraint [verified]:** the CLI opens its own handle, so it is a **cold** backup
-  (run against a stopped server). A live/hot backup would call `exportSnapshot` in-process
-  via a server command (see 5.B.2).
+- The `novadb backup` CLI opens its own handle, so it is a **cold** backup (run against a
+  stopped server).
+- **Hot (online) backup landed this session [measured]:** `BACKUP DATABASE TO 'dir'` was
+  parsed but the executor's handler wrote a bare, WAL-less, unlocked single-file page image
+  that neither the restore CLI nor recovery could consume. It now runs `exportSnapshot`
+  in-process under the exclusive `rw_lock` that `executeStatement` already holds for the
+  statement (so no checkpoint/vacuum reshuffles pages mid-copy; do NOT re-acquire the lock,
+  it is not reentrant), producing the same `snapshot.db` + `wal/` layout as an offline
+  backup. The result restores with the identical tooling (`novadb restore`, PITR).
+  Proven by "HOT BACKUP: ... on a live server yields a restorable snapshot" (`root.zig`):
+  a never-closed server takes the backup, keeps serving, and the restored copy has exactly
+  the pre-backup rows (post-backup writes correctly excluded).
 
-Assessment: reliable cold backup/restore today; PITR (LSN target) landed this session
-via WAL archiving + `restore --archive --target-lsn` (see 5.B.3); hot (online) backup
-is the remaining gap.
+Assessment: reliable cold and hot backup/restore; PITR (LSN target) via WAL archiving +
+`restore --archive --target-lsn` (see 5.B.3). All required backup gates closed.
 
 ### 4.5 Replication and HA: USABLE, operationally thin
 
@@ -258,8 +266,9 @@ section 5.A are only warranted if kaidb targets general-purpose use.
    a target LSN", `root.zig`) that checkpoints the target segments out of the live WAL and
    restores from snapshot + archive only. Remaining follow-up: a `--target-time` wall-clock
    selector (needs a timestamp index over archived segments; LSN targeting is the primitive).
-4. **Hot (online) backup** [medium]. Server-side `BACKUP DATABASE TO ...` using
-   `exportSnapshot` live, so backups do not require a stopped server.
+4. **Hot (online) backup** [DONE]. `BACKUP DATABASE TO 'dir'` runs `exportSnapshot` live
+   under the exclusive `rw_lock` the executor already holds, producing a restorable
+   snapshot+WAL directory without stopping the server (4.4).
 5. **TLS-gate the password path** [DONE]. `security.require_tls_for_auth` refuses the
    cleartext-password challenge on a non-TLS connection (SQLSTATE 28000) and the data-plane
    `TcpServer` now honours `config.tls` (4.3). Credential rotation is now possible via
@@ -278,10 +287,10 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 ## 6. Recommended path for the scoped role
 
 For the **single-node relational** role, the operability floor is now met: 5.B.1
-(metrics), 5.B.2 (health/readiness), 5.B.3 (PITR, LSN target), and 5.B.5 (TLS-gate the
-password path) all landed this session. No required gate remains open; the richer
-telemetry (histograms, replication-lag), hot backup (5.B.4), and forcing rotation of the
-bootstrap credential are quality follow-ups, not gates.
+(metrics), 5.B.2 (health/readiness), 5.B.3 (PITR, LSN target), 5.B.4 (hot backup), and
+5.B.5 (TLS-gate the password path) all landed this session. No required gate remains open;
+the richer telemetry (histograms, replication-lag) and forcing rotation of the bootstrap
+credential are quality follow-ups, not gates.
 None of the section 5.A scale items are required for this role; the clustered-storage
 cost (4.8) is the boundary that bounds it. If the ambition later widens to a
 distributed/general-purpose database, 5.A.1 (physical row locator) is the first and

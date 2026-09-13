@@ -1633,24 +1633,23 @@ pub const QueryExecutor = struct {
     /// block at a time into a freshly created (truncated) file and fsyncs it.
     /// This is a cold physical backup, not a logical export; it captures the WAL
     /// state exactly as flushed. Backs the SQL `BACKUP` statement.
+    /// Hot (online) backup of a running server: writes a consistent snapshot
+    /// directory (`<backup_path>/snapshot.db` + `<backup_path>/wal/`) using the
+    /// same primitive the replication path uses, so `BACKUP DATABASE TO 'dir'`
+    /// does not require a stopped server and the result is restorable with the
+    /// exact same tooling as an offline backup (`novadb restore`, PITR).
+    ///
+    /// Runs under the db `rw_lock` held exclusively by [`executeStatement`] (a
+    /// `.backup` statement has no single table, so it takes the coarse exclusive
+    /// lock), which is exactly what we want: no checkpoint or vacuum can reshuffle
+    /// pages during the page copy. Concurrent DML on other connections is blocked
+    /// for the copy's duration; the WAL is copied alongside the pages so a restore
+    /// replays it to a crash-consistent state as of the backup point. Must NOT
+    /// re-acquire `rw_lock` here (it is not reentrant) or it self-deadlocks. (The
+    /// previous form wrote a bare, WAL-less, unlocked single-file page image that
+    /// neither the restore CLI nor the recovery path could consume.)
     fn backupDatabase(self: *QueryExecutor, backup_path: []const u8) !void {
-        try self.db.pool.flushAllPages();
-        try self.db.pool.pager.file.sync(self.db.pool.pager.io);
-
-        const io = self.db.pool.pager.io;
-        const backup_file = try std.Io.Dir.createFile(.cwd(), io, backup_path, .{ .read = true, .truncate = true });
-        defer backup_file.close(io);
-
-        const PAGE_SIZE = @import("../storage/page.zig").PAGE_SIZE;
-        var page_buf: [PAGE_SIZE]u8 = undefined;
-        const num_pages = self.db.pool.pager.num_pages;
-        var page_id: u64 = 0;
-        while (page_id < num_pages) : (page_id += 1) {
-            const offset = page_id * PAGE_SIZE;
-            _ = try self.db.pool.pager.file.readPositionalAll(io, &page_buf, offset);
-            try backup_file.writePositionalAll(io, &page_buf, offset);
-        }
-        try backup_file.sync(io);
+        try self.db.exportSnapshot(backup_path);
     }
 
     /// Resolves the declared [`ColumnType`] of a column referenced by a SELECT.

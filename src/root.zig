@@ -4422,6 +4422,83 @@ test "ALTER USER: IDENTIFIED BY rotates the password and preserves the role" {
     }
 }
 
+test "HOT BACKUP: BACKUP DATABASE TO on a live server yields a restorable snapshot" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+
+    const src_path = "test_hotbk_src.db";
+    const src_wal = "test_hotbk_src_wal";
+    const bk_dir = "test_hotbk_snapshot";
+    const dst_path = "test_hotbk_restored.db";
+    const dst_wal = "test_hotbk_restored_wal";
+    Io.Dir.deleteFile(.cwd(), io, src_path) catch {};
+    Io.Dir.deleteFile(.cwd(), io, dst_path) catch {};
+    for ([_][]const u8{ src_wal, bk_dir, dst_wal }) |d| Io.Dir.deleteTree(.cwd(), io, d) catch {};
+    defer Io.Dir.deleteFile(.cwd(), io, src_path) catch {};
+    defer Io.Dir.deleteFile(.cwd(), io, dst_path) catch {};
+    defer for ([_][]const u8{ src_wal, bk_dir, dst_wal }) |d| Io.Dir.deleteTree(.cwd(), io, d) catch {};
+
+    // A LIVE server: opened once, never closed before the backup runs.
+    var db = try Database.open(allocator, io, src_path, 64, src_wal);
+    defer db.close();
+    var ex = QueryExecutor.init(allocator, db);
+    defer ex.deinit();
+
+    freeResp(allocator, try ex.execute(.{ .sql = "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)" }));
+    var i: i64 = 1;
+    while (i <= 20) : (i += 1) {
+        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO t (id, v) VALUES ({d}, 'r{d}')", .{ i, i });
+        defer allocator.free(sql);
+        freeResp(allocator, try ex.execute(.{ .sql = sql }));
+    }
+
+    // Hot backup while the server is up.
+    {
+        const sql = try std.fmt.allocPrint(allocator, "BACKUP DATABASE TO '{s}'", .{bk_dir});
+        defer allocator.free(sql);
+        const res = try ex.execute(.{ .sql = sql });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+    }
+
+    // The server keeps serving after the backup (proves it was never stopped),
+    // and these post-backup rows must NOT appear in the snapshot.
+    while (i <= 30) : (i += 1) {
+        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO t (id, v) VALUES ({d}, 'r{d}')", .{ i, i });
+        defer allocator.free(sql);
+        freeResp(allocator, try ex.execute(.{ .sql = sql }));
+    }
+
+    // Restore the hot-backup artifact with the standard (offline) tooling.
+    try Database.restoreSnapshot(allocator, io, bk_dir, dst_path, dst_wal);
+    {
+        var rdb = try Database.open(allocator, io, dst_path, 64, dst_wal);
+        defer rdb.close();
+        var rex = QueryExecutor.init(allocator, rdb);
+        defer rex.deinit();
+        for ([_]i64{ 1, 10, 20 }) |id| { // present at backup time
+            const sql = try std.fmt.allocPrint(allocator, "SELECT v FROM t WHERE id = {d}", .{id});
+            defer allocator.free(sql);
+            const res = try rex.execute(.{ .sql = sql });
+            defer freeResp(allocator, res);
+            try std.testing.expect(res.error_message == null);
+            try std.testing.expectEqual(@as(usize, 1), res.rows.len);
+        }
+        for ([_]i64{ 21, 25, 30 }) |id| { // inserted AFTER the backup
+            const sql = try std.fmt.allocPrint(allocator, "SELECT v FROM t WHERE id = {d}", .{id});
+            defer allocator.free(sql);
+            const res = try rex.execute(.{ .sql = sql });
+            defer freeResp(allocator, res);
+            try std.testing.expect(res.error_message == null);
+            try std.testing.expectEqual(@as(usize, 0), res.rows.len);
+        }
+    }
+}
+
 test "WRITER-CACHE: concurrent writers past the query-cache cap don't corrupt (regression)" {
     const alloc = std.heap.c_allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
