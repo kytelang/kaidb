@@ -298,6 +298,13 @@ pub const SecurityManager = struct {
     /// `config.security.require_auth`; implies `enabled`. Defaults false so the
     /// embedded/first-run path is unchanged.
     require_auth: bool = false,
+    /// When true, the cleartext-password challenge is only offered over a TLS
+    /// connection; a password login attempt on a plaintext connection is refused
+    /// (SQLSTATE 28000) before any password is read. Set from
+    /// `config.security.require_tls_for_auth`; implies `require_auth` (hence
+    /// `enabled`). Defaults false. The server refuses to start with this on but
+    /// no TLS configured, so it can never silently lock every client out.
+    require_tls_for_auth: bool = false,
     /// The async I/O context used for the clock, CSPRNG, mutexes, and the
     /// Argon2 KDF.
     io: Io,

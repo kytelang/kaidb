@@ -158,6 +158,11 @@ pub const Config = struct {
         /// keeps the first-run-friendly behaviour (open access when no users, or
         /// challenge-but-do-not-require when users exist).
         require_auth: bool = false,
+        /// Only offer the cleartext-password login over a TLS connection; refuse
+        /// a password login on a plaintext link (SQLSTATE 28000). Implies
+        /// `require_auth` (hence `enabled`). Defaults false. When true, `tls`
+        /// must be configured or the server refuses to start (no silent lockout).
+        require_tls_for_auth: bool = false,
     } = .{},
     /// Replication settings for a follower (or the link a primary offers).
     ///

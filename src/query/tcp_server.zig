@@ -139,6 +139,12 @@ pub const TcpServer = struct {
     /// TLS server options; when set, [`handleConnectionInner`] wraps the raw
     /// stream before running the protocol loop. Null means plaintext.
     tls_opts: ?tls.config.Server = null,
+    /// PEM cert/key paths for TLS. When both are set, [`handleConnectionInner`]
+    /// builds a fresh [`tls.config.Server`] per connection (fresh rng + `now`, so
+    /// certificate validity is judged against the current time rather than a
+    /// timestamp frozen at startup). Empty means no file-based TLS.
+    tls_cert_path: []const u8 = "",
+    tls_key_path: []const u8 = "",
     /// Recycled buffers for the JSON-packet read path; initialised in [`listen`],
     /// hence `undefined` until then. See [`MessageBufferPool`].
     buffer_pool: MessageBufferPool = undefined,
@@ -163,6 +169,19 @@ pub const TcpServer = struct {
     /// options; must be called before [`listen`] to affect that session.
     pub fn enableTls(self: *TcpServer, opts: tls.config.Server) void {
         self.tls_opts = opts;
+    }
+
+    /// Enables file-based TLS: stores the PEM cert/key paths so each accepted
+    /// connection is TLS-wrapped (options built per connection in
+    /// [`handleConnectionInner`]). Must be called before [`listen`].
+    pub fn enableTlsFiles(self: *TcpServer, cert_path: []const u8, key_path: []const u8) void {
+        self.tls_cert_path = cert_path;
+        self.tls_key_path = key_path;
+    }
+
+    /// True when any TLS mode is configured (explicit options or cert/key files).
+    pub fn tlsEnabled(self: *const TcpServer) bool {
+        return self.tls_opts != null or (self.tls_cert_path.len > 0 and self.tls_key_path.len > 0);
     }
 
     /// Releases server-owned resources, i.e. the [`MessageBufferPool`]. Safe
@@ -410,15 +429,53 @@ fn handleConnectionInner(server: *TcpServer, io: Io, stream: net.Stream) !void {
         var r = tls_conn.reader(&tls_read_buf);
         var w = tls_conn.writer(&tls_write_buf);
 
-        try runLoop(server, io, &r.interface, &w.interface, &connection_executor);
+        try runLoop(server, io, &r.interface, &w.interface, &connection_executor, true);
+    } else if (server.tls_cert_path.len > 0 and server.tls_key_path.len > 0) {
+        // File-based TLS: build options per connection so `now` (the cert-validity
+        // reference) and the CSPRNG are fresh, and the CertKeyPair lifetime is
+        // bounded to this connection. Mirrors the replication server path.
+        var csprng: std.Random.DefaultCsprng = undefined;
+        const rng = tlsRng(io, &csprng);
+        var server_ck = tls.config.CertKeyPair.fromFilePath(server.allocator, io, Io.Dir.cwd(), server.tls_cert_path, server.tls_key_path) catch |err| {
+            log.err("tcp server: loading TLS cert/key ({s}, {s}) failed: {any}", .{ server.tls_cert_path, server.tls_key_path, err });
+            return;
+        };
+        defer server_ck.deinit(server.allocator);
+        const opts = tls.config.Server{
+            .rng = rng,
+            .auth = &server_ck,
+            .now = Io.Clock.real.now(io),
+        };
+        var tls_conn = tls.serverFromStream(io, stream, opts) catch |err| {
+            log.warn("tcp server: TLS handshake failed ({any}); refusing connection", .{err});
+            return;
+        };
+        defer tls_conn.close() catch {};
+
+        var tls_read_buf: [tls.input_buffer_len]u8 = undefined;
+        var tls_write_buf: [tls.output_buffer_len]u8 = undefined;
+        var r = tls_conn.reader(&tls_read_buf);
+        var w = tls_conn.writer(&tls_write_buf);
+
+        try runLoop(server, io, &r.interface, &w.interface, &connection_executor, true);
     } else {
         var read_buf: [4096]u8 = undefined;
         var write_buf: [4096]u8 = undefined;
         var r = stream.reader(io, &read_buf);
         var w = stream.writer(io, &write_buf);
 
-        try runLoop(server, io, &r.interface, &w.interface, &connection_executor);
+        try runLoop(server, io, &r.interface, &w.interface, &connection_executor, false);
     }
+}
+
+/// Seeds a per-connection CSPRNG from the platform RNG and returns a
+/// `std.Random` for the TLS handshake. A fresh instance per connection keeps
+/// handshake nonces independent.
+fn tlsRng(io: Io, csprng: *std.Random.DefaultCsprng) std.Random {
+    var seed: [32]u8 = undefined;
+    std.Io.random(io, &seed);
+    csprng.* = std.Random.DefaultCsprng.init(seed);
+    return csprng.random();
 }
 
 /// The protocol demultiplexer and request loop for one connection.
@@ -454,6 +511,7 @@ fn runLoop(
     reader: *Io.Reader,
     writer: *Io.Writer,
     connection_executor: *QueryExecutor,
+    secure: bool,
 ) !void {
 
     {
@@ -463,6 +521,7 @@ fn runLoop(
         };
         if (first == @intFromEnum(wire.Frontend.startup)) {
             var sess = Session.init(server.allocator, io, server.db, 0, null);
+            sess.secure = secure;
             defer sess.deinit();
             return session.run(&sess, reader, writer);
         }

@@ -592,10 +592,21 @@ pub fn main(init: std.process.Init) !void {
     // the startup path challenges every connection and rejects bad credentials;
     // with `require_auth` the wire session additionally fail-closes any data-plane
     // frame on an unauthenticated connection.
-    db.security_manager.enabled = config.security.enabled or config.security.require_auth;
-    db.security_manager.require_auth = config.security.require_auth;
+    // `require_tls_for_auth` implies `require_auth`, which implies `enabled`.
+    const require_tls_for_auth = config.security.require_tls_for_auth;
+    const tls_configured = config.tls.enabled and config.tls.cert_file.len > 0 and config.tls.key_file.len > 0;
+    if (require_tls_for_auth and !tls_configured) {
+        // Fail closed at startup rather than silently rejecting every login: with
+        // this flag on, password auth is only offered over TLS, so a server with
+        // no TLS configured would accept no client at all.
+        log.err("security.require_tls_for_auth is on but TLS is not configured (need tls.enabled + tls.cert_file + tls.key_file); refusing to start", .{});
+        return error.TlsRequiredButNotConfigured;
+    }
+    db.security_manager.enabled = config.security.enabled or config.security.require_auth or require_tls_for_auth;
+    db.security_manager.require_auth = config.security.require_auth or require_tls_for_auth;
+    db.security_manager.require_tls_for_auth = require_tls_for_auth;
     if (db.security_manager.enabled) {
-        log.info("authentication ENABLED (require_auth={})", .{config.security.require_auth});
+        log.info("authentication ENABLED (require_auth={}, require_tls_for_auth={})", .{ db.security_manager.require_auth, require_tls_for_auth });
         // A fresh database seeds `admin`/`admin`. We deliberately do NOT probe the
         // credential here (a failed probe would feed the brute-force lockout and
         // could lock the real admin out across restarts); instead advise operators
@@ -647,6 +658,10 @@ pub fn main(init: std.process.Init) !void {
 
     var tcp_server = TcpServer.init(allocator, config.address, config.port, db, config.max_sessions, config);
     defer tcp_server.deinit();
+    if (tls_configured) {
+        tcp_server.enableTlsFiles(config.tls.cert_file, config.tls.key_file);
+        log.info("data-plane TLS enabled (cert {s})", .{config.tls.cert_file});
+    }
 
     var tcp_group: Io.Group = .init;
     tcp_group.async(io, startTcpServer, .{ &tcp_server, io });

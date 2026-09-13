@@ -20,7 +20,7 @@ Three boundaries are explicit and non-negotiable rather than hand-waved:
    workload routinely ships thousands of rows via secondary indexes.
 2. **Single node**: no horizontal scale/sharding.
 3. **Operational surface** must be present for the wider claim (metrics/health/PITR
-   landed this session; TLS-gating the password path remains, see 5.B).
+   /TLS-gated auth all landed this session, see 5.B; no required gate remains open).
 
 This document judges fitness for that single-node relational role, and separately notes
 what a distributed/general-purpose ambition would additionally require.
@@ -42,7 +42,7 @@ with citations. Treat the verdicts as reliable; treat effort sizes as estimates.
 |---|---|---|
 | Crash recovery / durability | READY | `durability/`, `pool.zig` WAL-before-page + doublewrite |
 | Concurrency safety | READY (last known race fixed this session) | `btree.zig`, `root.zig` fuzzers |
-| Authentication / authorization | READY (opt-in; enforce via config) | `concurrency/security.zig`, `proto/session.zig` |
+| Authentication / authorization | READY (opt-in; enforce + TLS-gate via config) | `concurrency/security.zig`, `proto/session.zig` |
 | Backup / restore | READY (cold) / hot is a follow-up | `main.zig`, `schema/database.zig` snapshot |
 | Replication / HA | USABLE, ops-thin | `schema/database.zig` fence + follower |
 | Resource governance | PARTIAL | `query_executor.zig`, `tcp_server.zig` |
@@ -50,9 +50,9 @@ with citations. Treat the verdicts as reliable; treat effort sizes as estimates.
 | Point-in-time recovery | READY (LSN target) | WAL archiving + `restore --archive --target-lsn`; time-target follow-up |
 | Scale (general-purpose) | NOT A GOAL for scoped role | `btree.zig` clustered design |
 
-Bottom line: **fit for the scoped control-plane role** (observability + PITR now landed);
-not intended as a general-purpose DB, and the scale items are only required if that
-ambition changes.
+Bottom line: **fit for the scoped control-plane role** (observability, PITR, and TLS-gated
+auth now landed; no required gate open); not intended as a general-purpose DB, and the
+scale items are only required if that ambition changes.
 
 ## 4. Subsystem findings (verified)
 
@@ -114,13 +114,23 @@ correctness issue.
   the wire session fail-closes every data-plane frame on an unauthenticated connection
   with SQLSTATE 28000 (`proto/session.zig:361`). Verified: wrong password rejected,
   correct `admin` accepted.
-- **Two caveats [verified]:** (a) a fresh database bootstraps `admin`/`admin`
+- **TLS-gate landed this session [measured]:** `config.security.require_tls_for_auth`
+  (implies `require_auth`) refuses the cleartext-password challenge on a plaintext link
+  (SQLSTATE 28000, before any password is read) and only offers it over TLS. The data-plane
+  `TcpServer` now honours `config.tls` (cert/key), building per-connection TLS options with
+  a fresh `now`/CSPRNG (`query/tcp_server.zig` `enableTlsFiles`/`handleConnectionInner`); a
+  `secure` flag threads from the connection handler to the session startup guard
+  (`proto/session.zig`). The server refuses to start if `require_tls_for_auth` is on but TLS
+  is not configured, so it can never silently lock every client out. Proven by
+  "O4-TLS: require_tls_for_auth refuses cleartext password on a plaintext link" (`root.zig`):
+  plaintext -> 28000 + unauthenticated; secure -> normal challenge succeeds.
+- **Remaining caveat [verified]:** a fresh database bootstraps `admin`/`admin`
   (`schema/database.zig:506`); the server logs an advisory to rotate it, but it is not
-  forced. (b) The password path is cleartext-over-the-wire and is **not yet TLS-gated**;
-  it should be refused on a non-TLS connection when `require_auth` is on (see 5.B.8).
+  forced.
 
 Assessment: the mechanism is real and enforceable; production use requires enabling
-`require_auth`, rotating the bootstrap credential, and running over TLS.
+`require_auth` (or `require_tls_for_auth`), rotating the bootstrap credential, and running
+over TLS.
 
 ### 4.4 Backup and restore: READY (cold); hot backup is a follow-up
 
@@ -250,9 +260,10 @@ section 5.A are only warranted if kaidb targets general-purpose use.
    selector (needs a timestamp index over archived segments; LSN targeting is the primitive).
 4. **Hot (online) backup** [medium]. Server-side `BACKUP DATABASE TO ...` using
    `exportSnapshot` live, so backups do not require a stopped server.
-5. **TLS-gate the password path** [small]. Refuse cleartext-password startup on a
-   non-TLS connection when `require_auth` is on (4.3 caveat b); force/rotate the
-   bootstrap `admin` credential.
+5. **TLS-gate the password path** [DONE]. `security.require_tls_for_auth` refuses the
+   cleartext-password challenge on a non-TLS connection (SQLSTATE 28000) and the data-plane
+   `TcpServer` now honours `config.tls` (4.3). Remaining follow-up: force/rotate the
+   bootstrap `admin` credential (still advisory-only).
 6. **Connection governance** [small-medium]. Idle timeout, backpressure; surface the
    existing per-query deadline + memory cap in config.
 7. **Replication operations** [medium]. Lag monitoring, `promote`/failover command,
@@ -264,10 +275,11 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 
 ## 6. Recommended path for the scoped role
 
-For the **single-node relational** role, the operability floor is now largely met:
-5.B.1 (metrics), 5.B.2 (health/readiness), and 5.B.3 (PITR, LSN target) landed this
-session. The remaining required item is **5.B.5 (TLS-gate the password path)**; the
-richer telemetry (histograms, replication-lag) is a quality follow-up, not a gate.
+For the **single-node relational** role, the operability floor is now met: 5.B.1
+(metrics), 5.B.2 (health/readiness), 5.B.3 (PITR, LSN target), and 5.B.5 (TLS-gate the
+password path) all landed this session. No required gate remains open; the richer
+telemetry (histograms, replication-lag), hot backup (5.B.4), and forcing rotation of the
+bootstrap credential are quality follow-ups, not gates.
 None of the section 5.A scale items are required for this role; the clustered-storage
 cost (4.8) is the boundary that bounds it. If the ambition later widens to a
 distributed/general-purpose database, 5.A.1 (physical row locator) is the first and

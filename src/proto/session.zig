@@ -149,6 +149,11 @@ pub const Session = struct {
     /// reads borrow from it (see [`Session.acquireBuf`]); when `null`, the raw
     /// allocator is used instead.
     msg_pool: ?*MessageBufferPool = null,
+    /// True when the underlying transport is TLS-encrypted. Set by the connection
+    /// handler before [`run`]. Consulted by the startup handler to refuse the
+    /// cleartext-password exchange on a plaintext link when
+    /// `SecurityManager.require_tls_for_auth` is on.
+    secure: bool = false,
 
     /// Constructs a session bound to `db` with the given idle timeout and
     /// optional buffer pool.
@@ -374,6 +379,14 @@ pub fn run(sess: *Session, reader: *Io.Reader, writer: *Io.Writer) !void {
                 };
                 const sec = sess.executor.db.security_manager;
                 if (sec.enabled and sec.users.count() > 0) {
+                    // TLS gate: never send a cleartext-password challenge (nor read
+                    // a password) over a plaintext link when the operator requires
+                    // TLS for auth. Refuse before any secret crosses the wire.
+                    if (sec.require_tls_for_auth and !sess.secure) {
+                        try sendOwned(writer, allocator, try wire.encodeError(allocator, "FATAL", "28000", "TLS required for password authentication"));
+                        try writer.flush();
+                        return;
+                    }
                     try sendOwned(writer, allocator, try wire.encodeAuthCleartext(allocator));
                     try writer.flush();
 

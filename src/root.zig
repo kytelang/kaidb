@@ -4283,6 +4283,86 @@ test "O4: startup auth binds a session -- valid creds authorize, bad creds rejec
     }
 }
 
+test "O4-TLS: require_tls_for_auth refuses cleartext password on a plaintext link" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Database = @import("schema.zig").Database;
+    const session = @import("proto/session.zig");
+    const wire = @import("proto/wire.zig");
+
+    const db_path = "test_o4tls_auth.db";
+    Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+
+    var db = try Database.open(allocator, io, db_path, 64, null);
+    defer db.close();
+    db.security_manager.enabled = true;
+    db.security_manager.require_auth = true;
+    db.security_manager.require_tls_for_auth = true;
+
+    const F = struct {
+        fn framed(a: std.mem.Allocator, ftype: wire.Frontend, parts: []const []const u8) ![]u8 {
+            var b = wire.Builder.init(a);
+            defer b.deinit();
+            if (ftype == .startup) {
+                try b.putU16(1);
+                try b.putU16(0);
+            }
+            for (parts) |p| try b.putStr16(p);
+            return b.finish(@intFromEnum(ftype));
+        }
+    };
+
+    const Runner = struct {
+        fn go(a: std.mem.Allocator, d: *Database, ioh: Io, secure: bool, out: *[]u8) !bool {
+            const f_su = try F.framed(a, .startup, &.{ "admin", "", "test" });
+            defer a.free(f_su);
+            const f_pw = try F.framed(a, .auth_response, &.{"admin"});
+            defer a.free(f_pw);
+
+            var input = std.ArrayList(u8).empty;
+            defer input.deinit(a);
+            try input.appendSlice(a, f_su);
+            try input.appendSlice(a, f_pw);
+
+            var reader = std.Io.Reader.fixed(input.items);
+            const outbuf = try a.alloc(u8, 64 * 1024);
+            var writer = std.Io.Writer.fixed(outbuf);
+            var sess = session.Session.init(a, ioh, d, 60_000, null);
+            sess.secure = secure;
+            defer sess.deinit();
+            session.run(&sess, &reader, &writer) catch {};
+            out.* = try a.dupe(u8, writer.buffered());
+            a.free(outbuf);
+            return sess.authenticated;
+        }
+    };
+
+    // Plaintext link: the challenge must be refused with 28000 before any
+    // password is read, and the session must NOT be authenticated.
+    {
+        var out: []u8 = undefined;
+        const authed = try Runner.go(allocator, db, io, false, &out);
+        defer allocator.free(out);
+        try std.testing.expect(!authed);
+        try std.testing.expect(std.mem.indexOf(u8, out, "28000") != null);
+        // No cleartext-password challenge should have been sent on the plaintext link.
+        try std.testing.expect(std.mem.indexOf(u8, out, "28P01") == null);
+    }
+
+    // Secure link: the normal challenge/authenticate path runs and succeeds.
+    {
+        var out: []u8 = undefined;
+        const authed = try Runner.go(allocator, db, io, true, &out);
+        defer allocator.free(out);
+        try std.testing.expect(authed);
+        try std.testing.expect(std.mem.indexOf(u8, out, "28000") == null);
+    }
+}
+
 test "WRITER-CACHE: concurrent writers past the query-cache cap don't corrupt (regression)" {
     const alloc = std.heap.c_allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
