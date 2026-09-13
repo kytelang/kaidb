@@ -4538,6 +4538,47 @@ test "ADMIN ROTATION: passwordMatches detects the default and clears after rotat
     try std.testing.expect(sec.passwordMatches("admin", "newadminpw"));
 }
 
+test "METRICS: execute feeds the query-latency histogram and it renders as Prometheus" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+
+    const p = "test_metrics_hist.db";
+    Io.Dir.deleteFile(.cwd(), io, p) catch {};
+    defer Io.Dir.deleteFile(.cwd(), io, p) catch {};
+
+    var db = try Database.open(allocator, io, p, 64, null);
+    defer db.close();
+    var ex = QueryExecutor.init(allocator, db);
+    defer ex.deinit();
+
+    freeResp(allocator, try ex.execute(.{ .sql = "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)" }));
+    var i: i64 = 1;
+    while (i <= 8) : (i += 1) {
+        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO t (id, v) VALUES ({d}, 'r{d}')", .{ i, i });
+        defer allocator.free(sql);
+        freeResp(allocator, try ex.execute(.{ .sql = sql }));
+    }
+    freeResp(allocator, try ex.execute(.{ .sql = "SELECT * FROM t" }));
+
+    // Every top-level execute recorded one observation: 1 CREATE + 8 INSERT + 1 SELECT.
+    const total = db.query_latency.count.load(.monotonic);
+    try std.testing.expectEqual(@as(u64, 10), total);
+
+    // Render exactly as /metrics does and assert the Prometheus shape is present.
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try db.query_latency.writeProm(&w, "kaidb_query_duration_seconds", "End-to-end query execution latency in seconds.");
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "# TYPE kaidb_query_duration_seconds histogram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "kaidb_query_duration_seconds_bucket{le=\"+Inf\"} 10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "kaidb_query_duration_seconds_count 10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "kaidb_query_duration_seconds_sum ") != null);
+}
+
 test "WRITER-CACHE: concurrent writers past the query-cache cap don't corrupt (regression)" {
     const alloc = std.heap.c_allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});

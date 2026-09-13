@@ -46,7 +46,7 @@ with citations. Treat the verdicts as reliable; treat effort sizes as estimates.
 | Backup / restore | READY (cold + hot) | `main.zig` CLI, `BACKUP DATABASE TO` (live), snapshot+WAL |
 | Replication / HA | USABLE, ops-thin | `schema/database.zig` fence + follower |
 | Resource governance | PARTIAL | `query_executor.zig`, `tcp_server.zig` |
-| Observability / metrics | PARTIAL (basics landed) | `main.zig` `/metrics` `/healthz` `/readyz` |
+| Observability / metrics | PARTIAL (counters + query-latency histogram) | `main.zig` `/metrics`, `common/histogram.zig` |
 | Point-in-time recovery | READY (LSN target) | WAL archiving + `restore --archive --target-lsn`; time-target follow-up |
 | Scale (general-purpose) | NOT A GOAL for scoped role | `btree.zig` clustered design |
 
@@ -198,10 +198,16 @@ low-connection control-plane client; needs the timeouts for a broader front door
   front door (`main.zig` `handleHttp`). `/metrics` exposes real counters: buffer-pool
   size + resident pages, `fetches_total`, `evictions_total`, mmap borrow vs pread
   serves, checksum failures, `next_tx_id`, and `current_lsn`. Verified live over HTTP.
-- **Still missing [verified]:** request-rate / latency histograms (no per-query timing
-  export yet), a split hit/miss ratio (only combined `fetches_total` today), WAL-size
-  and checkpoint-lag gauges, active-transaction and lock-wait gauges, replication-lag,
-  and a structured (JSON) log option.
+- **Query-latency histogram landed this session [measured]:** `kaidb_query_duration_seconds`
+  is a proper Prometheus histogram (cumulative `le` buckets from 0.5ms to 10s, plus `_sum`
+  and `_count`). Every top-level `QueryExecutor.execute` records its end-to-end latency into
+  a lock-free per-`Database` histogram (`common/histogram.zig`, atomic buckets), exported at
+  `/metrics`. This gives p50/p90/p99 via `histogram_quantile` and a QPS rate via
+  `rate(..._count[1m])`. Covered by a histogram unit test and an executor-fed integration
+  test (`root.zig`).
+- **Still missing [verified]:** a split hit/miss ratio (only combined `fetches_total`
+  today), WAL-size and checkpoint-lag gauges, active-transaction and lock-wait gauges,
+  replication-lag, and a structured (JSON) log option.
 
 Assessment: the operability floor is now met (health, readiness, core engine
 counters); the richer query/replication telemetry remains a follow-up.
@@ -257,7 +263,7 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 ### 5.B Operational tooling (needed for the scoped role, in priority order)
 
 1. **Observability `/metrics`** [DONE-partial]. Prometheus `/metrics` with core engine
-   counters is live (4.7). Remaining follow-ups: QPS/latency histograms, hit/miss split,
+   counters plus a query-latency histogram is live (4.7). Remaining follow-ups: hit/miss split,
    WAL-size + checkpoint-lag, active-txn/lock-wait, replication-lag gauges.
 2. **Health / readiness probes** [DONE]. `/healthz` + `/readyz` live (4.7). JSON
    structured logging remains a small follow-up.
@@ -297,7 +303,8 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 For the **single-node relational** role, the operability floor is now met: 5.B.1
 (metrics), 5.B.2 (health/readiness), 5.B.3 (PITR, LSN target), 5.B.4 (hot backup), and
 5.B.5 (TLS-gate the password path) all landed this session. No required gate remains open;
-the richer telemetry (histograms, replication-lag) is a quality follow-up, not a gate.
+the richer telemetry that remains (hit/miss split, replication-lag gauges) is a quality
+follow-up, not a gate; the query-latency histogram landed this session.
 None of the section 5.A scale items are required for this role; the clustered-storage
 cost (4.8) is the boundary that bounds it. If the ambition later widens to a
 distributed/general-purpose database, 5.A.1 (physical row locator) is the first and

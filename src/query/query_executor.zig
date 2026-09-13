@@ -2795,6 +2795,15 @@ pub const QueryExecutor = struct {
     /// It therefore (almost) never propagates a Zig error to the caller: logical
     /// failures come back inside [`QueryResponse.error_message`].
     pub fn execute(self: *QueryExecutor, req: QueryRequest) !QueryResponse {
+        // Record end-to-end latency of every top-level query into the shared
+        // histogram, on all return/error paths. Monotonic clock; nanoseconds.
+        const lat_io = self.db.pool.pager.io;
+        const lat_start: i128 = Io.Clock.now(.awake, lat_io).toNanoseconds();
+        defer {
+            const elapsed = Io.Clock.now(.awake, lat_io).toNanoseconds() - lat_start;
+            if (elapsed >= 0) self.db.query_latency.observeNs(@intCast(elapsed));
+        }
+
         var limit_allocator_state = if (req.memory_limit_bytes) |limit|
             MemoryLimitAllocator{ .parent_allocator = self.allocator, .limit_bytes = limit }
         else if (self.memory_limit_bytes) |limit|

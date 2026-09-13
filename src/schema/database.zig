@@ -210,6 +210,10 @@ pub const Database = struct {
     /// every table every ~10s. Atomic because it is bumped from client threads
     /// and read from the background-writer thread.
     garbage_ops: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Lock-free latency histogram of top-level query execution, observed by
+    /// [`QueryExecutor.execute`] and exported at `/metrics`. Shared across all
+    /// connection-scoped executors (they all point at this one `Database`).
+    query_latency: @import("../common/histogram.zig").LatencyHistogram = .{},
     /// The [`garbage_ops`] value observed at the start of the last vacuum pass;
     /// see [`Database.vacuum`]. Only touched under the vacuum's `rw_lock`.
     last_vacuum_garbage_ops: u64 = 0,

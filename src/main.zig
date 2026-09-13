@@ -258,7 +258,15 @@ fn handleHttp(allocator: std.mem.Allocator, raw_request: []const u8, ctx: ?*anyo
                 pool.current_lsn.load(.monotonic),
             });
             defer allocator.free(body);
-            return try std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+
+            // Latency histogram (query duration). Rendered into a bounded stack
+            // buffer; ~18 short lines fit comfortably.
+            var hbuf: [4096]u8 = undefined;
+            var hw = std.Io.Writer.fixed(&hbuf);
+            s_ctx.executor.db.query_latency.writeProm(&hw, "kaidb_query_duration_seconds", "End-to-end query execution latency in seconds.") catch {};
+            const hist = hw.buffered();
+
+            return try std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {d}\r\n\r\n{s}{s}", .{ body.len + hist.len, body, hist });
         }
 
         if (s_ctx.static_store) |store| {
