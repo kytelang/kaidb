@@ -337,6 +337,40 @@ pub fn main(init: std.process.Init) !void {
             try @import("compact.zig").compact(allocator, io, args[2], args[3]);
             return;
         }
+        // Backup: `novadb backup <base_dir> <dest_dir>` writes a consistent snapshot
+        // (checkpoint + fsync + full page copy + WAL) to <dest_dir>/snapshot.db(+wal).
+        // Run against a STOPPED server (this opens its own handle); the underlying
+        // exportSnapshot primitive is the same one the replication path uses live.
+        if (args.len >= 4 and std.mem.eql(u8, args[1], "backup")) {
+            const base = args[2];
+            const dest = args[3];
+            const dbf = try std.fmt.allocPrint(allocator, "{s}/nova.db", .{base});
+            defer allocator.free(dbf);
+            const wdir = try std.fmt.allocPrint(allocator, "{s}/wal", .{base});
+            defer allocator.free(wdir);
+            log.info("backing up {s} -> {s} ...", .{ base, dest });
+            var db = try Database.open(allocator, io, dbf, 8192, wdir);
+            defer db.close();
+            try db.exportSnapshot(dest);
+            log.info("backup complete: {s}/snapshot.db (+ wal/)", .{dest});
+            return;
+        }
+        // Restore: `novadb restore <snapshot_dir> <dest_base_dir>` reconstructs a data
+        // directory from a snapshot (copies snapshot.db -> nova.db and the WAL back);
+        // the next server start on <dest_base_dir> runs recovery over it.
+        if (args.len >= 4 and std.mem.eql(u8, args[1], "restore")) {
+            const snap = args[2];
+            const dest_base = args[3];
+            try Io.Dir.createDirPath(.cwd(), io, dest_base);
+            const dbf = try std.fmt.allocPrint(allocator, "{s}/nova.db", .{dest_base});
+            defer allocator.free(dbf);
+            const wdir = try std.fmt.allocPrint(allocator, "{s}/wal", .{dest_base});
+            defer allocator.free(wdir);
+            log.info("restoring {s} -> {s} ...", .{ snap, dest_base });
+            try Database.restoreSnapshot(allocator, io, snap, dbf, wdir);
+            log.info("restore complete: {s}", .{dest_base});
+            return;
+        }
     }
 
     log.info("Bootstrapping B+Tree database engine...", .{});
