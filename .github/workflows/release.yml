@@ -1,0 +1,97 @@
+name: release
+
+# Build NovaDB for every supported OS/arch and publish them on a GitHub Release.
+#
+# Fires when a version tag `vX.Y.Z` is pushed, or manually via the Actions tab
+# (workflow_dispatch) with a tag name. Zig cross-compiles every target from a
+# single Linux runner (the project's `zig build cross` step), so there is no
+# per-OS runner matrix to keep in sync.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v0.1.0)"
+        required: true
+        type: string
+
+# The job creates a Release and uploads assets, so it needs write access to the
+# repository contents.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pin the toolchain to the version the repo builds with
+      # (build.zig.zon `minimum_zig_version`). Bump both together.
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Cross-compile every supported OS/arch. The `cross` step in build.zig
+      # builds each target ReleaseSafe (it sets the mode itself, so there is no
+      # -Doptimize flag to pass) and stamps it into zig-out/cross/<triple>/:
+      #   aarch64-macos, x86_64-macos, x86_64-linux-gnu, aarch64-linux-gnu,
+      #   x86_64-windows, aarch64-windows.
+      - name: Cross-compile all targets
+        run: zig build cross
+
+      # One archive per target: .zip for Windows, .tar.gz elsewhere. Each archive
+      # carries whatever binaries that target produced (server `novadb` and/or
+      # the `novadb-cli`, `.exe` on Windows) plus LICENSE/README when present.
+      - name: Package artifacts
+        id: package
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          OUT="dist"
+          mkdir -p "$OUT"
+          shopt -s nullglob
+          for dir in zig-out/cross/*/; do
+            triple="$(basename "$dir")"
+            stage="$(mktemp -d)/novadb-${TAG}-${triple}"
+            mkdir -p "$stage"
+            cp "$dir"* "$stage"/ 2>/dev/null || true
+            for extra in LICENSE LICENSE.md README.md; do
+              [ -f "$extra" ] && cp "$extra" "$stage"/ || true
+            done
+            base="novadb-${TAG}-${triple}"
+            if [[ "$triple" == *windows* ]]; then
+              ( cd "$(dirname "$stage")" && zip -r -q "$base.zip" "$(basename "$stage")" )
+              mv "$(dirname "$stage")/$base.zip" "$OUT/"
+            else
+              tar -C "$(dirname "$stage")" -czf "$OUT/$base.tar.gz" "$(basename "$stage")"
+            fi
+          done
+          ( cd "$OUT" && sha256sum * > SHA256SUMS.txt )
+          echo "--- artifacts ---"; ls -la "$OUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: NovaDB ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt

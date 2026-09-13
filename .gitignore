@@ -1,0 +1,21 @@
+# build + cache artifacts
+.zig-cache/
+zig-out/
+**/.zig-cache/
+**/zig-out/
+*.o
+*.a
+
+# generated / scratch
+merged.nova
+*.log
+.DS_Store
+
+# runtime data + test scratch
+data/*.db
+data/*.wal
+*.novadb
+*.wal
+test_wal_recovery/
+test_wal_docwire7/
+testdata/*.db

@@ -1,0 +1,215 @@
+run 1
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U      21141.6 op/s      47.2us         29us       3016us     92    147
+Workload B  Read Mostly          95R/5U       22471.9 op/s      44.4us         28us       2083us     66    102
+Workload C  Read Only            100R         21834.1 op/s      45.7us         29us        668us     61     96
+Workload D  Read Latest          95R/5I       13210.0 op/s      75.6us         28us     299764us     85    108
+Workload E  Short Ranges         95S/5I        7293.9 op/s     136.9us         39us     443391us    141    335
+Workload F  Read-Modify-Write    50R/50RMW     7564.3 op/s     132.0us         29us     348092us    162    211
+=========================================================================================================
+
+run 2
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U      10204.1 op/s      97.9us         29us     502101us     96    127
+Workload B  Read Mostly          95R/5U       18518.5 op/s      53.8us         29us      75214us     69    114
+Workload C  Read Only            100R         16103.1 op/s      61.9us         29us     119795us     80    120
+Workload D  Read Latest          95R/5I       14970.1 op/s      66.7us         29us     193791us     87    110
+Workload E  Short Ranges         95S/5I        8912.7 op/s     112.0us         39us     204032us    128    325
+Workload F  Read-Modify-Write    50R/50RMW     6365.4 op/s     157.0us         29us     557452us    172    232
+=========================================================================================================
+
+run 3
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U       9832.8 op/s     101.6us         28us     552778us     97    130
+Workload B  Read Mostly          95R/5U        8143.3 op/s     122.6us         28us     715262us     90    169
+Workload C  Read Only            100R         19455.3 op/s      51.3us         29us       1710us     79    138
+Workload D  Read Latest          95R/5I       16920.5 op/s      59.0us         28us     104667us     88    137
+Workload E  Short Ranges         95S/5I        8163.3 op/s     122.4us         37us     290915us    146    326
+Workload F  Read-Modify-Write    50R/50RMW     9058.0 op/s     110.3us         28us     262653us    165    209
+=========================================================================================================
+
+run 4
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U      10288.1 op/s      97.0us         29us     520632us     90    120
+Workload B  Read Mostly          95R/5U       10204.1 op/s      97.8us         28us     537651us     65    121
+Workload C  Read Only            100R          9775.2 op/s     102.1us         28us     554952us     64    100
+Workload D  Read Latest          95R/5I        9615.4 op/s     103.8us         29us     577766us     87    110
+Workload E  Short Ranges         95S/5I        6293.3 op/s     158.7us         39us     636673us    140    345
+Workload F  Read-Modify-Write    50R/50RMW     5602.2 op/s     178.4us         29us     802047us    164    209
+=========================================================================================================
+
+run 5
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U      21276.6 op/s      46.9us         29us       1283us     97    138
+Workload B  Read Mostly          95R/5U       21322.0 op/s      46.7us         28us       1030us     69    104
+Workload C  Read Only            100R         14598.5 op/s      68.4us         29us     176581us     82    128
+Workload D  Read Latest          95R/5I       13037.8 op/s      76.6us         28us     294865us     88    110
+Workload E  Short Ranges         95S/5I        6435.0 op/s     155.3us         40us     621555us    139    364
+Workload F  Read-Modify-Write    50R/50RMW     7012.6 op/s     142.5us         29us     429893us    166    209
+=========================================================================================================
+
+run 6 - with 20000 page pool
+
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U       9469.7 op/s     105.5us         29us     597707us     83    125
+Workload B  Read Mostly          95R/5U       11534.0 op/s      86.5us         28us     430610us     65    105
+Workload C  Read Only            100R         22123.9 op/s      45.0us         28us        703us     59     68
+Workload D  Read Latest          95R/5I       23474.2 op/s      42.5us         28us       1968us     57     86
+Workload E  Short Ranges         95S/5I        6622.5 op/s     150.9us         37us     661964us    103    146
+Workload F  Read-Modify-Write    50R/50RMW     6930.0 op/s     144.1us         29us     493537us    154    206
+=========================================================================================================
+
+run 7
+
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U       8453.1 op/s     118.3us         29us     672361us     80    125
+Workload B  Read Mostly          95R/5U       10775.9 op/s      92.7us         28us     489985us     64    101
+Workload C  Read Only            100R          9191.2 op/s     108.6us         29us     620553us     63    111
+Workload D  Read Latest          95R/5I       22988.5 op/s      43.4us         28us       1853us     57    104
+Workload E  Short Ranges         95S/5I       11248.6 op/s      88.8us         41us      60700us    100    154
+Workload F  Read-Modify-Write    50R/50RMW     6684.5 op/s     149.4us         29us     570217us    146    204
+=========================================================================================================
+
+run 8
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U       9259.3 op/s     107.9us         28us     633633us     76    120
+Workload B  Read Mostly          95R/5U       11976.0 op/s      83.4us         28us     389344us     66    106
+Workload C  Read Only            100R          9891.2 op/s     100.9us         28us     538106us     63    113
+Workload D  Read Latest          95R/5I       22883.3 op/s      43.6us         28us        559us     65    104
+Workload E  Short Ranges         95S/5I        6849.3 op/s     145.9us         37us     629822us    100    148
+Workload F  Read-Modify-Write    50R/50RMW     7369.2 op/s     135.6us         29us     433024us    157    207
+=========================================================================================================
+
+run 9
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U       8635.6 op/s     115.6us         29us     692171us     87    124
+Workload B  Read Mostly          95R/5U       11223.3 op/s      89.0us         28us     437357us     69    119
+Workload C  Read Only            100R          8888.9 op/s     112.3us         28us     660630us     64     97
+Workload D  Read Latest          95R/5I       23094.7 op/s      43.2us         29us       1435us     58    104
+Workload E  Short Ranges         95S/5I       11737.1 op/s      85.0us         37us      50664us     96    126
+Workload F  Read-Modify-Write    50R/50RMW     6480.9 op/s     154.3us         29us     587520us    158    205
+=========================================================================================================
+
+run 10
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U       9132.4 op/s     109.5us         28us     633398us     91    130
+Workload B  Read Mostly          95R/5U       11123.5 op/s      89.8us         28us     451474us     69    111
+Workload C  Read Only            100R          9115.8 op/s     109.6us         28us     643848us     60     85
+Workload D  Read Latest          95R/5I        9276.4 op/s     107.7us         28us     642762us     66    102
+Workload E  Short Ranges         95S/5I        7002.8 op/s     142.7us         38us     572805us    105    159
+Workload F  Read-Modify-Write    50R/50RMW     7163.3 op/s     139.5us         29us     460341us    150    191
+=========================================================================================================
+
+
+====== pool size 1000 =============
+
+run 1
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U      10869.6 op/s      91.8us         29us      69332us    162    238
+Workload B  Read Mostly          95R/5U       14124.3 op/s      70.7us         29us      16997us    142    194
+Workload C  Read Only            100R         14164.3 op/s      70.5us         30us      13897us    139    177
+Workload D  Read Latest          95R/5I       12903.2 op/s      77.4us         29us     105196us    123    161
+Workload E  Short Ranges         95S/5I        3270.1 op/s     305.7us         44us       5089us    651    734
+Workload F  Read-Modify-Write    50R/50RMW     7886.4 op/s     126.7us         30us      75379us    216    283
+=========================================================================================================
+
+run 2
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U       9940.4 op/s     100.4us         28us     116925us    161    222
+Workload B  Read Mostly          95R/5U       13227.5 op/s      75.5us         29us      78736us    121    166
+Workload C  Read Only            100R         14684.3 op/s      67.9us         29us       4701us    130    161
+Workload D  Read Latest          95R/5I       13459.0 op/s      74.1us         29us      25792us    148    218
+Workload E  Short Ranges         95S/5I        3279.8 op/s     304.8us         44us      25158us    666    831
+Workload F  Read-Modify-Write    50R/50RMW     7622.0 op/s     131.0us         29us      90516us    226    308
+=========================================================================================================
+
+run 3
+
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U      10352.0 op/s      96.4us         29us      73720us    157    220
+Workload B  Read Mostly          95R/5U       14084.5 op/s      70.9us         28us      19869us    141    194
+Workload C  Read Only            100R         13927.6 op/s      71.7us         29us      13906us    143    203
+Workload D  Read Latest          95R/5I       13831.3 op/s      72.2us         29us      11213us    143    205
+Workload E  Short Ranges         95S/5I        3461.4 op/s     288.8us         43us       2907us    642    706
+Workload F  Read-Modify-Write    50R/50RMW     7745.9 op/s     129.0us         29us     101537us    215    278
+=========================================================================================================
+
+run 4
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U       9765.6 op/s     102.3us         29us      97290us    167    244
+Workload B  Read Mostly          95R/5U       13245.0 op/s      75.4us         28us      49409us    143    212
+Workload C  Read Only            100R         12578.6 op/s      79.4us         29us      80246us    141    193
+Workload D  Read Latest          95R/5I       15015.0 op/s      66.5us         29us      11251us    126    157
+Workload E  Short Ranges         95S/5I        3342.2 op/s     299.0us         43us       5993us    648    736
+Workload F  Read-Modify-Write    50R/50RMW     7955.4 op/s     125.6us         29us      69585us    206    274
+=========================================================================================================
+
+run 5
+=========================================================================================================
+YCSB Benchmark Suite Summary
+=========================================================================================================
+Workload  Description          Mix         Throughput  Avg Latency  Min Latency  Max Latency  p95    p99
+---------------------------------------------------------------------------------------------------------
+Workload A  Update Heavy         50R/50U       8680.6 op/s     115.0us         29us     180725us    187    283
+Workload B  Read Mostly          95R/5U       13568.5 op/s      73.6us         29us      23327us    146    218
+Workload C  Read Only            100R         14005.6 op/s      71.3us         30us      15861us    141    182
+Workload D  Read Latest          95R/5I       12562.8 op/s      79.4us         29us      90490us    142    183
+Workload E  Short Ranges         95S/5I        3288.4 op/s     304.0us         46us       5795us    646    717
+Workload F  Read-Modify-Write    50R/50RMW     7686.4 op/s     130.0us         29us     116034us    211    264
+=========================================================================================================

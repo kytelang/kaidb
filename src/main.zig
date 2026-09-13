@@ -1,0 +1,480 @@
+//! NovaDB server entry point: bootstraps the storage engine and serves it over
+//! two network fronts.
+//!
+//! This is the top-level `main` for the standalone `btree`/`novadb` executable.
+//! Its whole job is orchestration, not storage logic: it reads configuration,
+//! opens (and on first run creates) the on-disk [`Database`], wires up the
+//! query layer, optionally joins a replication topology, and then runs two
+//! listeners concurrently until a shutdown signal arrives.
+//!
+//! The engine exposes two independent front ends over the same live
+//! [`Database`]:
+//!
+//!   1. A binary/TCP protocol server ([`TcpServer`]) on `config.address:config.port`
+//!     , the intended fast path that Nova's driver speaks (see `src/proto/`).
+//!   2. An HTTP server ([`schnell.Server`]) on `config.http.*` that serves static
+//!      content and a JSON `POST /query` convenience endpoint via [`handleHttp`].
+//!
+//! Both listeners run as async tasks on a single shared [`std.Io.Threaded`]
+//! executor; the main thread then parks in a 100ms poll loop watching
+//! [`shutdown_triggered`], which the POSIX signal handler flips. The whole
+//! design is intentionally "do all fallible setup up front, then serve": every
+//! resource is opened with a matching `defer` for orderly teardown, so a failure
+//! during bootstrap unwinds cleanly rather than leaving half-open files or ports.
+//!
+//! Configuration precedence is layered: values come from the on-disk config
+//! ([`Config.load`]) and are then OVERRIDDEN by environment variables
+//! (`PRIMARY`, `REPLICA_*`, `HTTP_PORT`, `SYNCHRONOUS_COMMIT`). This lets an
+//! orchestrator inject role and topology at launch without rewriting the config
+//! file, which is how the same binary boots as either a primary or a follower.
+//!
+//! Replication role is decided here, not in the storage layer: if `config.primary`
+//! is false the node becomes a follower ([`Database.becomeFollower`]) and starts
+//! a fence-guarded replication listener; a primary with replication enabled
+//! becomes a durable leader that ships WAL to its replica. A leader that cannot
+//! reach its replica logs and serves anyway (availability over strict
+//! durability at startup), whereas a follower that fails to start is only logged
+//!, the process still comes up read-serving from its local file.
+
+const std = @import("std");
+const Io = std.Io;
+const Dir = Io.Dir;
+const builtin = @import("builtin");
+
+/// The parsed server configuration type (data dir, ports, TLS, durability,
+/// replication, security). Loaded from disk by [`Config.load`] and then patched
+/// from the environment before any resource is opened.
+const Config = @import("common/config.zig").Config;
+/// The live storage engine handle: the opened B+Tree file, buffer pool, WAL,
+/// MVCC state, security manager and replication role live behind this. Opened
+/// once in [`main`] via [`Database.open`] and shared read/write by both listeners.
+const Database = @import("schema.zig").Database;
+/// Executes a decoded query against a [`Database`] and returns columns/rows. One
+/// shared instance ([`global_executor`]) is fronted by both the TCP and HTTP paths.
+const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+/// The JSON-decodable request shape accepted by the HTTP `POST /query` endpoint;
+/// parsed from the request body in [`handleHttp`].
+const QueryRequest = @import("query/query_executor.zig").QueryRequest;
+/// The binary/wire-protocol listener, the primary path Nova's driver speaks. Run
+/// as an async task by [`startTcpServer`].
+const TcpServer = @import("query/tcp_server.zig").TcpServer;
+
+/// The lightweight HTTP(S) server used for the static-file and JSON-query front
+/// end; distinct from the binary [`TcpServer`] and driven by [`startHttpServer`].
+const schnell = @import("common/schnell.zig");
+
+/// Scoped logger for this module; all bootstrap and lifecycle messages are tagged
+/// `.main` so server startup can be filtered from storage/protocol logs.
+const log = std.log.scoped(.main);
+
+/// In-memory cache of static assets served over HTTP (path → bytes + MIME + ETag).
+/// Populated from `config.http.static_dir` and looked up by [`handleHttp`] on `GET`.
+const StaticContentStore = @import("utils").StaticContentStore;
+
+/// Shared, opaque context threaded through the HTTP raw handler.
+///
+/// [`schnell.Server`] hands the handler a `?*anyopaque`; this struct is what that
+/// pointer actually is, cast back in [`handleHttp`]. It bundles the two things a
+/// request needs, the query engine and the optional static store, so the
+/// handler stays a free function with no captured state.
+const ServerContext = struct {
+    /// The shared query engine used to service `POST /query`. Borrowed, not owned
+    /// (it points at [`global_executor`], whose lifetime spans the whole server).
+    executor: *QueryExecutor,
+    /// Optional static-asset store for `GET` requests; `null` (or an empty store)
+    /// means no static content is served and every `GET` falls through to 404.
+    static_store: ?*StaticContentStore,
+};
+
+/// Process-wide query executor, stored as an optional so it can be constructed
+/// after the [`Database`] is open yet still referenced by the module-level
+/// [`ServerContext`]. Set once in [`main`]; `null` before bootstrap completes.
+var global_executor: ?QueryExecutor = null;
+/// Set to `true` by [`shutdownSignalHandler`] on SIGINT/SIGTERM. The main loop
+/// in [`main`] polls this to leave its serve loop; atomic + seq_cst because it is
+/// written from an async signal context and read from the main thread.
+var shutdown_triggered: std.atomic.Value(bool) = .init(false);
+/// Weak, module-level pointer to the running HTTP server so a signal handler
+/// could reach it. Published in [`main`] after the server is constructed; may be
+/// `null` before then. Only pointers safe to touch from a signal handler belong here.
+var shutdown_server: ?*schnell.Server = null;
+
+/// Async-signal handler for SIGINT/SIGTERM that requests a graceful shutdown.
+///
+/// It does the minimum legal in signal context: a single atomic swap on
+/// [`shutdown_triggered`]. The swap doubles as an idempotency guard, a second
+/// signal returns immediately rather than re-running teardown. The actual
+/// stopping of servers happens back on the main thread once its poll loop
+/// observes the flag, because tearing sockets down from a signal handler is not
+/// async-signal-safe. The `shutdown_server` deref is intentionally a no-op here
+/// (the pointer is only read, not acted on) for that same reason.
+fn shutdownSignalHandler(sig: std.c.SIG) callconv(.c) void {
+    _ = sig;
+    if (shutdown_triggered.swap(true, .seq_cst)) return;
+    if (shutdown_server) |s| {
+        _ = s;
+    }
+}
+
+/// Installs [`shutdownSignalHandler`] for SIGINT and SIGTERM on POSIX hosts.
+///
+/// No-op on Windows (guarded at comptime), which has no `sigaction`; the Windows
+/// server would need a console control handler instead. The mask is empty and
+/// flags are 0, so the handler runs without blocking other signals, acceptable
+/// because it does only an atomic swap and returns.
+fn installShutdownHandlers() void {
+    if (comptime builtin.os.tag != .windows) {
+        const action = std.posix.Sigaction{
+            .handler = .{ .handler = shutdownSignalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &action, null);
+        std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+    }
+}
+
+/// Resolves the directory to load configuration from.
+///
+/// Currently this always returns the current working directory: it probes for a
+/// `db.json` there and returns `.cwd()` whether or not the probe succeeds (the
+/// error branch falls through to the same result). The probe is retained as the
+/// hook where an alternative search path would be added; today it has no
+/// behavioural effect and the caller ([`main`]) treats a missing config as a
+/// hard error via [`Config.load`].
+fn configDir(io: Io) Io.Dir {
+    if (Io.Dir.access(.cwd(), io, "db.json", .{})) {
+        return .cwd();
+    } else |_| {}
+    return .cwd();
+}
+
+/// Async task body that runs the HTTP listener to completion.
+///
+/// Spawned into an [`Io.Group`] by [`main`]. It calls the blocking
+/// [`schnell.Server.listen`] and swallows any listen error into a log line rather
+/// than propagating it, so a failed HTTP front end does not abort the process
+/// while the TCP front end may still be serving. Returns `Io.Cancelable!void`
+/// because the group cancels it during shutdown.
+fn startHttpServer(server: *schnell.Server, thr_io: Io) Io.Cancelable!void {
+    server.listen(thr_io) catch |err| {
+        log.err("HTTP server error: {}", .{err});
+    };
+}
+
+/// Async task body that runs the binary/TCP protocol listener to completion.
+///
+/// The mirror of [`startHttpServer`] for [`TcpServer`]: spawned into its own
+/// [`Io.Group`], it runs [`TcpServer.listen`] and logs (rather than propagates)
+/// any error so one front end failing does not take down the other. Cancelled by
+/// the group on shutdown.
+fn startTcpServer(server: *TcpServer, thr_io: Io) Io.Cancelable!void {
+    server.listen(thr_io) catch |err| {
+        log.err("TCP server error: {}", .{err});
+    };
+}
+
+/// Raw HTTP request handler: turns a raw request buffer into a full HTTP
+/// response string.
+///
+/// Registered with [`schnell.Server.setRawHandler`], so it sees the unparsed
+/// request bytes and must emit the entire response (status line, headers, body).
+/// It handles exactly two routes and 404s everything else:
+///
+///   - `GET <path>`: if a [`StaticContentStore`] is present and has the file, it
+///     is returned with `Content-Type`, `Content-Length`, `ETag` and a one-hour
+///     `Cache-Control`. A miss falls through to 404.
+///   - `POST /query`: the body is parsed as a [`QueryRequest`]; a malformed body
+///     yields `400 Bad Request` with a JSON error, otherwise the query runs on
+///     the shared [`QueryExecutor`] and the result is serialised to JSON with `200 OK`.
+///
+/// Every allocation the response is built from is freed via `defer` before
+/// return, including the deep free of the executor result's columns and rows.
+/// Returns `error.MissingServerContext` if the opaque context pointer is null,
+/// and propagates allocation/serialisation errors as `anyerror`; the caller (the
+/// server) owns the returned slice.
+fn handleHttp(allocator: std.mem.Allocator, raw_request: []const u8, ctx: ?*anyopaque) anyerror![]const u8 {
+    const s_ctx: *ServerContext = @ptrCast(@alignCast(ctx orelse return error.MissingServerContext));
+
+    if (std.mem.startsWith(u8, raw_request, "GET ")) {
+        if (s_ctx.static_store) |store| {
+            const path_end = std.mem.indexOf(u8, raw_request, " HTTP/") orelse raw_request.len;
+            if (path_end > 4) {
+                const path = raw_request[4..path_end];
+                if (store.lookup(path)) |file| {
+                    return try std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\n" ++
+                        "Content-Type: {s}\r\n" ++
+                        "Content-Length: {d}\r\n" ++
+                        "ETag: {s}\r\n" ++
+                        "Cache-Control: public, max-age=3600\r\n\r\n{s}", .{ file.mime_type, file.data.len, file.etag, file.data });
+                }
+            }
+        }
+    }
+
+    if (std.mem.startsWith(u8, raw_request, "POST /query") or std.mem.indexOf(u8, raw_request, "POST /query ") != null) {
+        // The JSON /query endpoint is the SQL surface; reject it when the instance
+        // runs in document-only mode (matches the wire-protocol gate).
+        if (s_ctx.executor.db.mode == .document) {
+            const msg = "{\"error_message\":\"SQL is disabled: this server runs in document mode\"}";
+            return try std.fmt.allocPrint(allocator, "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ msg.len, msg });
+        }
+        const body = getHttpBody(raw_request);
+        const req = std.json.parseFromSlice(QueryRequest, allocator, body, .{}) catch |err| {
+            const err_resp = try std.fmt.allocPrint(allocator, "{{\"error_message\":\"Invalid JSON payload: {any}\"}}", .{err});
+            defer allocator.free(err_resp);
+            return try std.fmt.allocPrint(allocator, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ err_resp.len, err_resp });
+        };
+        defer req.deinit();
+
+        const executor = s_ctx.executor;
+        const res = try executor.execute(req.value);
+        defer {
+            if (res.error_message) |m| allocator.free(m);
+            for (res.columns) |c| allocator.free(c);
+            allocator.free(res.columns);
+            for (res.rows) |r| {
+                for (r) |c| allocator.free(c);
+                allocator.free(r);
+            }
+            allocator.free(res.rows);
+        }
+
+        var allocating = std.Io.Writer.Allocating.init(allocator);
+        defer allocating.deinit();
+        try allocating.writer.print("{f}", .{std.json.fmt(res, .{})});
+
+        return try std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ allocating.written().len, allocating.written() });
+    }
+
+    return try allocator.dupe(u8, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+}
+
+/// Extracts the body of an HTTP request by finding the header/body separator.
+///
+/// Splits on the first `\r\n\r\n` (proper HTTP) and, failing that, a bare `\n\n`
+/// (tolerating lax clients / test traffic). If no blank-line separator is found
+/// at all it returns the whole buffer unchanged, on the assumption the caller
+/// passed a body-only payload. The result borrows into `raw`; it does not copy.
+fn getHttpBody(raw: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |idx| {
+        return raw[idx + 4 ..];
+    }
+    if (std.mem.indexOf(u8, raw, "\n\n")) |idx| {
+        return raw[idx + 2 ..];
+    }
+    return raw;
+}
+
+/// Reads the optional `providers.yaml` from a directory into a freshly allocated
+/// buffer.
+///
+/// A missing file is not an error: `error.FileNotFound` is mapped to an empty
+/// slice so an absent providers config is treated as "no providers" rather than
+/// a failure. Any other I/O error propagates. On success the caller owns the
+/// returned bytes and must free them (the `errdefer` only covers the failure
+/// path within this function).
+fn loadProviders(allocator: std.mem.Allocator, io: std.Io, dir: Io.Dir) ![]u8 {
+    const content = Io.Dir.readFileAlloc(dir, io, "providers.yaml", allocator, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => return &.{},
+        else => return err,
+    };
+    errdefer allocator.free(content);
+    return content;
+}
+
+/// Process entry point: bootstrap the engine, start both listeners, serve until
+/// shutdown.
+///
+/// The body is a strict "acquire, then serve" sequence, each resource paired with
+/// a `defer` for teardown in reverse order:
+///
+///   1. Choose an allocator, a leak-detecting [`DebugAllocator`] in Debug builds
+///      (the deferred `detectLeaks` exits non-zero on any leak, making tests fail
+///      loudly), the libc allocator otherwise.
+///   2. Build the [`std.Io.Threaded`] executor both listeners share, load and
+///      validate [`Config`], and create the data directory.
+///   3. Open the [`Database`] (WAL dir only when durability is enabled) and apply
+///      environment overrides for role/ports/durability over the file config.
+///   4. Establish replication role: follower vs durable leader (see the module
+///      header for the availability trade-offs on failure).
+///   5. Construct the shared [`QueryExecutor`], the [`StaticContentStore`], and
+///      the [`ServerContext`], then start the HTTP and TCP servers as async tasks
+///      in separate [`Io.Group`]s.
+///   6. Install signal handlers and park in a 100ms poll loop on
+///      [`shutdown_triggered`]; on shutdown, stop and cancel both servers.
+///
+/// Returns any bootstrap error (config, directory creation, DB open, server init)
+/// to the runtime, which aborts startup. Runtime listen errors, by contrast, are
+/// logged inside the task bodies and do not propagate here.
+pub fn main(init: std.process.Init) !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    const allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
+
+    defer if (builtin.mode == .Debug) {
+        if (gpa.detectLeaks() > 0) {
+            std.process.exit(1);
+        }
+    };
+
+    var threaded: std.Io.Threaded = .init(allocator, .{
+        .environ = init.minimal.environ,
+        .async_limit = .unlimited,
+        .concurrent_limit = .unlimited,
+    });
+
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Offline maintenance: `novadb compact <src_dir> <dst_dir>` rebuilds the
+    // database into a fresh, fully packed file and exits (see compact.zig). Runs
+    // before any server/config setup so it is a pure one-shot tool.
+    {
+        const args = try init.minimal.args.toSlice(allocator);
+        defer allocator.free(args);
+        if (args.len >= 4 and std.mem.eql(u8, args[1], "compact")) {
+            log.info("compacting {s} -> {s} ...", .{ args[2], args[3] });
+            try @import("compact.zig").compact(allocator, io, args[2], args[3]);
+            return;
+        }
+    }
+
+    log.info("Bootstrapping B+Tree database engine...", .{});
+
+    const config_dir = configDir(io);
+    var parsed_config = Config.load(allocator, io, config_dir) catch |err| {
+        log.err("configuration error: {any}", .{err});
+        return err;
+    };
+    defer parsed_config.deinit();
+    const config = &parsed_config.value;
+
+    Io.Dir.createDirPath(.cwd(), io, config.base_dir) catch |err| {
+        log.err("could not create data directory {s}: {any}", .{ config.base_dir, err });
+        return err;
+    };
+
+    const db_file_path = try std.fmt.allocPrint(allocator, "{s}/nova.db", .{config.base_dir});
+    defer allocator.free(db_file_path);
+
+    const wal_dir = if (config.durability.enabled)
+        try std.fmt.allocPrint(allocator, "{s}/wal", .{config.base_dir})
+    else
+        null;
+    defer if (wal_dir) |d| allocator.free(d);
+
+    // Page-mgmt (mmap reads): opt-in, enabled INSIDE open (before recovery and
+    // tree-cache population read any page) so startup reads borrow the read-only
+    // map instead of materialising into slab windows; see `Database.openWithMmap`
+    // and `match-page-mgmt-with-sqlite.md`.
+    const pool_pages = config.effectivePoolPages();
+    log.info("buffer pool: {d} pages ({d} MiB){s}", .{
+        pool_pages,
+        (@as(u64, pool_pages) * 16384) / (1024 * 1024),
+        if (config.pool_size == 0) " [auto]" else "",
+    });
+    var db = if (config.mmap_reads)
+        try Database.openWithMmap(allocator, io, db_file_path, pool_pages, wal_dir)
+    else
+        try Database.open(allocator, io, db_file_path, pool_pages, wal_dir);
+    defer db.close();
+    db.security_manager.enabled = config.security.enabled;
+
+    if (init.environ_map.get("PRIMARY")) |v| config.primary = std.mem.eql(u8, v, "true");
+    if (init.environ_map.get("REPLICA_ENABLED")) |v| config.replica.enabled = std.mem.eql(u8, v, "true");
+    if (init.environ_map.get("REPLICA_PORT")) |v| {
+        if (std.fmt.parseInt(u16, v, 10)) |p| config.replica.port = p else |_| {}
+    }
+    if (init.environ_map.get("HTTP_PORT")) |v| {
+        if (std.fmt.parseInt(u16, v, 10)) |p| config.http.port = p else |_| {}
+    }
+
+    const repl_addr = blk: {
+        if (init.environ_map.get("REPLICA_ADDRESS")) |v| {
+            if (v.len > 0) break :blk v;
+        }
+        break :blk if (config.replica.address.len > 0) config.replica.address else "127.0.0.1";
+    };
+    if (!config.primary) {
+        const fence_dir = wal_dir orelse config.base_dir;
+        db.becomeFollower(repl_addr, config.replica.port, fence_dir, config.replica.key, .{}) catch |err| {
+            log.err("failed to start follower replication listener: {any}", .{err});
+        };
+    } else if (config.replica.enabled) {
+        db.becomeDurableLeader(repl_addr, config.replica.port, 2, 1, 5000, config.replica.key, .{}) catch |err| {
+            log.err("leader could not connect to replica {s}:{d} for shipping: {any} (serving without replication)", .{ repl_addr, config.replica.port, err });
+        };
+    }
+
+    // Single data-model surface: SQL-only or document-only (see ServerMode). The
+    // wire session and HTTP query handler reject the other surface's requests.
+    db.mode = config.mode;
+    log.info("data model: {s}", .{@tagName(config.mode)});
+
+    db.synchronous_commit = config.durability.synchronous_commit;
+    if (init.environ_map.get("SYNCHRONOUS_COMMIT")) |val| {
+        db.synchronous_commit = std.mem.eql(u8, val, "true");
+    }
+
+    // Apply the configured result-materialisation cap before any connection is
+    // accepted. It bounds how many bytes one query may buffer while building its
+    // result set, so a runaway unindexed sort/scan fails cleanly with a "Query
+    // Memory Limit Exceeded" response instead of OOM-killing the whole server.
+    // Read by every executed query on both the wire and HTTP paths. 0 in config
+    // means unlimited.
+    QueryExecutor.result_bytes_limit_default =
+        if (config.query_memory_limit_bytes == 0) null else config.query_memory_limit_bytes;
+
+    global_executor = QueryExecutor.init(allocator, db);
+    defer global_executor.?.deinit();
+
+    var static_store = StaticContentStore.init(allocator);
+    defer static_store.deinit();
+
+    const static_dir = config.http.static_dir orelse "public";
+    static_store.loadDir(io, static_dir) catch |err| {
+        log.warn("Failed to load static content from '{s}': {any}", .{ static_dir, err });
+    };
+
+    var server_context: ServerContext = .{
+        .executor = &global_executor.?,
+        .static_store = &static_store,
+    };
+
+    var http_cfg = config.http;
+    if (config.tls.enabled) {
+        http_cfg.tls_cert_file = config.tls.cert_file;
+        http_cfg.tls_key_file = config.tls.key_file;
+    }
+
+    var http_server = try schnell.Server.init(allocator, http_cfg);
+    defer http_server.deinit();
+
+    http_server.setRawHandler(handleHttp, &server_context);
+    shutdown_server = &http_server;
+
+    var http_group: Io.Group = .init;
+    http_group.async(io, startHttpServer, .{ &http_server, io });
+
+    log.info("Database HTTPS Server listening on {s}:{d}...", .{ http_cfg.host, http_cfg.port });
+
+    var tcp_server = TcpServer.init(allocator, config.address, config.port, db, config.max_sessions, config);
+    defer tcp_server.deinit();
+
+    var tcp_group: Io.Group = .init;
+    tcp_group.async(io, startTcpServer, .{ &tcp_server, io });
+
+    log.info("Database TCP Server listening on {s}:{d}...", .{ config.address, config.port });
+
+    installShutdownHandlers();
+
+    while (!shutdown_triggered.load(.seq_cst)) {
+        io.sleep(Io.Duration.fromMilliseconds(100), .awake) catch {};
+    }
+
+    log.info("Shutdown signal received. Shutting down...", .{});
+    http_server.stop(io);
+    http_group.cancel(io);
+    tcp_server.stop(io);
+    tcp_group.cancel(io);
+}

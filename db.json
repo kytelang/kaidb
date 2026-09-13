@@ -1,0 +1,10 @@
+{
+  "port": 3009,
+  "primary": true,
+  "replica": {
+    "enabled": false,
+    "address": "127.0.0.1",
+    "port": 3010,
+    "key": ""
+  }
+}
