@@ -141,8 +141,17 @@ pub const Config = struct {
     http: schnell.ServerConfig = .{},
     /// Security-feature toggle block.
     security: struct {
-        /// Master switch for the security features.
+        /// Master switch for the security features. When true the server issues
+        /// the password challenge at startup and authenticates connections
+        /// against `sys.users` (an `admin` account is bootstrapped on a fresh
+        /// database with the password `admin` — CHANGE IT before exposing the
+        /// server; the engine logs a warning while it is unchanged).
         enabled: bool = false,
+        /// Enforce authentication: reject any query/exec on a connection that has
+        /// not authenticated. Implies `enabled`. With it off (default) the server
+        /// keeps the first-run-friendly behaviour (open access when no users, or
+        /// challenge-but-do-not-require when users exist).
+        require_auth: bool = false,
     } = .{},
     /// Replication settings for a follower (or the link a primary offers).
     ///

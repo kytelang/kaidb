@@ -293,6 +293,11 @@ pub const SecurityManager = struct {
     /// Master switch. When false, authentication and checks are bypassed and a
     /// synthetic admin session is returned everywhere.
     enabled: bool,
+    /// When true, a connection that has not authenticated is refused at the
+    /// query/exec boundary (not just challenged at startup). Set from
+    /// `config.security.require_auth`; implies `enabled`. Defaults false so the
+    /// embedded/first-run path is unchanged.
+    require_auth: bool = false,
     /// The async I/O context used for the clock, CSPRNG, mutexes, and the
     /// Argon2 KDF.
     io: Io,

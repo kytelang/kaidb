@@ -348,6 +348,23 @@ pub fn run(sess: *Session, reader: *Io.Reader, writer: *Io.Writer) !void {
             continue;
         }
 
+        // Auth enforcement: with `require_auth` on, every data-plane frame requires an
+        // authenticated session (SQLSTATE 28000). The startup challenge already blocks
+        // unauthenticated connects when auth is enabled; this is defence-in-depth that
+        // also fail-closes any data frame arriving before/without authentication. Auth
+        // frames (startup/auth_response) and protocol control (sync/close/terminate)
+        // pass through so a client can still authenticate and disconnect cleanly.
+        const data_plane = switch (t) {
+            .query, .parse, .bind, .describe, .execute => true,
+            else => false,
+        };
+        if (data_plane and sess.executor.db.security_manager.require_auth and !sess.authenticated) {
+            try sendOwned(writer, allocator, try wire.encodeError(allocator, "ERROR", "28000", "authentication required"));
+            try sendOwned(writer, allocator, try wire.encodeReady(allocator, .idle));
+            try writer.flush();
+            continue;
+        }
+
         switch (t) {
             .startup => {
                 const su = wire.decodeStartup(frame.payload) catch {

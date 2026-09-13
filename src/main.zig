@@ -450,6 +450,23 @@ pub fn main(init: std.process.Init) !void {
         db.synchronous_commit = std.mem.eql(u8, val, "true");
     }
 
+    // Authentication enforcement. `openInner` constructs the security manager
+    // disabled (embedded-friendly default); apply the configured policy here now
+    // that config is known. `require_auth` implies `enabled`. When auth is active
+    // the startup path challenges every connection and rejects bad credentials;
+    // with `require_auth` the wire session additionally fail-closes any data-plane
+    // frame on an unauthenticated connection.
+    db.security_manager.enabled = config.security.enabled or config.security.require_auth;
+    db.security_manager.require_auth = config.security.require_auth;
+    if (db.security_manager.enabled) {
+        log.info("authentication ENABLED (require_auth={})", .{config.security.require_auth});
+        // A fresh database seeds `admin`/`admin`. We deliberately do NOT probe the
+        // credential here (a failed probe would feed the brute-force lockout and
+        // could lock the real admin out across restarts); instead advise operators
+        // unconditionally to rotate it before exposing the server.
+        log.warn("SECURITY: ensure the bootstrap 'admin' account's default password ('admin') has been changed (ALTER USER admin PASSWORD ...) before exposing this server", .{});
+    }
+
     // Apply the configured result-materialisation cap before any connection is
     // accepted. It bounds how many bytes one query may buffer while building its
     // result set, so a runaway unindexed sort/scan fails cleanly with a "Query
