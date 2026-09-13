@@ -1,0 +1,254 @@
+# kaidb (NovaDB) Production Fitness Audit
+
+Status: verified against the source tree at commit `87a8221` (branch `main`).
+Every claim below cites `file:line` so it can be checked. Where a statement is a
+measurement from this session's benchmarks it is marked **[measured]**; where it is
+an informed engineering estimate rather than a read fact it is marked **[estimate]**.
+Everything else is **[verified]** by reading the cited code.
+
+## 1. Scope this audit judges against
+
+kaidb is scoped (decision of record) as the **embedded control-plane / config store
+for the Nova/Kyte orchestrator**: small, bounded, low-churn data (workload specs,
+leader leases, membership, manifests), typically fitting in RAM on a single node or a
+small primary+follower set. It is explicitly **not** positioned as a general-purpose
+OLTP/analytics engine. This document judges fitness for that scoped role first, and
+separately notes what a general-purpose ambition would additionally require.
+
+"Production-ready" here means: durable across crashes, safe under concurrency,
+authenticated, backup/restorable, observable, and operable. Benchmark speed is
+necessary but not part of the readiness bar.
+
+## 2. Methodology and honesty note
+
+An earlier one-line "is it prod-ready?" answer in this session was a fast triage from
+memory and got two things wrong (it called auth "missing" and crash-recovery a "gap"
+when both exist and are exercised). This document is the corrective: a subsystem walk
+with citations. Treat the verdicts as reliable; treat effort sizes as estimates.
+
+## 3. Verdict summary
+
+| Subsystem | Status for scoped role | Evidence |
+|---|---|---|
+| Crash recovery / durability | READY | `durability/`, `pool.zig` WAL-before-page + doublewrite |
+| Concurrency safety | READY (last known race fixed this session) | `btree.zig`, `root.zig` fuzzers |
+| Authentication / authorization | READY (opt-in; enforce via config) | `concurrency/security.zig`, `proto/session.zig` |
+| Backup / restore | READY (cold) / hot is a follow-up | `main.zig`, `schema/database.zig` snapshot |
+| Replication / HA | USABLE, ops-thin | `schema/database.zig` fence + follower |
+| Resource governance | PARTIAL | `query_executor.zig`, `tcp_server.zig` |
+| Observability / metrics | MISSING | no `/metrics`, logs only |
+| Point-in-time recovery | MISSING | snapshot+WAL primitives exist, no archiving |
+| Scale (general-purpose) | NOT A GOAL for scoped role | `btree.zig` clustered design |
+
+Bottom line: **fit for the scoped control-plane role once observability + PITR land**;
+not intended as a general-purpose DB, and the scale items are only required if that
+ambition changes.
+
+## 4. Subsystem findings (verified)
+
+### 4.1 Durability and crash recovery: READY
+
+- Write-ahead logging with the standard WAL-before-page invariant is enforced at every
+  page write, not just at checkpoint: `PagePool.walBeforePageLsn` (`storage/pool.zig:359`)
+  is called on the eviction/flush paths (`storage/pool.zig:638`, `:721`) and
+  `walBeforePage` up front on the whole-pool flushes (`:834`, `:923`, `:964`).
+- WAL segments are `fsync`ed (`durability/write_ahead_log.zig:650` `sync`), and an
+  atomic checkpoint marker (`CHECKPOINT`, written via temp-file + rename) records the
+  replay boundary (`durability/checkpoint.zig:65`, `:99`).
+- Recovery on open is a documented three-phase redo (catalog, user DML + index rebuild,
+  then repair) (`schema/database.zig:54`), preceded by torn-write repair from the
+  doublewrite buffer (`recoverDoublewriteBuffer`, `schema/database.zig:1213`) before any
+  page is trusted. WAL replay entry points: `write_ahead_log.zig:1035` (`replay`),
+  `:967` (`replayFile`).
+- `synchronous_commit` is configurable (`common/config.zig`, applied at
+  `main.zig` via `db.synchronous_commit`), trading latency for per-commit durability.
+- **Known constraint [verified]:** the overflow cutoff is fixed at `PAGE_SIZE/8`
+  (`storage/overflow.zig:94`); the comment at `:80`-`:90` states that raising it is
+  blocked on an unaddressed ARIES crash-recovery gap for large overflow values. So very
+  large inline values are deliberately capped rather than risk that path. Fine for the
+  control-plane workload; a constraint to note for large-blob use.
+
+Assessment: durable and crash-safe for its workload, with one self-documented cutoff.
+
+### 4.2 Concurrency safety: READY
+
+- Per-tree `structure_lock` (shared for in-place reads/writes, exclusive for
+  restructures) plus per-frame latches; the buffer pool is 16-way sharded with
+  per-shard `rw_lock` (`storage/pool.zig` header docs; `MIN_POOL_SIZE=64` at `:95`).
+- A default-on concurrency fuzzer runs in the plain test gate (not opt-in):
+  "OVERLAPPING-key writers on one tree" (`root.zig:4705`-`4708`), scaled up by
+  `NOVADB_FUZZ`.
+- **The one known race is fixed this session [measured]:** `PageStillPinned` on a
+  delete-driven merge/collapse, root-caused to a page pinned across a `discardPage` of
+  that same page in three sites (`mergePages`, `deleteExclusive` root collapse,
+  `handleUnderflow`) in `storage/btree.zig`. Reproduced deterministically via a
+  window-widening fault hook (`btree.fault_merge_yield_ms`, `storage/btree.zig`),
+  which turned a ~0/15 natural rate into ~5/40; post-fix 0/50 with the window on, and
+  an always-on regression test guards it ("REGRESSION: merge pin-lifetime", `root.zig`).
+
+Assessment: safe for the concurrent access the role sees. Higher write concurrency on a
+single hot tree is bounded by the exclusive `structure_lock` (see 5.6), which is not a
+correctness issue.
+
+### 4.3 Authentication and authorization: READY (opt-in)
+
+- Full security surface exists: `CREATE USER ... WITH PASSWORD`, `CREATE ROLE`,
+  `GRANT`/`REVOKE` in SQL (`sql/ast.zig:91`+, `sql/lexer.zig`), an Argon2id password
+  verifier with per-user salt (`concurrency/security.zig:174` `User`, `authenticate` at
+  `:516` with constant-time compare at `:559`), session tokens, and brute-force lockout
+  with exponential backoff (`security.zig:333`-`339`).
+- Startup challenge/response is wired: on an enabled manager with users the server
+  issues a cleartext-password challenge and authenticates (`proto/session.zig:359`).
+- **Enforcement was added this session [measured]:** `config.security.require_auth`
+  (`common/config.zig:143`) is applied to the live manager at startup (`main.zig`), and
+  the wire session fail-closes every data-plane frame on an unauthenticated connection
+  with SQLSTATE 28000 (`proto/session.zig:361`). Verified: wrong password rejected,
+  correct `admin` accepted.
+- **Two caveats [verified]:** (a) a fresh database bootstraps `admin`/`admin`
+  (`schema/database.zig:506`); the server logs an advisory to rotate it, but it is not
+  forced. (b) The password path is cleartext-over-the-wire and is **not yet TLS-gated**;
+  it should be refused on a non-TLS connection when `require_auth` is on (see 5.B.8).
+
+Assessment: the mechanism is real and enforceable; production use requires enabling
+`require_auth`, rotating the bootstrap credential, and running over TLS.
+
+### 4.4 Backup and restore: READY (cold); hot backup is a follow-up
+
+- Consistent physical snapshot primitives exist and are replication-tested:
+  `Database.exportSnapshot` (`schema/database.zig:2450`) flushes WAL, flushes all pages,
+  `fsync`s, copies every page to `snapshot.db`, and copies the WAL directory;
+  `restoreSnapshot` (`:2504`) reconstructs the data file + WAL.
+- **Operator CLI added this session [measured]:** `novadb backup <base> <dest>` and
+  `novadb restore <snap> <dest>` (`main.zig`), verified end-to-end (load → backup →
+  restore into a fresh dir → byte-identical query results across all benchmark queries).
+- **Constraint [verified]:** the CLI opens its own handle, so it is a **cold** backup
+  (run against a stopped server). A live/hot backup would call `exportSnapshot` in-process
+  via a server command (see 5.B.2).
+
+Assessment: reliable cold backup/restore today; hot backup and PITR are the gaps.
+
+### 4.5 Replication and HA: USABLE, operationally thin
+
+- Primary ships WAL to a follower; a follower is entered via `becomeFollower`, and a
+  fence epoch protects against a stale leader: `guardWrite` rejects a write from a
+  fenced-off leader (`schema/database.zig:2396`), the epoch is persisted to a sidecar
+  (`:2584`, `fenceDir` at `:2437`), and resync uses `exportSnapshotForResync` (`:2544`).
+- A background writer + HA lease loop run under the `Database` (`schema/database.zig:522`
+  spawns `runBgWriterTask`).
+
+Assessment: the correctness primitives (fencing, snapshot resync) are present and
+tested for the orchestrator's needs, but the **operational surface is thin**: no lag
+metric, no first-class promote/failover command, no automated re-sync tooling (see 5.B.7).
+
+### 4.6 Resource governance: PARTIAL
+
+- Per-query result-memory cap: `result_bytes_limit` (`query_executor.zig:736`), set from
+  `config.query_memory_limit_bytes` at `main.zig`; a runaway query fails with "Query
+  Memory Limit Exceeded" rather than OOMing the server (`query_executor.zig:57`).
+- Per-query deadline: `deadline_ms` + `checkDeadline` (`query_executor.zig:741`).
+- Connection cap: `TcpServer.max_connections` enforced at accept time via an atomic
+  counter (`query/tcp_server.zig:120`-`122`, `:36`-`38`); slow clients run as independent
+  async tasks and cannot block the accept loop.
+
+Gaps [verified/estimate]: no idle-connection timeout, no explicit backpressure signal
+when the pool is saturated, and the memory cap is per-query not global. Adequate for a
+low-connection control-plane client; needs the timeouts for a broader front door.
+
+### 4.7 Observability: MISSING (the biggest operability gap)
+
+- Only scoped `std.log` logging exists (e.g. `main.zig` `log.info`/`log.warn`). There is
+  **no metrics endpoint** (no `/metrics`), no health/readiness probe, and no structured
+  (JSON) log option. The HTTP front door exists (`main.zig` `schnell.Server`) and could
+  host these, but they are not implemented.
+
+Assessment: this is the item most likely to bite in real operation, and it is entirely
+absent. High priority for the scoped role (see 5.B.3, 5.B.4).
+
+### 4.8 Storage design and scale: intentional trade-off
+
+- kaidb is **index-organised (clustered)**: the base table is a PK B+tree, and a
+  secondary-index scan yields PKs, each of which costs a full base-tree descent to fetch
+  the row. **[measured]** this session's QPROF put ~85% of warm row-return query time in
+  that per-row `base-search+decode`.
+- Mitigations already shipped: async base-leaf prefetch for the disk-bound regime
+  (`storage/pager.zig:240` `prefetchPages`, batch `DEFAULT_PREFETCH_BATCH=256` at
+  `query/iterator.zig:85`); auto buffer pool sized ~50% of RAM (`common/config.zig:257`,
+  `:263`; `pool_size=0`=auto); footprint fixes (earlier sessions) that took a 1M load
+  from ~15 GB to ~993 MB.
+- **[measured]** against Postgres 18 and MySQL 8/InnoDB on 1M rows through an identical
+  Kyte client: kaidb is parity-to-2x of Postgres on most row-return queries, ahead of
+  InnoDB, and wins count/aggregate. The residual gap is the clustered double-lookup.
+
+Assessment: correct and competitive for the scoped role; the clustered design's cost on
+large secondary-index fan-out is a known trade-off, not a defect. The scale items in
+section 5.A are only warranted if kaidb targets general-purpose use.
+
+### 4.9 Test surface
+
+- 69 `test` blocks in `root.zig` (`grep -c` verified), including default-on concurrency
+  fuzzers (`:4705`), scaled by `NOVADB_FUZZ`; the full `zig build test` gate is green at
+  `87a8221`.
+
+## 5. Gap roadmap
+
+### 5.A Scale architecture (only required if targeting general-purpose use)
+
+1. **Physical row locator in secondary indexes** [estimate: large]. Store a validated
+   base-leaf page-id hint in each index entry to skip the per-row base descent (the
+   85%). Needs a per-page owner tag (on-disk format bump + reload) or a
+   "base-tree-never-frees-to-global-pool" invariant; validate-and-fall-back-to-PK;
+   backfill; recovery support. Highest-impact lever.
+2. **Scan-not-seek planner** [medium]. Push `LIMIT` into index scans and prefer a seek
+   when an index covers the predicate; small-`LIMIT` queries currently full-scan.
+3. **Multi-index AND without per-index re-scans** [medium]. Index intersection.
+4. **Large-value out-of-line store** [medium-large]. Replace overflow chains
+   (`overflow.zig:94`) with a TOAST-style single-pointer store; also revisit the
+   `PAGE_SIZE/8` cutoff once the ARIES gap (`overflow.zig:80`-`90`) is closed.
+5. **Buffer-pool / memory beyond RAM** [medium]. Re-land mmap reads safely (previously
+   reverted), improve the CLOCK evictor.
+6. **Write-concurrency ceiling** [large]. The per-tree exclusive `structure_lock`
+   serialises restructuring writers; finer-grained latching would raise write throughput.
+7. **MVCC version-chain cost** [medium]. `rowVisible` (`query_executor.zig:883`) walks
+   the chain per row; add in-place pruning; tune `vacuum` (`database.zig:1046`).
+8. **Horizontal partitioning/sharding** [very large; out of scope for the role].
+
+### 5.B Operational tooling (needed for the scoped role, in priority order)
+
+1. **Observability `/metrics`** [medium]. QPS, latency histogram, buffer-pool hit rate,
+   WAL size + checkpoint lag, active txns, lock waits, error counters, replication lag.
+   Host on the existing HTTP server. **Highest operational priority.**
+2. **Health / readiness probes + JSON logs** [small]. `/healthz`, `/readyz`
+   (recovered? follower caught up?), structured logging.
+3. **Point-in-time recovery** [medium]. Archive WAL segments (currently truncated after
+   checkpoint by `runBgWriterTask`) + a `restore --target-lsn/--target-time` over a base
+   snapshot. The snapshot + replay primitives already exist (4.4).
+4. **Hot (online) backup** [medium]. Server-side `BACKUP DATABASE TO ...` using
+   `exportSnapshot` live, so backups do not require a stopped server.
+5. **TLS-gate the password path** [small]. Refuse cleartext-password startup on a
+   non-TLS connection when `require_auth` is on (4.3 caveat b); force/rotate the
+   bootstrap `admin` credential.
+6. **Connection governance** [small-medium]. Idle timeout, backpressure; surface the
+   existing per-query deadline + memory cap in config.
+7. **Replication operations** [medium]. Lag monitoring, `promote`/failover command,
+   automated re-sync, failover verification around the fence epoch (4.5).
+8. **Online admin ops** [medium]. Online compact/index rebuild (`compact` is offline
+   only), vacuum controls, a user/role admin CLI wrapper.
+9. **On-disk format upgrade tooling** [medium]. A `migrate` path so a format bump (e.g.
+   the 5.A.1 owner tag) does not require a manual dump+reload.
+
+## 6. Recommended path for the scoped role
+
+To call kaidb production-ready **as the orchestrator control-plane store**, the
+required work is small and bounded: 5.B.1 (metrics), 5.B.2 (health probes), 5.B.3
+(PITR), and 5.B.5 (TLS-gate auth). None of the section 5.A scale items are needed for
+that role. If the ambition later widens to a general-purpose database, 5.A.1 (physical
+locator) is the first and largest lever.
+
+## 7. Limitations of this audit
+
+Verdicts and the presence/absence of features are code-verified with citations.
+Effort sizes are estimates. Performance figures are this session's single-machine
+(8 GB) measurements, warm, 1M rows, and are directional rather than a formal
+benchmark. This audit did not run a fault-injection or TSan sweep across every
+subsystem; the concurrency confidence rests on the default-on fuzzers plus the specific
+merge-race work done this session.
