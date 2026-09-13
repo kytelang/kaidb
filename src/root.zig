@@ -4499,6 +4499,45 @@ test "HOT BACKUP: BACKUP DATABASE TO on a live server yields a restorable snapsh
     }
 }
 
+test "ADMIN ROTATION: passwordMatches detects the default and clears after rotation" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Database = @import("schema.zig").Database;
+
+    const p = "test_adminrot.db";
+    Io.Dir.deleteFile(.cwd(), io, p) catch {};
+    defer Io.Dir.deleteFile(.cwd(), io, p) catch {};
+
+    var db = try Database.open(allocator, io, p, 64, null);
+    defer db.close();
+    db.security_manager.enabled = true;
+
+    const sec = db.security_manager;
+    // Fresh DB: the bootstrap default is detectable (this is what the startup
+    // gate keys on) and a lockout-free check never trips the brute-force counter.
+    try std.testing.expect(sec.passwordMatches("admin", "admin"));
+    try std.testing.expect(!sec.passwordMatches("admin", "wrong"));
+    try std.testing.expect(!sec.passwordMatches("ghost", "admin"));
+
+    // Rotate exactly as the offline `novadb passwd` CLI does: hash + updateUserPassword.
+    var salt: [32]u8 = undefined;
+    std.Io.random(io, &salt);
+    const hash = try sec.hashKey("newadminpw", salt);
+    const hex_hash = std.fmt.bytesToHex(hash, .lower);
+    const hex_salt = std.fmt.bytesToHex(salt, .lower);
+    const password_hash = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ hex_hash, hex_salt });
+    defer allocator.free(password_hash);
+    try db.updateUserPassword("admin", password_hash, 1);
+    try sec.loadUsers(db);
+
+    // Default no longer matches; the new password does. The startup gate would
+    // now permit boot.
+    try std.testing.expect(!sec.passwordMatches("admin", "admin"));
+    try std.testing.expect(sec.passwordMatches("admin", "newadminpw"));
+}
+
 test "WRITER-CACHE: concurrent writers past the query-cache cap don't corrupt (regression)" {
     const alloc = std.heap.c_allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});

@@ -163,6 +163,12 @@ pub const Config = struct {
         /// `require_auth` (hence `enabled`). Defaults false. When true, `tls`
         /// must be configured or the server refuses to start (no silent lockout).
         require_tls_for_auth: bool = false,
+        /// Refuse to start while the bootstrap `admin` account still has its
+        /// default password (`admin`). Forces an operator to rotate the seeded
+        /// credential before the server will serve. Rotate it offline first with
+        /// `novadb passwd admin '<newpw>'` (the server need not be running), then
+        /// start with this on. Defaults false to keep first-run/dev friction low.
+        require_admin_password_change: bool = false,
     } = .{},
     /// Replication settings for a follower (or the link a primary offers).
     ///

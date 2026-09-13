@@ -124,9 +124,16 @@ correctness issue.
   is not configured, so it can never silently lock every client out. Proven by
   "O4-TLS: require_tls_for_auth refuses cleartext password on a plaintext link" (`root.zig`):
   plaintext -> 28000 + unauthenticated; secure -> normal challenge succeeds.
-- **Remaining caveat [verified]:** a fresh database bootstraps `admin`/`admin`
-  (`schema/database.zig:506`); the server logs an advisory to rotate it, but it is not
-  forced.
+- **Forced rotation landed this session [measured]:** a fresh database still bootstraps
+  `admin`/`admin` (`schema/database.zig:506`), but `security.require_admin_password_change`
+  makes the server *refuse to start* while `admin` still has the default password (checked
+  with `SecurityManager.passwordMatches`, a constant-time compare that takes no
+  lockout/side-effect path, unlike `authenticate`). The bootstrap paradox (rotating needs an
+  admin login, but the gate blocks boot) is resolved by the offline
+  `novadb passwd <base> admin '<newpw>'` command, which opens its own handle and rotates
+  without the server running; the startup error names it. Proven by
+  "ADMIN ROTATION: passwordMatches detects the default and clears after rotation"
+  (`root.zig`) plus a CLI smoke test.
 
 Assessment: the mechanism is real and enforceable; production use requires enabling
 `require_auth` (or `require_tls_for_auth`), rotating the bootstrap credential, and running
@@ -272,9 +279,10 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 5. **TLS-gate the password path** [DONE]. `security.require_tls_for_auth` refuses the
    cleartext-password challenge on a non-TLS connection (SQLSTATE 28000) and the data-plane
    `TcpServer` now honours `config.tls` (4.3). Credential rotation is now possible via
-   `ALTER USER name IDENTIFIED BY 'newpw'` (added this session; role preserved). Remaining
-   follow-up: *force* rotation of the bootstrap `admin` credential at startup (today it is
-   advisory-only, but the operator now has a working command to do it).
+   `ALTER USER name IDENTIFIED BY 'newpw'` (added this session; role preserved), and
+   `security.require_admin_password_change` *forces* it: the server refuses to start while
+   `admin` still has the default password, with `novadb passwd` as the offline rotation
+   escape hatch (4.3). No follow-up remains here.
 6. **Connection governance** [small-medium]. Idle timeout, backpressure; surface the
    existing per-query deadline + memory cap in config.
 7. **Replication operations** [medium]. Lag monitoring, `promote`/failover command,
@@ -289,8 +297,7 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 For the **single-node relational** role, the operability floor is now met: 5.B.1
 (metrics), 5.B.2 (health/readiness), 5.B.3 (PITR, LSN target), 5.B.4 (hot backup), and
 5.B.5 (TLS-gate the password path) all landed this session. No required gate remains open;
-the richer telemetry (histograms, replication-lag) and forcing rotation of the bootstrap
-credential are quality follow-ups, not gates.
+the richer telemetry (histograms, replication-lag) is a quality follow-up, not a gate.
 None of the section 5.A scale items are required for this role; the clustered-storage
 cost (4.8) is the boundary that bounds it. If the ambition later widens to a
 distributed/general-purpose database, 5.A.1 (physical row locator) is the first and

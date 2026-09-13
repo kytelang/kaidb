@@ -493,6 +493,39 @@ pub fn main(init: std.process.Init) !void {
             }
             return;
         }
+        // Offline password rotation: `novadb passwd <base_dir> <user> <newpassword>`
+        // opens its own handle (server may be stopped), so it can rotate the seeded
+        // admin/admin before the server is ever exposed. This is the escape hatch
+        // for `security.require_admin_password_change`.
+        if (args.len >= 5 and std.mem.eql(u8, args[1], "passwd")) {
+            const base = args[2];
+            const user = args[3];
+            const newpw = args[4];
+            const dbf = try std.fmt.allocPrint(allocator, "{s}/nova.db", .{base});
+            defer allocator.free(dbf);
+            const wdir = try std.fmt.allocPrint(allocator, "{s}/wal", .{base});
+            defer allocator.free(wdir);
+            var db = try Database.open(allocator, io, dbf, 8192, wdir);
+            defer db.close();
+
+            var salt: [32]u8 = undefined;
+            std.Io.random(io, &salt);
+            const hash = try db.security_manager.hashKey(newpw, salt);
+            const hex_hash = std.fmt.bytesToHex(hash, .lower);
+            const hex_salt = std.fmt.bytesToHex(salt, .lower);
+            const password_hash = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ hex_hash, hex_salt });
+            defer allocator.free(password_hash);
+
+            db.updateUserPassword(user, password_hash, 1) catch |err| {
+                if (err == error.UserNotFound) {
+                    log.err("passwd: user '{s}' does not exist", .{user});
+                    return error.UserNotFound;
+                }
+                return err;
+            };
+            log.info("passwd: password for '{s}' updated", .{user});
+            return;
+        }
     }
 
     log.info("Bootstrapping B+Tree database engine...", .{});
@@ -602,6 +635,19 @@ pub fn main(init: std.process.Init) !void {
         log.err("security.require_tls_for_auth is on but TLS is not configured (need tls.enabled + tls.cert_file + tls.key_file); refusing to start", .{});
         return error.TlsRequiredButNotConfigured;
     }
+    // Force rotation of the seeded admin credential when asked. Checked with a
+    // lockout-free comparison (never `authenticate`, which would feed the
+    // brute-force counter). Fail closed BEFORE opening the listeners. The
+    // bootstrap paradox (a fresh DB seeds admin/admin, and rotating needs an admin
+    // login) is resolved by the offline `novadb passwd admin '<newpw>'` command,
+    // which rotates without the server running; the error points operators to it.
+    if (config.security.require_admin_password_change and
+        db.security_manager.passwordMatches("admin", "admin"))
+    {
+        log.err("security.require_admin_password_change is on but 'admin' still has the default password; rotate it first with `novadb passwd admin '<newpassword>'` (server may be stopped), then start. Refusing to start.", .{});
+        return error.DefaultAdminPasswordNotRotated;
+    }
+
     db.security_manager.enabled = config.security.enabled or config.security.require_auth or require_tls_for_auth;
     db.security_manager.require_auth = config.security.require_auth or require_tls_for_auth;
     db.security_manager.require_tls_for_auth = require_tls_for_auth;

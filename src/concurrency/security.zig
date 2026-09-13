@@ -596,6 +596,21 @@ pub const SecurityManager = struct {
         return session;
     }
 
+    /// Constant-time check of whether `candidate` is `username`'s current
+    /// password, WITHOUT any brute-force-lockout side effects. Unlike
+    /// [`authenticate`] it records no failed attempt and mints no session, so it
+    /// is safe to call at startup to detect an unrotated default credential
+    /// (a failed `authenticate` there could lock the real admin out). Returns
+    /// false when the user is unknown or disabled.
+    pub fn passwordMatches(self: *SecurityManager, username: []const u8, candidate: []const u8) bool {
+        self.users_mutex.lockUncancelable(self.io);
+        defer self.users_mutex.unlock(self.io);
+        const user = self.users.get(username) orelse return false;
+        if (!user.enabled) return false;
+        const computed = self.hashKey(candidate, user.key_salt) catch return false;
+        return std.crypto.timing_safe.eql([32]u8, computed, user.key_hash);
+    }
+
     /// Resolves a bearer `token` to its live [`Session`], enforcing expiry.
     ///
     /// When disabled, returns the synthetic anonymous admin session. Otherwise
