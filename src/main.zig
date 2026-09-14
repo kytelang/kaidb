@@ -270,7 +270,28 @@ fn handleHttp(allocator: std.mem.Allocator, raw_request: []const u8, ctx: ?*anyo
             s_ctx.executor.db.query_latency.writeProm(&hw, "kaidb_query_duration_seconds", "End-to-end query execution latency in seconds.") catch {};
             const hist = hw.buffered();
 
-            return try std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {d}\r\n\r\n{s}{s}", .{ body.len + hist.len, body, hist });
+            // Replication lag, only when this node is a shipping primary. Emitting
+            // 0 when no replica is configured would falsely read as "fully caught
+            // up", so these series are absent unless replication is active.
+            var rbuf: [768]u8 = undefined;
+            var rw = std.Io.Writer.fixed(&rbuf);
+            if (s_ctx.executor.db.durable_repl) |dr| {
+                rw.print(
+                    \\# HELP kaidb_replication_produced_seq Highest replication frame seq produced by the primary.
+                    \\# TYPE kaidb_replication_produced_seq gauge
+                    \\kaidb_replication_produced_seq {d}
+                    \\# HELP kaidb_replication_confirmed_seq Highest replication frame seq confirmed durable by followers.
+                    \\# TYPE kaidb_replication_confirmed_seq gauge
+                    \\kaidb_replication_confirmed_seq {d}
+                    \\# HELP kaidb_replication_lag_frames Frames produced but not yet confirmed by followers.
+                    \\# TYPE kaidb_replication_lag_frames gauge
+                    \\kaidb_replication_lag_frames {d}
+                    \\
+                , .{ dr.producedSeq(), dr.confirmedSeq(), dr.lagFrames() }) catch {};
+            }
+            const repl = rw.buffered();
+
+            return try std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {d}\r\n\r\n{s}{s}{s}", .{ body.len + hist.len + repl.len, body, hist, repl });
         }
 
         if (s_ctx.static_store) |store| {

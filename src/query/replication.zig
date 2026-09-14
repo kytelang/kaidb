@@ -1913,6 +1913,26 @@ pub const DurableReplicator = struct {
         };
     }
 
+    /// The highest sequence number the primary has assigned to a shipped frame
+    /// (`next_seq - 1`); 0 before anything is shipped. Read racily for metrics.
+    pub fn producedSeq(self: *const DurableReplicator) u64 {
+        return if (self.next_seq == 0) 0 else self.next_seq - 1;
+    }
+
+    /// The sequence number confirmed durable by every expected follower (the
+    /// prune watermark); 0 until all expected followers have reported. For the
+    /// single-follower deployment this is that follower's confirmed seq.
+    pub fn confirmedSeq(self: *DurableReplicator) u64 {
+        const expected: u32 = if (self.tracker.total_replicas > 1) self.tracker.total_replicas - 1 else 1;
+        return self.tracker.minConfirmed(expected);
+    }
+
+    /// Replication lag in frames: how many shipped frames the follower(s) have
+    /// not yet confirmed. Saturating so it can never underflow.
+    pub fn lagFrames(self: *DurableReplicator) u64 {
+        return self.producedSeq() -| self.confirmedSeq();
+    }
+
     /// Releases all owned state: pending buffer, retained ring, backfill, host, client
     /// and tracker.
     pub fn deinit(self: *DurableReplicator) void {

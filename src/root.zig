@@ -4621,6 +4621,44 @@ test "METRICS: buffer-pool hit_count tracks resident fetches (miss ratio derivab
     try std.testing.expect(db.pool.hit_count.load(.monotonic) <= db.pool.fetch_count.load(.monotonic));
 }
 
+test "METRICS: replication lag = produced - confirmed (saturating)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const repl = @import("query/replication.zig");
+
+    // total_replicas = 2 (primary + one follower) => 1 expected follower.
+    var dr = repl.DurableReplicator.init(allocator, io, 2, 1, 1000, "", .{});
+    defer dr.deinit();
+
+    // Nothing produced or confirmed yet.
+    try std.testing.expectEqual(@as(u64, 0), dr.producedSeq());
+    try std.testing.expectEqual(@as(u64, 0), dr.lagFrames());
+
+    // Primary has shipped up to seq 10.
+    dr.next_seq = 11;
+    try std.testing.expectEqual(@as(u64, 10), dr.producedSeq());
+    // Follower has not acked anything: fully lagged.
+    try std.testing.expectEqual(@as(u64, 0), dr.confirmedSeq());
+    try std.testing.expectEqual(@as(u64, 10), dr.lagFrames());
+
+    // Follower confirms up to 7.
+    try dr.tracker.recordAck(dr.follower_id, 7);
+    try std.testing.expectEqual(@as(u64, 7), dr.confirmedSeq());
+    try std.testing.expectEqual(@as(u64, 3), dr.lagFrames());
+
+    // Caught up.
+    try dr.tracker.recordAck(dr.follower_id, 10);
+    try std.testing.expectEqual(@as(u64, 0), dr.lagFrames());
+
+    // A stale/duplicate lower ack cannot regress progress, so lag stays 0
+    // (and never goes negative / underflows).
+    try dr.tracker.recordAck(dr.follower_id, 5);
+    try std.testing.expectEqual(@as(u64, 10), dr.confirmedSeq());
+    try std.testing.expectEqual(@as(u64, 0), dr.lagFrames());
+}
+
 test "WRITER-CACHE: concurrent writers past the query-cache cap don't corrupt (regression)" {
     const alloc = std.heap.c_allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
