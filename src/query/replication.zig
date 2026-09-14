@@ -1841,24 +1841,40 @@ pub const QuorumTracker = struct {
 /// Currently single-follower on the wire (`follower_id` defaults to 1) though the
 /// quorum machinery is written for N.
 pub const DurableReplicator = struct {
-    /// Allocator owning the buffers, retained batches, and duped host.
+    /// One follower's transport: everything per-follower lives here, so the
+    /// replicator can fan the (single, shared) sequence stream out to a set of
+    /// followers. The seq stream itself (`next_seq`, `sent`, `backfill`, the
+    /// `tracker`) is shared and not duplicated per link.
+    pub const FollowerLink = struct {
+        /// Stable follower id; the key into [`QuorumTracker.follower_seqs`].
+        id: u64,
+        /// Owned copy of the follower host, for reconnects.
+        host: []const u8,
+        /// Follower port.
+        port: u16,
+        /// The outbound connection to this follower.
+        client: ReplClient,
+        /// Whether this link currently believes it holds a live connection.
+        connected: bool = false,
+    };
+
+    /// Allocator owning the buffers, retained batches, and duped hosts.
     allocator: Allocator,
     /// I/O token for network and sleep operations.
     io: Io,
-    /// The outbound connection used to ship batches and read acks.
-    client: ReplClient,
-    /// Per-follower ack progress and the quorum-durability decision.
+    /// Per-follower ack progress and the quorum-durability decision. Shared
+    /// across all links (keyed by [`FollowerLink.id`]).
     tracker: QuorumTracker,
     /// Current leader epoch stamped into every shipped batch; bumped on failover.
     epoch: u64,
     /// How long a synchronous write waits for quorum before `error.QuorumTimeout`.
     timeout_ms: u64,
-    /// Identity of the (single) follower in [`DurableReplicator.tracker`].
-    follower_id: u64 = 1,
     /// Shared HMAC key presented on each connect via [`ReplClient.authenticateStream`].
     auth_key: []const u8 = "",
+    /// TLS config applied to every follower link's client on connect.
+    tls_config: TlsConfig = .{},
     /// Next sequence number to assign to a shipped frame; the primary's monotonic
-    /// counter.
+    /// counter. One contiguous stream shared by every follower.
     next_seq: u64 = 1,
     /// Frames accumulated for the in-progress transaction, flushed on commit.
     buf: std.ArrayList([]const u8) = .empty,
@@ -1868,13 +1884,10 @@ pub const DurableReplicator = struct {
     /// writes ships nothing.
     pending_write: bool = false,
 
-    /// Owned copy of the follower host, remembered from the first
-    /// [`DurableReplicator.connect`] for later reconnects.
-    host: []const u8 = "",
-    /// Follower port, remembered for reconnects.
-    port: u16 = 0,
-    /// Whether the client currently believes it holds a live connection.
-    connected: bool = false,
+    /// The followers this primary ships to. Each is fed the same shared stream
+    /// from its own cursor. Populated by [`DurableReplicator.connect`] /
+    /// [`DurableReplicator.addFollower`].
+    links: std.ArrayList(FollowerLink) = .empty,
     /// Bounded in-memory ring of recently shipped batches for fast catch-up.
     sent: std.ArrayList(SentBatch) = .empty,
     /// Optional durable catch-up store reaching further back than the ring.
@@ -1900,16 +1913,14 @@ pub const DurableReplicator = struct {
     /// No connection is made here; call [`DurableReplicator.connect`] (and optionally
     /// [`DurableReplicator.enableBackfill`]) afterwards.
     pub fn init(allocator: Allocator, io: Io, total_replicas: u32, epoch: u64, timeout_ms: u64, auth_key: []const u8, tls_config: TlsConfig) DurableReplicator {
-        var client = ReplClient.init(allocator, io);
-        client.tls_config = tls_config;
         return .{
             .allocator = allocator,
             .io = io,
-            .client = client,
             .tracker = QuorumTracker.init(allocator, total_replicas),
             .epoch = epoch,
             .timeout_ms = timeout_ms,
             .auth_key = auth_key,
+            .tls_config = tls_config,
         };
     }
 
@@ -1941,8 +1952,11 @@ pub const DurableReplicator = struct {
         for (self.sent.items) |b| self.freeBatch(b);
         self.sent.deinit(self.allocator);
         if (self.backfill) |bl| bl.deinit();
-        if (self.host.len > 0) self.allocator.free(self.host);
-        self.client.deinit();
+        for (self.links.items) |*link| {
+            link.client.deinit();
+            if (link.host.len > 0) self.allocator.free(link.host);
+        }
+        self.links.deinit(self.allocator);
         self.tracker.deinit();
     }
 
@@ -1968,13 +1982,31 @@ pub const DurableReplicator = struct {
     /// arguments, and marks the replicator connected. The three steps mirror
     /// [`DurableReplicator.reconnectAndCatchUp`]'s except that this path does not
     /// replay history (there is none yet on a first connect).
+    /// Adds a follower link with stable id `id` and connects it (TCP + TLS +
+    /// auth). The link is appended only on success; a failed connect frees the
+    /// half-built client and duped host so nothing leaks. Fan-out ships the same
+    /// shared stream to every link added here.
+    pub fn addFollower(self: *DurableReplicator, id: u64, host: []const u8, port: u16) !void {
+        const host_dup = try self.allocator.dupe(u8, host);
+        errdefer self.allocator.free(host_dup);
+        var client = ReplClient.init(self.allocator, self.io);
+        client.tls_config = self.tls_config;
+        errdefer client.deinit();
+        try client.connectRaw(host, port);
+        try client.upgradeTls(host);
+        try client.authenticateStream(self.auth_key);
+        try self.links.append(self.allocator, .{
+            .id = id,
+            .host = host_dup,
+            .port = port,
+            .client = client,
+            .connected = true,
+        });
+    }
+
+    /// Back-compatible single-follower connect: adds one link with id 1.
     pub fn connect(self: *DurableReplicator, host: []const u8, port: u16) !void {
-        try self.client.connectRaw(host, port);
-        try self.client.upgradeTls(host);
-        try self.client.authenticateStream(self.auth_key);
-        if (self.host.len == 0) self.host = try self.allocator.dupe(u8, host);
-        self.port = port;
-        self.connected = true;
+        return self.addFollower(1, host, port);
     }
 
     /// Reconnects to the remembered follower and replays every batch it is missing.
@@ -1994,22 +2026,22 @@ pub const DurableReplicator = struct {
     /// stays current, and `confirmed` advances as acks come back so replay stops at
     /// the right point. The `errdefer` marks the replicator disconnected if any step
     /// fails, so a partial catch-up does not leave a false "connected" belief.
-    fn reconnectAndCatchUp(self: *DurableReplicator) !void {
-        self.client.disconnect();
-        self.connected = false;
+    fn reconnectAndCatchUpLink(self: *DurableReplicator, link: *FollowerLink) !void {
+        link.client.disconnect();
+        link.connected = false;
         errdefer {
-            self.client.disconnect();
-            self.connected = false;
+            link.client.disconnect();
+            link.connected = false;
         }
-        try self.client.connectRaw(self.host, self.port);
-        try self.client.upgradeTls(self.host);
-        try self.client.authenticateStream(self.auth_key);
-        self.connected = true;
+        try link.client.connectRaw(link.host, link.port);
+        try link.client.upgradeTls(link.host);
+        try link.client.authenticateStream(self.auth_key);
+        link.connected = true;
 
-        const hb = try self.client.shipAndRecord(
+        const hb = try link.client.shipAndRecord(
             proto.ReplFrames{ .epoch = self.epoch, .base_seq = 0, .frames = &[_][]const u8{} },
             &self.tracker,
-            self.follower_id,
+            link.id,
         );
         var confirmed = hb.confirmed_seq;
 
@@ -2024,31 +2056,31 @@ pub const DurableReplicator = struct {
                             self.allocator.free(batches);
                         }
                         for (batches) |b| {
-                            const ack = try self.client.shipAndRecord(
+                            const ack = try link.client.shipAndRecord(
                                 proto.ReplFrames{ .epoch = self.epoch, .base_seq = b.base, .frames = b.frames },
                                 &self.tracker,
-                                self.follower_id,
+                                link.id,
                             );
                             confirmed = ack.confirmed_seq;
                         }
-                        log.info("replication catch-up (on-disk backfill) complete: follower re-synced to seq {d}", .{confirmed});
+                        log.info("replica {d} catch-up (on-disk backfill) complete: re-synced to seq {d}", .{ link.id, confirmed });
                         return;
                     }
                 }
             }
-            log.warn("replication catch-up: follower at seq {d}; no retained batch reaches back to {d}; a full snapshot restore is required", .{ confirmed, confirmed + 1 });
+            log.warn("replica {d} catch-up: at seq {d}; no retained batch reaches back to {d}; a full snapshot restore is required", .{ link.id, confirmed, confirmed + 1 });
             return error.SnapshotRequired;
         }
         for (self.sent.items) |b| {
             if (b.base <= confirmed) continue;
-            const ack = try self.client.shipAndRecord(
+            const ack = try link.client.shipAndRecord(
                 proto.ReplFrames{ .epoch = self.epoch, .base_seq = b.base, .frames = b.frames },
                 &self.tracker,
-                self.follower_id,
+                link.id,
             );
             confirmed = ack.confirmed_seq;
         }
-        log.info("replication catch-up complete: follower re-synced to seq {d}", .{confirmed});
+        log.info("replica {d} catch-up complete: re-synced to seq {d}", .{ link.id, confirmed });
     }
 
     /// Deep-copies the current pending buffer into the retained ring as one batch
@@ -2175,27 +2207,29 @@ pub const DurableReplicator = struct {
             log.warn("backfill append failed: {any}; ring-only backfill for this batch", .{err});
         };
 
-        if (!self.connected) {
-            self.reconnectAndCatchUp() catch |err| {
-                if (await_quorum) return err;
-                log.warn("replication reconnect failed: {any}; write committed locally (catches up on a later write)", .{err});
-                return;
-            };
-            if (await_quorum) try self.tracker.awaitQuorum(self.io, last, self.timeout_ms);
-            self.checkpointBackfill();
-            return;
+        // Fan out the (single, shared) batch to every follower link. Each link
+        // ships independently: a slow or dead follower marks itself disconnected
+        // and is skipped, so it can never block the others or the primary. Under
+        // synchronous replication the quorum wait below is what enforces
+        // durability across the fleet; a per-link failure is surfaced immediately
+        // (fail-fast) to preserve the original single-follower semantics.
+        const frames = proto.ReplFrames{ .epoch = self.epoch, .base_seq = base, .frames = self.buf.items };
+        for (self.links.items) |*link| {
+            if (!link.connected) {
+                self.reconnectAndCatchUpLink(link) catch |err| {
+                    if (await_quorum) return err;
+                    log.warn("replica {d}: reconnect failed: {any}; committed locally, will catch up", .{ link.id, err });
+                    continue;
+                };
+            } else {
+                _ = link.client.shipAndRecord(frames, &self.tracker, link.id) catch |err| {
+                    link.connected = false;
+                    if (await_quorum) return err;
+                    log.warn("replica {d}: async ship failed (follower unreachable?): {any}; committed locally, will catch up", .{ link.id, err });
+                    continue;
+                };
+            }
         }
-
-        _ = self.client.shipAndRecord(
-            proto.ReplFrames{ .epoch = self.epoch, .base_seq = base, .frames = self.buf.items },
-            &self.tracker,
-            self.follower_id,
-        ) catch |err| {
-            self.connected = false;
-            if (await_quorum) return err;
-            log.warn("async replication ship failed (follower unreachable?): {any}; committed locally, will catch up", .{err});
-            return;
-        };
         if (await_quorum) try self.tracker.awaitQuorum(self.io, last, self.timeout_ms);
         self.checkpointBackfill();
     }

@@ -3905,7 +3905,7 @@ test "D6: catch-up returns SnapshotRequired when no retained batch reaches the f
     try dr.connect("127.0.0.1", 59326);
 
     dr.next_seq = 50;
-    dr.connected = false;
+    dr.links.items[0].connected = false;
     for (cap.records.items) |rec| repl.DurableReplicator.onRecord(&dr, rec);
     try std.testing.expectError(error.SnapshotRequired, dr.shipPending(true));
 }
@@ -4644,17 +4644,17 @@ test "METRICS: replication lag = produced - confirmed (saturating)" {
     try std.testing.expectEqual(@as(u64, 10), dr.lagFrames());
 
     // Follower confirms up to 7.
-    try dr.tracker.recordAck(dr.follower_id, 7);
+    try dr.tracker.recordAck(1, 7);
     try std.testing.expectEqual(@as(u64, 7), dr.confirmedSeq());
     try std.testing.expectEqual(@as(u64, 3), dr.lagFrames());
 
     // Caught up.
-    try dr.tracker.recordAck(dr.follower_id, 10);
+    try dr.tracker.recordAck(1, 10);
     try std.testing.expectEqual(@as(u64, 0), dr.lagFrames());
 
     // A stale/duplicate lower ack cannot regress progress, so lag stays 0
     // (and never goes negative / underflows).
-    try dr.tracker.recordAck(dr.follower_id, 5);
+    try dr.tracker.recordAck(1, 5);
     try std.testing.expectEqual(@as(u64, 10), dr.confirmedSeq());
     try std.testing.expectEqual(@as(u64, 0), dr.lagFrames());
 }
