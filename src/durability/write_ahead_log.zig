@@ -411,6 +411,13 @@ pub const WriteAheadLog = struct {
     /// Highest LSN durably on disk (flushed AND fsync'd). The durability
     /// frontier: a record is safe once this reaches its LSN.
     flushed_lsn: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// `last_flushed_lsn` recorded by the most recent [`WriteAheadLog.checkpoint`]
+    /// this process has run. `flushed_lsn - last_checkpoint_lsn` is the
+    /// checkpoint lag (LSNs written but not yet covered by a checkpoint), exported
+    /// at `/metrics`; a persistently growing lag means the checkpointer is stalled
+    /// (or held back) and the WAL cannot be truncated. Starts at 0 (no checkpoint
+    /// this run); the metric is meaningful once the first checkpoint runs.
+    last_checkpoint_lsn: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Highest LSN assigned to any appended record, durable or not. Advanced by
     /// [`WriteAheadLog.incrementLSN`].
     lsn: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -590,6 +597,43 @@ pub const WriteAheadLog = struct {
     /// [`WriteAheadLog.flushed_lsn`].
     pub fn flushedLSN(self: *WriteAheadLog, flushed_lsn: u64) void {
         self.flushed_lsn.store(flushed_lsn, .monotonic);
+    }
+
+    /// Checkpoint lag in LSNs: how far the durable frontier has advanced beyond
+    /// the last checkpoint this process ran. Saturating (never negative). 0 means
+    /// caught up or no checkpoint yet this run; a persistently rising value means
+    /// the checkpointer is stalled and the WAL is not being truncated.
+    pub fn checkpointLagLsn(self: *WriteAheadLog) u64 {
+        return self.flushed_lsn.load(.monotonic) -| self.last_checkpoint_lsn.load(.monotonic);
+    }
+
+    /// Best-effort total size of the on-disk WAL: the sum of every `.wal` segment
+    /// in the log directory. A directory it cannot open yields 0 rather than an
+    /// error, so a metrics scrape never fails on it. O(segments) `stat`s; the
+    /// segment set is bounded by checkpoint truncation + retention, so this is
+    /// cheap enough for a periodic scrape.
+    pub fn walBytesOnDisk(self: *WriteAheadLog) u64 {
+        var dir = Dir.openDir(.cwd(), self.io, self.dir_path, .{ .iterate = true }) catch return 0;
+        defer dir.close(self.io);
+        var total: u64 = 0;
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".wal")) continue;
+            const fp = self.getFilePath2(entry.name) catch continue;
+            defer self.allocator.free(fp);
+            const f = Dir.openFile(.cwd(), self.io, fp, .{}) catch continue;
+            defer f.close(self.io);
+            const st = f.stat(self.io) catch continue;
+            total += st.size;
+        }
+        return total;
+    }
+
+    /// Joins the WAL directory with `name` into an owned path. Small helper for
+    /// [`WriteAheadLog.walBytesOnDisk`]; distinct from [`getFilePath`], which
+    /// formats from a sequence number.
+    fn getFilePath2(self: *WriteAheadLog, name: []const u8) ![]u8 {
+        return try fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.dir_path, name });
     }
 
     /// Writes the staged buffer out to the active segment (no fsync).
@@ -828,6 +872,7 @@ pub const WriteAheadLog = struct {
         const seq = if (self.current_file == null) 0 else self.current_seq;
         const cp = CheckpointRecord{ .file_seq = seq, .last_flushed_lsn = self.flushed_lsn.load(.monotonic) };
         try cp.save(self.io, self.dir_path);
+        self.last_checkpoint_lsn.store(cp.last_flushed_lsn, .monotonic);
         try self.rotateLocked();
         self.truncateActiveLogs(seq) catch {};
     }

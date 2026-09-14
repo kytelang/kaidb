@@ -291,7 +291,23 @@ fn handleHttp(allocator: std.mem.Allocator, raw_request: []const u8, ctx: ?*anyo
             }
             const repl = rw.buffered();
 
-            return try std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {d}\r\n\r\n{s}{s}{s}", .{ body.len + hist.len + repl.len, body, hist, repl });
+            // WAL size + checkpoint lag, only when durability is on (WAL present).
+            var wbuf: [768]u8 = undefined;
+            var ww = std.Io.Writer.fixed(&wbuf);
+            if (s_ctx.executor.db.wal) |wal| {
+                ww.print(
+                    \\# HELP kaidb_wal_bytes Total size of the on-disk WAL segments.
+                    \\# TYPE kaidb_wal_bytes gauge
+                    \\kaidb_wal_bytes {d}
+                    \\# HELP kaidb_wal_checkpoint_lag_lsn LSNs written since the last checkpoint (0 = caught up).
+                    \\# TYPE kaidb_wal_checkpoint_lag_lsn gauge
+                    \\kaidb_wal_checkpoint_lag_lsn {d}
+                    \\
+                , .{ wal.walBytesOnDisk(), wal.checkpointLagLsn() }) catch {};
+            }
+            const walm = ww.buffered();
+
+            return try std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {d}\r\n\r\n{s}{s}{s}{s}", .{ body.len + hist.len + repl.len + walm.len, body, hist, repl, walm });
         }
 
         if (s_ctx.static_store) |store| {

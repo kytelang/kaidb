@@ -241,8 +241,12 @@ low-connection control-plane client; needs the timeouts for a broader front door
   `kaidb_replication_lag_frames` (produced - confirmed, saturating), computed from
   `DurableReplicator.next_seq` and the `QuorumTracker` ack watermark. The series are absent
   when no replica is configured (emitting 0 would falsely read as caught-up). Unit-tested.
-- **Still missing [verified]:** WAL-size and checkpoint-lag gauges, active-transaction and
-  lock-wait gauges, and a structured (JSON) log option.
+- **WAL-size + checkpoint-lag gauges landed this session [measured]:** `kaidb_wal_bytes`
+  (sum of on-disk `.wal` segments) and `kaidb_wal_checkpoint_lag_lsn` (durable frontier minus
+  the last checkpoint's LSN; 0 = caught up, a rising value = a stalled checkpointer). Emitted
+  only when durability is on. Unit-tested.
+- **Still missing [verified]:** active-transaction and lock-wait gauges, and a structured
+  (JSON) log option.
 
 Assessment: the operability floor is now met (health, readiness, core engine
 counters); the richer query/replication telemetry remains a follow-up.
@@ -299,7 +303,7 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 
 1. **Observability `/metrics`** [DONE-partial]. Prometheus `/metrics` with core engine
    counters, a buffer-pool hit/miss split, and a query-latency histogram is live (4.7).
-   Remaining follow-ups: WAL-size + checkpoint-lag, active-txn/lock-wait gauges.
+   Remaining follow-ups: active-txn/lock-wait gauges, JSON logs.
 2. **Health / readiness probes** [DONE]. `/healthz` + `/readyz` live (4.7). JSON
    structured logging remains a small follow-up.
 3. **Point-in-time recovery** [DONE (LSN target); time-target is a follow-up].
@@ -338,9 +342,9 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 For the **single-node relational** role, the operability floor is now met: 5.B.1
 (metrics), 5.B.2 (health/readiness), 5.B.3 (PITR, LSN target), 5.B.4 (hot backup), and
 5.B.5 (TLS-gate the password path) all landed this session. No required gate remains open;
-the richer telemetry that remains (WAL/checkpoint-lag, active-txn/lock-wait gauges) is a
-quality follow-up, not a gate; the query-latency histogram, buffer-pool hit/miss split, and
-replication-lag gauges landed this session.
+the richer telemetry that remains (active-txn/lock-wait gauges, JSON logs) is a quality
+follow-up, not a gate; the query-latency histogram, buffer-pool hit/miss split, replication-lag
+and WAL-size/checkpoint-lag gauges landed this session.
 None of the section 5.A scale items are required for this role; the clustered-storage
 cost (4.8) is the boundary that bounds it. If the ambition later widens to a
 distributed/general-purpose database, 5.A.1 (physical row locator) is the first and

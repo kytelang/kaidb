@@ -4659,6 +4659,47 @@ test "METRICS: replication lag = produced - confirmed (saturating)" {
     try std.testing.expectEqual(@as(u64, 0), dr.lagFrames());
 }
 
+test "METRICS: WAL size grows and checkpoint lag clears after a checkpoint" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+
+    const p = "test_metrics_wal.db";
+    const wal_dir = "test_metrics_wal_wal";
+    Io.Dir.deleteFile(.cwd(), io, p) catch {};
+    Io.Dir.deleteTree(.cwd(), io, wal_dir) catch {};
+    defer Io.Dir.deleteFile(.cwd(), io, p) catch {};
+    defer Io.Dir.deleteTree(.cwd(), io, wal_dir) catch {};
+
+    var db = try Database.open(allocator, io, p, 64, wal_dir);
+    defer db.close();
+    var ex = QueryExecutor.init(allocator, db);
+    defer ex.deinit();
+
+    freeResp(allocator, try ex.execute(.{ .sql = "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)" }));
+    var i: i64 = 1;
+    while (i <= 40) : (i += 1) {
+        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO t (id, v) VALUES ({d}, 'r{d}')", .{ i, i });
+        defer allocator.free(sql);
+        freeResp(allocator, try ex.execute(.{ .sql = sql }));
+    }
+
+    const wal = db.wal.?;
+    try wal.flush();
+    // WAL has real bytes on disk after committed writes.
+    try std.testing.expect(wal.walBytesOnDisk() > 16);
+    // Records have been flushed but no checkpoint has run this session, so the
+    // durable frontier is ahead of the (zero) last-checkpoint LSN.
+    try std.testing.expect(wal.checkpointLagLsn() > 0);
+
+    // A checkpoint moves the checkpoint LSN up to the durable frontier: caught up.
+    try wal.checkpoint();
+    try std.testing.expectEqual(@as(u64, 0), wal.checkpointLagLsn());
+}
+
 test "WRITER-CACHE: concurrent writers past the query-cache cap don't corrupt (regression)" {
     const alloc = std.heap.c_allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
