@@ -1,10 +1,36 @@
 # kaidb (NovaDB) Production Fitness Audit
 
-Status: verified against the source tree at commit `87a8221` (branch `main`).
-Every claim below cites `file:line` so it can be checked. Where a statement is a
-measurement from this session's benchmarks it is marked **[measured]**; where it is
+Status: verified against the source tree on branch `main` (this session's work through
+`418cc64`). Every claim below cites `file:line` so it can be checked. Where a statement is
+a measurement from this session's benchmarks it is marked **[measured]**; where it is
 an informed engineering estimate rather than a read fact it is marked **[estimate]**.
 Everything else is **[verified]** by reading the cited code.
+
+## 0. Readiness verdict (2026-09-14)
+
+**Fit for single-node production for the scoped workload, pending a soak test on the target
+hardware.** Every production gate is closed and each was verified with a red→green test, not
+asserted: durability/crash-recovery, concurrency (the one known race fixed + guarded), auth
+(`require_auth` enforcement, TLS-gated password path, `ALTER USER`, forced admin rotation),
+cold **and** hot backup, PITR (LSN target), and observability (`/healthz`, `/readyz`, and a
+`/metrics` carrying counters, buffer-pool hit/miss ratio, a query-latency histogram, and
+replication lag).
+
+Deliberate boundaries that are **by design**, not blockers for this role:
+1. **Single node** — no sharding; scale is instances behind a proxy.
+2. **Clustered-storage cost** on large secondary-index fan-out (4.8) — fine until a workload
+   routinely ships thousands of rows *through* a secondary index.
+3. **Large-value cutoff** at `PAGE_SIZE/8` (~2 KiB inline, 4.1) — capped on purpose, tied to a
+   known ARIES gap for big overflow values. Fine unless storing large blobs.
+4. Remaining ops items are **polish, not gates**: promote/failover command, automated
+   re-sync, WAL-size/checkpoint-lag gauges, active-txn/lock-wait gauges, JSON logs.
+
+**The one caveat before calling it "in prod":** everything above is verified in-tree with
+tests. What has **not** been done is a live multi-hour **soak on real target hardware**
+(sustained load, a real follower over a network, kill-9 mid-write on the actual box,
+disk-full behaviour). The primitives are all tested; the untested part is a specific
+deployment's operational envelope. Run that soak against the intended workload shape (row
+sizes, read/write mix, dataset-vs-RAM, follower present?) before flipping the switch.
 
 ## 1. Scope this audit judges against
 
