@@ -227,6 +227,9 @@ fn handleHttp(allocator: std.mem.Allocator, raw_request: []const u8, ctx: ?*anyo
                 \\# HELP kaidb_buffer_pool_fetches_total Total fetchPage calls (hits + misses).
                 \\# TYPE kaidb_buffer_pool_fetches_total counter
                 \\kaidb_buffer_pool_fetches_total {d}
+                \\# HELP kaidb_buffer_pool_hits_total fetchPage calls served from a resident frame (cache hits). Miss ratio = 1 - hits/fetches.
+                \\# TYPE kaidb_buffer_pool_hits_total counter
+                \\kaidb_buffer_pool_hits_total {d}
                 \\# HELP kaidb_buffer_pool_evictions_total Total pages evicted.
                 \\# TYPE kaidb_buffer_pool_evictions_total counter
                 \\kaidb_buffer_pool_evictions_total {d}
@@ -250,6 +253,7 @@ fn handleHttp(allocator: std.mem.Allocator, raw_request: []const u8, ctx: ?*anyo
                 pool.pool_size,
                 pool.pager.num_pages,
                 pool.fetch_count.load(.monotonic),
+                pool.hit_count.load(.monotonic),
                 pool.evict_count.load(.monotonic),
                 pool.borrow_serves.load(.monotonic),
                 pool.pread_serves.load(.monotonic),

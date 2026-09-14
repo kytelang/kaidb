@@ -205,9 +205,12 @@ low-connection control-plane client; needs the timeouts for a broader front door
   `/metrics`. This gives p50/p90/p99 via `histogram_quantile` and a QPS rate via
   `rate(..._count[1m])`. Covered by a histogram unit test and an executor-fed integration
   test (`root.zig`).
-- **Still missing [verified]:** a split hit/miss ratio (only combined `fetches_total`
-  today), WAL-size and checkpoint-lag gauges, active-transaction and lock-wait gauges,
-  replication-lag, and a structured (JSON) log option.
+- **Hit/miss split landed this session [measured]:** `kaidb_buffer_pool_hits_total` (a
+  separate hit counter incremented on both resident-frame fetch paths); the miss ratio is
+  `1 - hits/fetches`. Covered by a resident-scan test asserting a fully-cached re-scan is
+  all hits.
+- **Still missing [verified]:** WAL-size and checkpoint-lag gauges, active-transaction and
+  lock-wait gauges, replication-lag, and a structured (JSON) log option.
 
 Assessment: the operability floor is now met (health, readiness, core engine
 counters); the richer query/replication telemetry remains a follow-up.
@@ -263,8 +266,8 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 ### 5.B Operational tooling (needed for the scoped role, in priority order)
 
 1. **Observability `/metrics`** [DONE-partial]. Prometheus `/metrics` with core engine
-   counters plus a query-latency histogram is live (4.7). Remaining follow-ups: hit/miss split,
-   WAL-size + checkpoint-lag, active-txn/lock-wait, replication-lag gauges.
+   counters, a buffer-pool hit/miss split, and a query-latency histogram is live (4.7).
+   Remaining follow-ups: WAL-size + checkpoint-lag, active-txn/lock-wait, replication-lag gauges.
 2. **Health / readiness probes** [DONE]. `/healthz` + `/readyz` live (4.7). JSON
    structured logging remains a small follow-up.
 3. **Point-in-time recovery** [DONE (LSN target); time-target is a follow-up].
@@ -303,8 +306,9 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 For the **single-node relational** role, the operability floor is now met: 5.B.1
 (metrics), 5.B.2 (health/readiness), 5.B.3 (PITR, LSN target), 5.B.4 (hot backup), and
 5.B.5 (TLS-gate the password path) all landed this session. No required gate remains open;
-the richer telemetry that remains (hit/miss split, replication-lag gauges) is a quality
-follow-up, not a gate; the query-latency histogram landed this session.
+the richer telemetry that remains (WAL/checkpoint-lag, active-txn/lock-wait, replication-lag
+gauges) is a quality follow-up, not a gate; the query-latency histogram and buffer-pool
+hit/miss split landed this session.
 None of the section 5.A scale items are required for this role; the clustered-storage
 cost (4.8) is the boundary that bounds it. If the ambition later widens to a
 distributed/general-purpose database, 5.A.1 (physical row locator) is the first and

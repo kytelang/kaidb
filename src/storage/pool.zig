@@ -298,6 +298,11 @@ pub const PagePool = struct {
     /// times (e.g. cursor reuse vs a fresh root-to-leaf search per document).
     /// Relaxed atomic so it never affects the hot path's correctness or ordering.
     fetch_count: std.atomic.Value(u64) = .init(0),
+    /// Running count of [`PagePool.fetchPage`] calls served from a resident frame
+    /// (a cache hit). `fetch_count - hit_count` is the miss count; `hit_count /
+    /// fetch_count` is the buffer-pool hit ratio exported at `/metrics`. Relaxed
+    /// atomic, same as `fetch_count`.
+    hit_count: std.atomic.Value(u64) = .init(0),
     /// Running count of REAL evictions: a fetch/newPage that reused an
     /// already-occupied frame (its old page dropped from the table). Distinct
     /// from a free-list hand-out, which costs nothing. Stays 0 while the working
@@ -609,6 +614,7 @@ pub const PagePool = struct {
             _ = @atomicRmw(u32, &f.pin_count, .Add, 1, .monotonic);
             @atomicStore(bool, &f.is_referenced, true, .monotonic);
             inst.rw_lock.unlockShared(self.pager.io);
+            _ = self.hit_count.fetchAdd(1, .monotonic);
             return f;
         }
         inst.rw_lock.unlockShared(self.pager.io);
@@ -620,6 +626,7 @@ pub const PagePool = struct {
             const f = &self.frames[fid];
             _ = @atomicRmw(u32, &f.pin_count, .Add, 1, .seq_cst);
             @atomicStore(bool, &f.is_referenced, true, .seq_cst);
+            _ = self.hit_count.fetchAdd(1, .monotonic);
             return f;
         }
 

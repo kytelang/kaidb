@@ -4579,6 +4579,48 @@ test "METRICS: execute feeds the query-latency histogram and it renders as Prome
     try std.testing.expect(std.mem.indexOf(u8, out, "kaidb_query_duration_seconds_sum ") != null);
 }
 
+test "METRICS: buffer-pool hit_count tracks resident fetches (miss ratio derivable)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+
+    const p = "test_metrics_hits.db";
+    Io.Dir.deleteFile(.cwd(), io, p) catch {};
+    defer Io.Dir.deleteFile(.cwd(), io, p) catch {};
+
+    var db = try Database.open(allocator, io, p, 64, null);
+    defer db.close();
+    var ex = QueryExecutor.init(allocator, db);
+    defer ex.deinit();
+
+    freeResp(allocator, try ex.execute(.{ .sql = "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)" }));
+    var i: i64 = 1;
+    while (i <= 20) : (i += 1) {
+        const sql = try std.fmt.allocPrint(allocator, "INSERT INTO t (id, v) VALUES ({d}, 'r{d}')", .{ i, i });
+        defer allocator.free(sql);
+        freeResp(allocator, try ex.execute(.{ .sql = sql }));
+    }
+    // Warm the pages (first scan may miss + fault in).
+    freeResp(allocator, try ex.execute(.{ .sql = "SELECT * FROM t" }));
+
+    const hits0 = db.pool.hit_count.load(.monotonic);
+    const fetches0 = db.pool.fetch_count.load(.monotonic);
+
+    // Second scan of a fully-resident tiny table (pool=64 pages, nothing evicts):
+    // every page fetch must be a hit.
+    freeResp(allocator, try ex.execute(.{ .sql = "SELECT * FROM t" }));
+
+    const dh = db.pool.hit_count.load(.monotonic) - hits0;
+    const df = db.pool.fetch_count.load(.monotonic) - fetches0;
+    try std.testing.expect(df > 0); // the scan did fetch pages
+    try std.testing.expectEqual(df, dh); // ...and all of them were hits
+    // Global invariant: hits never exceed fetches.
+    try std.testing.expect(db.pool.hit_count.load(.monotonic) <= db.pool.fetch_count.load(.monotonic));
+}
+
 test "WRITER-CACHE: concurrent writers past the query-cache cap don't corrupt (regression)" {
     const alloc = std.heap.c_allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
