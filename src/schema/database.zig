@@ -2706,6 +2706,65 @@ pub const Database = struct {
         std.log.info("Database is a DURABLE LEADER, shipping to {s}:{d} (quorum {d})", .{ host, port, total_replicas / 2 + 1 });
     }
 
+    /// Stops and frees the durable-leader shipping machinery, if any. Symmetric to
+    /// [`Database.stopFollower`]; unlike `close`'s teardown it also `destroy`s the
+    /// allocation, because it runs at runtime (on demote) and must not leak across
+    /// repeated role flips. Unsets the WAL ship callback FIRST so no further record
+    /// is handed to the replicator once it is being torn down.
+    pub fn stopDurableLeader(self: *Database) void {
+        if (self.wal) |w| {
+            w.ship_callback = null;
+            w.replication_manager = null;
+        }
+        if (self.durable_repl) |dr| {
+            dr.deinit();
+            self.allocator.destroy(dr);
+            self.durable_repl = null;
+        }
+    }
+
+    /// Promotes this node to a writable primary at a fresh, strictly-greater fence
+    /// epoch, and returns that epoch.
+    ///
+    /// Safe-by-construction against split-brain: the new epoch is
+    /// `max_epoch_seen + 1`. A former follower has been raising `max_epoch_seen`
+    /// via [`Database.observeEpoch`] as it applied the old leader's stream, so this
+    /// is strictly greater than any epoch the old leader used; the old leader is
+    /// fenced ([`Database.guardWrite`] fails) the moment it observes the new epoch.
+    /// [`Database.setWriteEpoch`] persists the raised `max_epoch_seen` BEFORE this
+    /// returns, so a crash mid-promote still leaves the higher epoch on disk and the
+    /// old leader stays fenced. Stops any follower apply loop first. Shipping to
+    /// remaining replicas, if wanted, is configured separately.
+    pub fn promote(self: *Database) !u64 {
+        self.stopFollower();
+        const new_epoch = self.max_epoch_seen + 1;
+        try self.setWriteEpoch(new_epoch);
+        std.log.info("Database PROMOTED to writable primary at epoch {d}", .{new_epoch});
+        return new_epoch;
+    }
+
+    /// Demotes this node to a follower that listens on `host:port` for the new
+    /// primary's pushed stream (replication is push-model: the leader dials the
+    /// follower). Fences local writes FIRST, then stops any shipping, then starts
+    /// following, so there is never a window where the node both accepts client
+    /// writes and applies a leader's stream. Any writes that committed locally
+    /// before the fence are not shipped onward and will be superseded by the new
+    /// leader's history once it re-syncs this follower (the new leader is
+    /// authoritative after a failover).
+    pub fn demote(self: *Database, host: []const u8, port: u16, auth_key: []const u8, tls_config: @import("../query/replication.zig").TlsConfig) !void {
+        // 1. Fence: raise max_epoch_seen above our own writable epoch so guardWrite
+        //    rejects every NEW client write immediately. Persisted by observeEpoch.
+        if (self.fencing_epoch >= self.max_epoch_seen) {
+            try self.observeEpoch(self.max_epoch_seen + 1);
+        }
+        // 2. Stop shipping (if we were a leader) and any prior follow loop.
+        self.stopDurableLeader();
+        self.stopFollower();
+        // 3. Start following the new primary.
+        try self.becomeFollower(host, port, self.fenceDir(), auth_key, tls_config);
+        std.log.info("Database DEMOTED to follower, listening on {s}:{d}", .{ host, port });
+    }
+
     /// Stops and frees the follower replication machinery, if any.
     ///
     /// Stops and destroys the `ReplServer` and `Follower` and frees the owned

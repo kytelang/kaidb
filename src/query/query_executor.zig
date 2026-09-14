@@ -2883,6 +2883,43 @@ pub const QueryExecutor = struct {
             return QueryResponse{ .rows_affected = 0 };
         }
 
+        // Runtime role transition (admin-gated), mechanism for orchestrated failover.
+        // `PROMOTE` makes this node a writable primary at a fresh, strictly-greater
+        // fence epoch (split-brain-safe; see Database.promote). Idempotent-ish:
+        // re-promoting just bumps the epoch.
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, req.sql, " \t\r\n;"), "PROMOTE")) {
+            if (try self.adminGate(req)) |deny| return deny;
+            const new_epoch = self.db.promote() catch |err| {
+                return QueryResponse{ .error_message = try std.fmt.allocPrint(self.allocator, "PROMOTE failed: {s}", .{@errorName(err)}) };
+            };
+            var cols = try self.allocator.alloc([]const u8, 1);
+            cols[0] = try self.allocator.dupe(u8, "epoch");
+            var row_cells = try self.allocator.alloc([]const u8, 1);
+            row_cells[0] = try std.fmt.allocPrint(self.allocator, "{d}", .{new_epoch});
+            var rows = try self.allocator.alloc([]const []const u8, 1);
+            rows[0] = row_cells;
+            return QueryResponse{ .columns = cols, .rows = rows, .rows_affected = 0 };
+        }
+
+        // `DEMOTE TO FOLLOWER ON 'host:port'` fences local writes, stops shipping,
+        // and starts following on the given LISTEN address (push-model: the new
+        // primary dials this follower). v1 uses no replication TLS/auth on the SQL
+        // path; a TLS-secured replication link is configured the file-config way.
+        if (std.ascii.startsWithIgnoreCase(req.sql, "DEMOTE TO FOLLOWER ON ")) {
+            if (try self.adminGate(req)) |deny| return deny;
+            const rest = std.mem.trim(u8, req.sql["DEMOTE TO FOLLOWER ON ".len..], " \t\r\n;'\"");
+            const colon = std.mem.lastIndexOfScalar(u8, rest, ':') orelse
+                return QueryResponse{ .error_message = try self.allocator.dupe(u8, "DEMOTE: expected 'host:port'") };
+            const host = rest[0..colon];
+            const port = std.fmt.parseUnsigned(u16, rest[colon + 1 ..], 10) catch
+                return QueryResponse{ .error_message = try self.allocator.dupe(u8, "DEMOTE: invalid port") };
+            if (host.len == 0) return QueryResponse{ .error_message = try self.allocator.dupe(u8, "DEMOTE: empty host") };
+            self.db.demote(host, port, "", .{}) catch |err| {
+                return QueryResponse{ .error_message = try std.fmt.allocPrint(self.allocator, "DEMOTE failed: {s}", .{@errorName(err)}) };
+            };
+            return QueryResponse{ .rows_affected = 0 };
+        }
+
         if (std.mem.startsWith(u8, req.sql, "SET DURABLE COMMIT ")) {
             if (try self.adminGate(req)) |deny| return deny;
             const rest = std.mem.trim(u8, req.sql["SET DURABLE COMMIT ".len..], " \t\r\n;");

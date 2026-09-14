@@ -22,9 +22,10 @@ Deliberate boundaries that are **by design**, not blockers for this role:
    routinely ships thousands of rows *through* a secondary index.
 3. **Large-value cutoff** at `PAGE_SIZE/8` (~2 KiB inline, 4.1) — capped on purpose, tied to a
    known ARIES gap for big overflow values. Fine unless storing large blobs.
-4. Remaining ops items are **polish, not gates**: promote/failover command, automated
-   re-sync, and active-txn/lock-wait gauges. (WAL-size/checkpoint-lag gauges and JSON logging
-   landed this session.)
+4. Remaining ops items are **polish, not gates**: automated failure-detection/auto-promote
+   (orchestrator policy) and automated re-sync tooling, plus active-txn/lock-wait gauges.
+   (WAL-size/checkpoint-lag gauges, JSON logging, and `PROMOTE`/`DEMOTE` role-transition
+   commands landed this session.)
 
 **The one caveat before calling it "in prod":** everything above is verified in-tree with
 tests. What has **not** been done is a live multi-hour **soak on real target hardware**
@@ -202,8 +203,16 @@ Assessment: reliable cold and hot backup/restore; PITR (LSN target) via WAL arch
 
 Assessment: the correctness primitives (fencing, snapshot resync) are present and
 tested for the orchestrator's needs. A replication-lag metric landed this session (4.7:
-`kaidb_replication_lag_frames`); the remaining operational thinness is no first-class
-promote/failover command and no automated re-sync tooling (see 5.B.7).
+`kaidb_replication_lag_frames`), and runtime **role transition** landed too:
+`PROMOTE` and `DEMOTE TO FOLLOWER ON 'host:port'` (admin-gated SQL) flip a live node's
+role without restart. Promote picks `max_epoch_seen + 1` and persists it before admitting
+a write; demote fences local writes first, then follows. Split-brain safety is proven by
+a red->green test ("PROMOTE fences the old leader"): an old leader that observes the
+promoted epoch has every subsequent write rejected. Remaining operational thinness:
+automated failure *detection*/auto-promote (a policy the orchestrator owns, not the
+engine) and automated re-sync tooling (see 5.B.7). NOTE: the promote/demote SQL path is
+mechanism, not policy; async failover keeps the standard committed-but-unshipped data-loss
+window (use sync replication / lag-gating for zero-loss) -- see `promote-demote-design.md`.
 
 ### 4.6 Resource governance: PARTIAL
 
@@ -334,8 +343,10 @@ section 5.A are only warranted if kaidb targets general-purpose use.
    escape hatch (4.3). No follow-up remains here.
 6. **Connection governance** [small-medium]. Idle timeout, backpressure; surface the
    existing per-query deadline + memory cap in config.
-7. **Replication operations** [medium]. Lag monitoring, `promote`/failover command,
-   automated re-sync, failover verification around the fence epoch (4.5).
+7. **Replication operations** [partly DONE]. Lag monitoring (4.7) and `PROMOTE`/`DEMOTE`
+   role-transition commands (4.5, split-brain-tested) landed this session. Remaining:
+   automated failure detection / auto-promote (orchestrator policy, not engine), and
+   automated re-sync tooling.
 8. **Online admin ops** [medium]. Online compact/index rebuild (`compact` is offline
    only), vacuum controls, a user/role admin CLI wrapper.
 9. **On-disk format upgrade tooling** [medium]. A `migrate` path so a format bump (e.g.

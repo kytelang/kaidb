@@ -4700,6 +4700,114 @@ test "METRICS: WAL size grows and checkpoint lag clears after a checkpoint" {
     try std.testing.expectEqual(@as(u64, 0), wal.checkpointLagLsn());
 }
 
+test "PROMOTE fences the old leader (split-brain safety)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+
+    const fp = "test_promote_f.db";
+    const fwal = "test_promote_f_wal";
+    const lp = "test_promote_l.db";
+    const lwal = "test_promote_l_wal";
+    for ([_][]const u8{ fp, lp }) |p| Io.Dir.deleteFile(.cwd(), io, p) catch {};
+    for ([_][]const u8{ fwal, lwal }) |d| Io.Dir.deleteTree(.cwd(), io, d) catch {};
+    defer for ([_][]const u8{ fp, lp }) |p| Io.Dir.deleteFile(.cwd(), io, p) catch {};
+    defer for ([_][]const u8{ fwal, lwal }) |d| Io.Dir.deleteTree(.cwd(), io, d) catch {};
+
+    // Follower F has been applying leader L's stream at epoch 1, so it has
+    // observed epoch 1 and is fenced from writing.
+    var f = try Database.open(allocator, io, fp, 64, fwal);
+    defer f.close();
+    var fex = QueryExecutor.init(allocator, f);
+    defer fex.deinit();
+    freeResp(allocator, try fex.execute(.{ .sql = "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)" }));
+    try f.observeEpoch(1);
+    {
+        const res = try fex.execute(.{ .sql = "INSERT INTO t (id, v) VALUES (1, 'x')" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message != null); // fenced as a follower
+    }
+
+    // Promote F: it picks epoch 2 (= max_epoch_seen + 1) and becomes writable.
+    {
+        const res = try fex.execute(.{ .sql = "PROMOTE" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+        try std.testing.expectEqualStrings("2", res.rows[0][0]);
+    }
+    {
+        const res = try fex.execute(.{ .sql = "INSERT INTO t (id, v) VALUES (1, 'x')" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null); // now writable
+        try std.testing.expectEqual(@as(u64, 1), res.rows_affected);
+    }
+
+    // The old leader L was writable at epoch 1. Once it observes the new epoch 2
+    // (as it would on reconnect / heartbeat), every write it attempts is fenced,
+    // so a promote can never produce two writable primaries.
+    var l = try Database.open(allocator, io, lp, 64, lwal);
+    defer l.close();
+    var lex = QueryExecutor.init(allocator, l);
+    defer lex.deinit();
+    freeResp(allocator, try lex.execute(.{ .sql = "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)" }));
+    try l.setWriteEpoch(1);
+    {
+        const res = try lex.execute(.{ .sql = "INSERT INTO t (id, v) VALUES (1, 'old')" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null); // L still writable at epoch 1
+    }
+    try l.observeEpoch(2); // L learns a higher-epoch leader exists
+    {
+        const res = try lex.execute(.{ .sql = "INSERT INTO t (id, v) VALUES (2, 'split')" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message != null); // FENCED: no split-brain
+    }
+}
+
+test "DEMOTE fences local writes and starts following" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+
+    const p = "test_demote.db";
+    const wal = "test_demote_wal";
+    Io.Dir.deleteFile(.cwd(), io, p) catch {};
+    Io.Dir.deleteTree(.cwd(), io, wal) catch {};
+    defer Io.Dir.deleteFile(.cwd(), io, p) catch {};
+    defer Io.Dir.deleteTree(.cwd(), io, wal) catch {};
+
+    var db = try Database.open(allocator, io, p, 64, wal);
+    defer db.close();
+    var ex = QueryExecutor.init(allocator, db);
+    defer ex.deinit();
+    freeResp(allocator, try ex.execute(.{ .sql = "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)" }));
+    try db.setWriteEpoch(1); // writable primary
+    {
+        const res = try ex.execute(.{ .sql = "INSERT INTO t (id, v) VALUES (1, 'a')" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+    }
+
+    {
+        const res = try ex.execute(.{ .sql = "DEMOTE TO FOLLOWER ON '127.0.0.1:59341'" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+    }
+    // Now a follower: writes are fenced, and the follow machinery is up.
+    try std.testing.expect(db.follower != null);
+    {
+        const res = try ex.execute(.{ .sql = "INSERT INTO t (id, v) VALUES (2, 'b')" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message != null); // fenced after demote
+    }
+}
+
 test "WRITER-CACHE: concurrent writers past the query-cache cap don't corrupt (regression)" {
     const alloc = std.heap.c_allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
