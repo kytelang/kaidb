@@ -41,6 +41,76 @@ const Io = std.Io;
 const Dir = Io.Dir;
 const builtin = @import("builtin");
 
+/// Set from `config.logging.json` at startup. When true, [`logFn`] emits one
+/// JSON object per log line instead of the human-readable default. A plain
+/// global (set once, before the listeners spawn, then only read) rather than an
+/// atomic: the write happens-before every worker thread is created.
+var g_json_logs: bool = false;
+
+/// Installs the custom structured-logging front end. Zig calls `logFn` for every
+/// `std.log` call in the process.
+pub const std_options: std.Options = .{ .logFn = logFn };
+
+/// Log sink: JSON lines when `g_json_logs` is set, otherwise the stock format.
+///
+/// The JSON path mirrors `std.log.defaultLog`'s stderr locking/cancel-protection
+/// so concurrent workers cannot interleave a line, then writes
+/// `{"ts_ms":..,"level":..,"scope":..,"msg":..}` with the message JSON-escaped.
+fn logFn(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (!g_json_logs) {
+        std.log.defaultLog(level, scope, format, args);
+        return;
+    }
+    const io = std.Options.debug_io;
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
+    const ts_ms = std.Io.Clock.now(.real, io).toMilliseconds();
+    var buffer: [256]u8 = undefined;
+    const w = std.debug.lockStderr(&buffer).terminal().writer;
+    defer std.debug.unlockStderr();
+    writeJsonLine(w, ts_ms, level, scope, format, args) catch {};
+}
+
+fn writeJsonLine(
+    w: *std.Io.Writer,
+    ts_ms: i64,
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) !void {
+    // Format the message body into a bounded buffer; truncate rather than fail so
+    // a huge log line degrades gracefully instead of dropping the record.
+    var msgbuf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msgbuf, format, args) catch &msgbuf;
+    try w.print("{{\"ts_ms\":{d},\"level\":\"{s}\",\"scope\":\"{s}\",\"msg\":", .{
+        ts_ms, level.asText(), @tagName(scope),
+    });
+    try writeJsonString(w, msg);
+    try w.writeAll("}\n");
+    try w.flush();
+}
+
+/// Writes `s` as a JSON string literal (quotes + escaping of `"`, `\`, and
+/// control characters) so an arbitrary log message is always valid JSON.
+fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |c| switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        else => if (c < 0x20) try w.print("\\u{x:0>4}", .{c}) else try w.writeByte(c),
+    };
+    try w.writeByte('"');
+}
+
 /// The parsed server configuration type (data dir, ports, TLS, durability,
 /// replication, security). Loaded from disk by [`Config.load`] and then patched
 /// from the environment before any resource is opened.
@@ -586,6 +656,9 @@ pub fn main(init: std.process.Init) !void {
     };
     defer parsed_config.deinit();
     const config = &parsed_config.value;
+    // Switch to structured logging as early as possible (before any subsystem
+    // opens), so all subsequent startup logs share the configured format.
+    g_json_logs = config.logging.json;
 
     Io.Dir.createDirPath(.cwd(), io, config.base_dir) catch |err| {
         log.err("could not create data directory {s}: {any}", .{ config.base_dir, err });

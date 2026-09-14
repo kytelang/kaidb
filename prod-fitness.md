@@ -23,7 +23,8 @@ Deliberate boundaries that are **by design**, not blockers for this role:
 3. **Large-value cutoff** at `PAGE_SIZE/8` (~2 KiB inline, 4.1) — capped on purpose, tied to a
    known ARIES gap for big overflow values. Fine unless storing large blobs.
 4. Remaining ops items are **polish, not gates**: promote/failover command, automated
-   re-sync, WAL-size/checkpoint-lag gauges, active-txn/lock-wait gauges, JSON logs.
+   re-sync, and active-txn/lock-wait gauges. (WAL-size/checkpoint-lag gauges and JSON logging
+   landed this session.)
 
 **The one caveat before calling it "in prod":** everything above is verified in-tree with
 tests. What has **not** been done is a live multi-hour **soak on real target hardware**
@@ -245,8 +246,11 @@ low-connection control-plane client; needs the timeouts for a broader front door
   (sum of on-disk `.wal` segments) and `kaidb_wal_checkpoint_lag_lsn` (durable frontier minus
   the last checkpoint's LSN; 0 = caught up, a rising value = a stalled checkpointer). Emitted
   only when durability is on. Unit-tested.
-- **Still missing [verified]:** active-transaction and lock-wait gauges, and a structured
-  (JSON) log option.
+- **Structured (JSON) logging landed this session [measured]:** `logging.json` in `db.json`
+  installs a `std_options.logFn` that emits one JSON object per line
+  (`{ts_ms, level, scope, msg}`, message JSON-escaped) to stderr; verified live (logs after
+  config load switch to JSON).
+- **Still missing [verified]:** active-transaction and lock-wait gauges.
 
 Assessment: the operability floor is now met (health, readiness, core engine
 counters); the richer query/replication telemetry remains a follow-up.
@@ -303,7 +307,7 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 
 1. **Observability `/metrics`** [DONE-partial]. Prometheus `/metrics` with core engine
    counters, a buffer-pool hit/miss split, and a query-latency histogram is live (4.7).
-   Remaining follow-ups: active-txn/lock-wait gauges, JSON logs.
+   Remaining follow-ups: active-txn/lock-wait gauges.
 2. **Health / readiness probes** [DONE]. `/healthz` + `/readyz` live (4.7). JSON
    structured logging remains a small follow-up.
 3. **Point-in-time recovery** [DONE (LSN target); time-target is a follow-up].
@@ -342,9 +346,9 @@ section 5.A are only warranted if kaidb targets general-purpose use.
 For the **single-node relational** role, the operability floor is now met: 5.B.1
 (metrics), 5.B.2 (health/readiness), 5.B.3 (PITR, LSN target), 5.B.4 (hot backup), and
 5.B.5 (TLS-gate the password path) all landed this session. No required gate remains open;
-the richer telemetry that remains (active-txn/lock-wait gauges, JSON logs) is a quality
-follow-up, not a gate; the query-latency histogram, buffer-pool hit/miss split, replication-lag
-and WAL-size/checkpoint-lag gauges landed this session.
+the only richer telemetry that remains (active-txn/lock-wait gauges) is a quality follow-up,
+not a gate; the query-latency histogram, buffer-pool hit/miss split, replication-lag,
+WAL-size/checkpoint-lag gauges, and JSON logging all landed this session.
 None of the section 5.A scale items are required for this role; the clustered-storage
 cost (4.8) is the boundary that bounds it. If the ambition later widens to a
 distributed/general-purpose database, 5.A.1 (physical row locator) is the first and

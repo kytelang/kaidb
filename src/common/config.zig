@@ -170,6 +170,13 @@ pub const Config = struct {
         /// start with this on. Defaults false to keep first-run/dev friction low.
         require_admin_password_change: bool = false,
     } = .{},
+    /// Logging output format. When `json` is true, the server emits one JSON
+    /// object per log line (`ts_ms`, `level`, `scope`, `msg`) to stderr, suited
+    /// to structured log shippers; otherwise the default human-readable format is
+    /// used. Defaults false.
+    logging: struct {
+        json: bool = false,
+    } = .{},
     /// Replication settings for a follower (or the link a primary offers).
     ///
     /// When [`enabled`] is true, [`validate`] additionally requires a non-zero
