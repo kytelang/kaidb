@@ -25,7 +25,7 @@
 //   MYSQL_URL        mysql DSN     (default mysql://root@127.0.0.1:3306/novabench?sslmode=disable)
 import postgres;
 import mysql;
-import novadb;
+import kaidb;
 import data.db;
 import list;
 import string;
@@ -203,7 +203,7 @@ fn querySql(i: int, tbl: string): string {
 async fn connectFor(kind: string, url: string): db.Connection {
     if (string.eql(kind, "postgres")) { let d = postgres.PgDriver(); return await d.connect(url); }
     if (string.eql(kind, "mysql")) { let d = mysql.MyDriver(); return await d.connect(url); }
-    let d = novadb.KyteDriver();
+    let d = kaidb.KyteDriver();
     return await d.connect(url);
 }
 
@@ -264,7 +264,7 @@ async fn loadOrders(conn: db.Connection, kind: string, tbl: string, rows: int, b
 // win is that the ~per-batch coroutine round-trip park no longer serialises the
 // load, so throughput approaches the server's true insert rate. Data is identical
 // to the sequential path, so the cross-engine row/aggregate cross-check still holds.
-async fn loadOrdersPipelined(kc: novadb.KyteConnection, tbl: string, rows: int, batch: int, seed: int, window: int, er: EngineResult): long {
+async fn loadOrdersPipelined(kc: kaidb.KyteConnection, tbl: string, rows: int, batch: int, seed: int, window: int, er: EngineResult): long {
     let rng = Rand(seed as long);
     let t0 = nowMs();
     let sqls = List<string>();
@@ -396,7 +396,7 @@ async fn runEngine(kind: string, name: string, url: string, base: string, suffix
         // Dedicated pipelined connection for the bulk load (load and query need
         // not share a connection); `window` in-flight batches hide round-trip park.
         let window = envInt("ORDERS_PIPELINE", 64);
-        let lc = await novadb.connectKaidb(url);
+        let lc = await kaidb.connectKaidb(url);
         er.loadMs = await loadOrdersPipelined(lc, tbl, rows, batch, seed, window, er);
         lc.close();
     } else {
