@@ -40,8 +40,8 @@ Read this honestly, both ways:
   PostgreSQL and ~4x MySQL. Per batch, kaidb pays a full round-trip and commit that the
   SQL engines absorb more cheaply, so on an equal synchronous footing it loses badly.
 - **As the driver actually ships (pipelined):** overlapping 64 batches hides that
-  per-batch park entirely and takes kaidb to ~5.7 s, the fastest of the four and ~1.9x
-  PostgreSQL / ~2.3x MySQL. This is a real, usable win, but it is the *kaidb driver*
+  per-batch park entirely and takes kaidb to ~5.4 s, the fastest of the four and ~1.9x
+  PostgreSQL / ~2.5x MySQL. This is a real, usable win, but it is the *kaidb driver*
   pipelining, not the *kaidb server* out-inserting InnoDB. PostgreSQL's wire protocol
   supports pipelining too; this harness simply does not use it for PG/MySQL, so the
   comparison would tighten if it did.
