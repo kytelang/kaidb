@@ -13,7 +13,7 @@
 //
 // SAFETY: the harness only ever creates/drops a table called `orders` in the
 // database named in each engine's URL. Point the SQL engines at a THROWAWAY
-// database (default `novabench`), never at an application database.
+// database (default `bench`), never at an application database.
 //
 // Configuration is by environment variable (all optional):
 //   ORDERS_ROWS      row count to generate         (default 1000000)
@@ -21,8 +21,8 @@
 //   ORDERS_BATCH     rows per INSERT statement      (default 500)
 //   ORDERS_SEED      RNG seed                        (default 12345)
 //   KAIDB_URL        kaidb DSN     (default admin:admin@127.0.0.1:3009?db=default&tls=false)
-//   PG_URL           postgres DSN  (default postgresql://postgres@127.0.0.1:5432/novabench?sslmode=disable)
-//   MYSQL_URL        mysql DSN     (default mysql://root@127.0.0.1:3306/novabench?sslmode=disable)
+//   PG_URL           postgres DSN  (default postgresql://postgres@127.0.0.1:5432/bench?sslmode=disable)
+//   MYSQL_URL        mysql DSN     (default mysql://root@127.0.0.1:3306/bench?sslmode=disable)
 import postgres;
 import mysql;
 import kaidb;
@@ -594,8 +594,8 @@ fn main(): int {
     let seed = envInt("ORDERS_SEED", 12345);
     let enginesCsv = envStr("ORDERS_ENGINES", "kaidb,postgres,mysql");
     let urlKaidb = envStr("KAIDB_URL", "admin:admin@127.0.0.1:3009?db=default&tls=false");
-    let urlPg = envStr("PG_URL", "postgresql://postgres@127.0.0.1:5432/novabench?sslmode=disable");
-    let urlMy = envStr("MYSQL_URL", "mysql://root@127.0.0.1:3306/novabench?sslmode=disable");
+    let urlPg = envStr("PG_URL", "postgresql://postgres@127.0.0.1:5432/bench?sslmode=disable");
+    let urlMy = envStr("MYSQL_URL", "mysql://root@127.0.0.1:3306/bench?sslmode=disable");
     let outPath = envStr("ORDERS_OUT", "orders_compare_report.md");
     let base = envStr("ORDERS_TABLE", "orders");
     // A run-unique suffix used only as a fallback table name when an engine's

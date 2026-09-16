@@ -107,4 +107,4 @@ Env knobs: `ORDERS_ROWS`, `ORDERS_ENGINES` (comma list), `ORDERS_BATCH`, `ORDERS
 `KAIDB_URL`/`PG_URL`/`MYSQL_URL`, `ORDERS_OUT`. Server-side `NOVADB_NOSTREAM=1` forces the
 old buffer-then-send path; `NOVADB_QEXEC`/`NOVADB_QPROF` enable per-stage profiling.
 The harness only ever creates/drops/queries the `orders` table in the database named in
-each engine's URL (PostgreSQL and MySQL both use `novabench`).
+each engine's URL (PostgreSQL and MySQL both use `bench`).

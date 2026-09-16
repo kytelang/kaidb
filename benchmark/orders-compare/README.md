@@ -44,14 +44,14 @@ point the SQL engines at a throwaway database.
 | Engine | Start | Port | Database |
 |---|---|---|---|
 | kaidb | run the `btree` server (streaming is on by default) | `3009` | `db=default` |
-| PostgreSQL | `brew services start postgresql@18` | `5432` | `novabench` |
-| MySQL | `brew services start mysql` | `3306` | `novabench` |
+| PostgreSQL | `brew services start postgresql@18` | `5432` | `bench` |
+| MySQL | `brew services start mysql` | `3306` | `bench` |
 
 Create the throwaway databases once (safe to re-run):
 
 ```sh
-/opt/homebrew/opt/postgresql@18/bin/createdb -p 5432 novabench 2>/dev/null || true
-mysql -uroot -e "CREATE DATABASE IF NOT EXISTS novabench;"
+/opt/homebrew/opt/postgresql@18/bin/createdb -p 5432 bench 2>/dev/null || true
+mysql -uroot -e "CREATE DATABASE IF NOT EXISTS bench;"
 ```
 
 If a server is down or read-only (for example a PostgreSQL cluster stuck in
@@ -83,8 +83,8 @@ Everything is configured by environment variable (all optional):
 | `ORDERS_TABLE` | `orders` | base table name |
 | `ORDERS_OUT` | `orders_compare_report.md` | markdown report path |
 | `KAIDB_URL` | `admin:admin@127.0.0.1:3009?db=default&tls=false` | kaidb DSN |
-| `PG_URL` | `postgresql://postgres@127.0.0.1:5432/novabench?sslmode=disable` | PostgreSQL DSN |
-| `MYSQL_URL` | `mysql://root@127.0.0.1:3306/novabench?sslmode=disable` | MySQL DSN |
+| `PG_URL` | `postgresql://postgres@127.0.0.1:5432/bench?sslmode=disable` | PostgreSQL DSN |
+| `MYSQL_URL` | `mysql://root@127.0.0.1:3306/bench?sslmode=disable` | MySQL DSN |
 
 ```sh
 # full run: 1M rows, all three engines, report written to report.md
@@ -126,7 +126,7 @@ The full, analysed 1M results and the "why" behind them live in `comparison.md`.
 
 The harness only ever creates, drops and queries the `orders` table in the
 database named in each engine's URL. **Point the SQL engines at a throwaway
-database** (the defaults use `novabench`), never at an application database.
+database** (the defaults use `bench`), never at an application database.
 An engine that cannot actually store the data (for example a PostgreSQL server
 in read-only recovery mode) is detected by the post-load row-count check and
 reported as skipped rather than producing bogus zero-millisecond "wins".
