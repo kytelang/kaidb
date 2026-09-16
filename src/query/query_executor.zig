@@ -5656,9 +5656,12 @@ pub const QueryExecutor = struct {
     /// the scan decoder expects, and `sys.columns` has no storage at all, so a
     /// normal table scan cannot read any of them. See [`buildCatalogRows`].
     fn isCatalogSynthTable(name: []const u8) bool {
-        return std.mem.eql(u8, name, "sys.tables") or
+        return std.mem.eql(u8, name, "sys.objects") or
+            std.mem.eql(u8, name, "sys.tables") or
             std.mem.eql(u8, name, "sys.indexes") or
-            std.mem.eql(u8, name, "sys.columns");
+            std.mem.eql(u8, name, "sys.columns") or
+            std.mem.eql(u8, name, "sys.schemas") or
+            std.mem.eql(u8, name, "sys.types");
     }
 
     /// Resolves a table id to its name via the in-memory catalog, or null if none.
@@ -5691,12 +5694,49 @@ pub const QueryExecutor = struct {
             out.deinit(self.allocator);
         }
 
-        if (std.mem.eql(u8, table_name, "sys.tables")) {
+        if (std.mem.eql(u8, table_name, "sys.objects")) {
+            // The superset catalog (MSSQL sys.objects): every table (user 'U' and the
+            // system catalog tables 'S') plus every index ('IX'), each with a type/desc.
             for (self.db.catalog.tables.items) |t| {
+                const is_sys = std.mem.startsWith(u8, t.name, "sys.");
                 var obj = std.json.ObjectMap.empty;
                 defer obj.deinit(self.allocator);
-                try obj.put(self.allocator, "id", std.json.Value{ .integer = @intCast(t.id) });
+                try obj.put(self.allocator, "object_id", std.json.Value{ .integer = @intCast(t.id) });
                 try obj.put(self.allocator, "name", std.json.Value{ .string = t.name });
+                try obj.put(self.allocator, "schema_id", std.json.Value{ .integer = 1 });
+                try obj.put(self.allocator, "type", std.json.Value{ .string = if (is_sys) "S" else "U" });
+                try obj.put(self.allocator, "type_desc", std.json.Value{ .string = if (is_sys) "SYSTEM_TABLE" else "USER_TABLE" });
+                try obj.put(self.allocator, "is_ms_shipped", std.json.Value{ .integer = if (is_sys) 1 else 0 });
+                const root: i64 = @intCast(self.db.table_roots.get(t.name) orelse 0);
+                try obj.put(self.allocator, "root_page_id", std.json.Value{ .integer = root });
+                try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
+            }
+            for (self.db.catalog.indexes.items) |ix| {
+                var obj = std.json.ObjectMap.empty;
+                defer obj.deinit(self.allocator);
+                try obj.put(self.allocator, "object_id", std.json.Value{ .integer = @intCast(ix.id) });
+                try obj.put(self.allocator, "name", std.json.Value{ .string = ix.name });
+                try obj.put(self.allocator, "schema_id", std.json.Value{ .integer = 1 });
+                try obj.put(self.allocator, "type", std.json.Value{ .string = "IX" });
+                try obj.put(self.allocator, "type_desc", std.json.Value{ .string = "INDEX" });
+                try obj.put(self.allocator, "is_ms_shipped", std.json.Value{ .integer = 0 });
+                const root: i64 = @intCast(self.db.index_roots.get(ix.name) orelse 0);
+                try obj.put(self.allocator, "root_page_id", std.json.Value{ .integer = root });
+                try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
+            }
+        } else if (std.mem.eql(u8, table_name, "sys.tables")) {
+            // Only user tables (MSSQL sys.tables): the sys.* catalog tables are excluded
+            // here and appear in sys.objects instead.
+            for (self.db.catalog.tables.items) |t| {
+                if (std.mem.startsWith(u8, t.name, "sys.")) continue;
+                var obj = std.json.ObjectMap.empty;
+                defer obj.deinit(self.allocator);
+                try obj.put(self.allocator, "object_id", std.json.Value{ .integer = @intCast(t.id) });
+                try obj.put(self.allocator, "name", std.json.Value{ .string = t.name });
+                try obj.put(self.allocator, "schema_id", std.json.Value{ .integer = 1 });
+                try obj.put(self.allocator, "type", std.json.Value{ .string = "U" });
+                try obj.put(self.allocator, "type_desc", std.json.Value{ .string = "USER_TABLE" });
+                try obj.put(self.allocator, "is_ms_shipped", std.json.Value{ .integer = 0 });
                 const root: i64 = @intCast(self.db.table_roots.get(t.name) orelse 0);
                 try obj.put(self.allocator, "root_page_id", std.json.Value{ .integer = root });
                 try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
@@ -5705,23 +5745,68 @@ pub const QueryExecutor = struct {
             for (self.db.catalog.indexes.items) |ix| {
                 var obj = std.json.ObjectMap.empty;
                 defer obj.deinit(self.allocator);
-                try obj.put(self.allocator, "name", std.json.Value{ .string = ix.name });
                 const tname = self.tableNameForId(ix.table_id) orelse "";
+                try obj.put(self.allocator, "object_id", std.json.Value{ .integer = @intCast(ix.table_id) });
                 try obj.put(self.allocator, "table_name", std.json.Value{ .string = tname });
+                try obj.put(self.allocator, "index_id", std.json.Value{ .integer = @intCast(ix.id) });
+                try obj.put(self.allocator, "name", std.json.Value{ .string = ix.name });
+                // kaidb secondary indexes are non-clustered B+Trees (MSSQL type 2).
+                try obj.put(self.allocator, "type", std.json.Value{ .integer = 2 });
+                try obj.put(self.allocator, "type_desc", std.json.Value{ .string = "NONCLUSTERED" });
+                const uniq: i64 = if (ix.kind == .UNIQUE) 1 else 0;
+                try obj.put(self.allocator, "is_unique", std.json.Value{ .integer = uniq });
+                try obj.put(self.allocator, "is_primary_key", std.json.Value{ .integer = 0 });
                 const root: i64 = @intCast(self.db.index_roots.get(ix.name) orelse 0);
                 try obj.put(self.allocator, "root_page_id", std.json.Value{ .integer = root });
                 try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
             }
-        } else { // sys.columns: one row per column of every table
+        } else if (std.mem.eql(u8, table_name, "sys.schemas")) {
+            // kaidb is single-schema; expose the default 'dbo' schema (MSSQL convention).
+            var obj = std.json.ObjectMap.empty;
+            defer obj.deinit(self.allocator);
+            try obj.put(self.allocator, "schema_id", std.json.Value{ .integer = 1 });
+            try obj.put(self.allocator, "name", std.json.Value{ .string = "dbo" });
+            try obj.put(self.allocator, "principal_id", std.json.Value{ .integer = 1 });
+            try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
+        } else if (std.mem.eql(u8, table_name, "sys.types")) {
+            // One row per kaidb column type (the engine's system types).
+            const TypeRow = struct { id: i64, name: []const u8, max_len: i64 };
+            const type_rows = [_]TypeRow{
+                .{ .id = 1, .name = "BOOL", .max_len = 1 },
+                .{ .id = 2, .name = "UINT32", .max_len = 4 },
+                .{ .id = 3, .name = "UINT64", .max_len = 8 },
+                .{ .id = 4, .name = "INT32", .max_len = 4 },
+                .{ .id = 5, .name = "INT64", .max_len = 8 },
+                .{ .id = 6, .name = "FLOAT32", .max_len = 4 },
+                .{ .id = 7, .name = "FLOAT64", .max_len = 8 },
+                .{ .id = 8, .name = "TIMESTAMP", .max_len = 8 },
+                .{ .id = 9, .name = "TEXT", .max_len = -1 },
+                .{ .id = 10, .name = "BLOB", .max_len = -1 },
+            };
+            for (type_rows) |tr| {
+                var obj = std.json.ObjectMap.empty;
+                defer obj.deinit(self.allocator);
+                try obj.put(self.allocator, "user_type_id", std.json.Value{ .integer = tr.id });
+                try obj.put(self.allocator, "name", std.json.Value{ .string = tr.name });
+                try obj.put(self.allocator, "max_length", std.json.Value{ .integer = tr.max_len });
+                try obj.put(self.allocator, "is_nullable", std.json.Value{ .integer = 1 });
+                try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
+            }
+        } else { // sys.columns: one row per column of every table (MSSQL sys.columns shape)
             for (self.db.catalog.tables.items) |t| {
                 for (t.columns, 0..) |col, i| {
+                    const var_len = col.type == .TEXT or col.type == .BLOB;
                     var obj = std.json.ObjectMap.empty;
                     defer obj.deinit(self.allocator);
+                    try obj.put(self.allocator, "object_id", std.json.Value{ .integer = @intCast(t.id) });
                     try obj.put(self.allocator, "table_name", std.json.Value{ .string = t.name });
+                    try obj.put(self.allocator, "column_id", std.json.Value{ .integer = @intCast(i + 1) });
                     try obj.put(self.allocator, "name", std.json.Value{ .string = col.name });
                     try obj.put(self.allocator, "data_type", std.json.Value{ .string = @tagName(col.type) });
+                    try obj.put(self.allocator, "max_length", std.json.Value{ .integer = if (var_len) -1 else @as(i64, @intCast(col.size)) });
                     try obj.put(self.allocator, "ordinal", std.json.Value{ .integer = @intCast(i + 1) });
                     try obj.put(self.allocator, "is_nullable", std.json.Value{ .integer = if (col.is_nullable) 1 else 0 });
+                    try obj.put(self.allocator, "is_identity", std.json.Value{ .integer = if (col.is_auto_increment) 1 else 0 });
                     try obj.put(self.allocator, "is_primary_key", std.json.Value{ .integer = if (col.is_primary_key) 1 else 0 });
                     try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
                 }

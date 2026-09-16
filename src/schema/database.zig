@@ -3168,23 +3168,40 @@ pub const Database = struct {
         defer privileges_tree.deinit();
         try self.registerSystemObject("sys.privileges", "TABLE", privileges_tree.root_page_id);
 
+        // The catalog views below are read back through the synthetic materialiser
+        // (buildCatalogRows) rather than a raw scan, so these column lists are the shape
+        // users see. They mirror SQL Server's system catalog: sys.objects is the superset
+        // of every object, sys.tables is the user-table subset, sys.indexes the indexes.
         try self.writeSystemTableSchema("sys.objects", &.{
-            .{ .name = "id", .type = .UINT32, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "object_id", .type = .UINT32, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
             .{ .name = "name", .type = .TEXT, .size = 4, .offset = 4, .is_primary_key = true, .is_auto_increment = false, .is_nullable = false, .default_value = null },
-            .{ .name = "type", .type = .TEXT, .size = 4, .offset = 8, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
-            .{ .name = "root_page_id", .type = .UINT64, .size = 8, .offset = 12, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "schema_id", .type = .UINT32, .size = 4, .offset = 8, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "type", .type = .TEXT, .size = 4, .offset = 12, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "type_desc", .type = .TEXT, .size = 4, .offset = 16, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "is_ms_shipped", .type = .UINT32, .size = 4, .offset = 20, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "root_page_id", .type = .UINT64, .size = 8, .offset = 24, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
         });
 
         try self.writeSystemTableSchema("sys.tables", &.{
-            .{ .name = "id", .type = .UINT32, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "object_id", .type = .UINT32, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
             .{ .name = "name", .type = .TEXT, .size = 4, .offset = 4, .is_primary_key = true, .is_auto_increment = false, .is_nullable = false, .default_value = null },
-            .{ .name = "root_page_id", .type = .UINT64, .size = 8, .offset = 8, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "schema_id", .type = .UINT32, .size = 4, .offset = 8, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "type", .type = .TEXT, .size = 4, .offset = 12, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "type_desc", .type = .TEXT, .size = 4, .offset = 16, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "is_ms_shipped", .type = .UINT32, .size = 4, .offset = 20, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "root_page_id", .type = .UINT64, .size = 8, .offset = 24, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
         });
 
         try self.writeSystemTableSchema("sys.indexes", &.{
-            .{ .name = "name", .type = .TEXT, .size = 4, .offset = 0, .is_primary_key = true, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "object_id", .type = .UINT32, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
             .{ .name = "table_name", .type = .TEXT, .size = 4, .offset = 4, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
-            .{ .name = "root_page_id", .type = .UINT64, .size = 8, .offset = 8, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "index_id", .type = .UINT32, .size = 4, .offset = 8, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "name", .type = .TEXT, .size = 4, .offset = 12, .is_primary_key = true, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "type", .type = .UINT32, .size = 4, .offset = 16, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "type_desc", .type = .TEXT, .size = 4, .offset = 20, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "is_unique", .type = .UINT32, .size = 4, .offset = 24, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "is_primary_key", .type = .UINT32, .size = 4, .offset = 28, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "root_page_id", .type = .UINT64, .size = 8, .offset = 32, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
         });
 
         try self.writeSystemTableSchema("sys.constraints", &.{
@@ -3469,17 +3486,11 @@ pub const Database = struct {
     /// disk and given no B+Tree: the executor recognises it (and the other `sys.*`
     /// tables) as a catalog scan and synthesises the rows from `self.catalog`. The
     /// guard keeps this idempotent across the repeated `loadCatalog` calls.
-    fn ensureSyntheticCatalogTables(self: *Database) !void {
-        if (self.catalog.getTable("sys.columns") != null) return;
-
-        const defs = [_]types.ColumnMetadata{
-            .{ .name = "table_name", .type = .TEXT, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
-            .{ .name = "name", .type = .TEXT, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
-            .{ .name = "data_type", .type = .TEXT, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
-            .{ .name = "ordinal", .type = .UINT32, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
-            .{ .name = "is_nullable", .type = .UINT32, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
-            .{ .name = "is_primary_key", .type = .UINT32, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
-        };
+    /// Registers one purely in-memory catalog table (no on-disk tree) from a column
+    /// definition list, if it is not already present. Its rows are produced on demand by
+    /// the synthetic materialiser (`QueryExecutor.buildCatalogRows`).
+    fn registerSyntheticTable(self: *Database, name: []const u8, defs: []const types.ColumnMetadata) !void {
+        if (self.catalog.getTable(name) != null) return;
         var cols = try self.allocator.alloc(types.Column, defs.len);
         for (defs, 0..) |d, i| {
             cols[i] = types.Column{
@@ -3494,8 +3505,44 @@ pub const Database = struct {
             };
         }
         const table_id: u32 = @intCast(self.catalog.tables.items.len + 1);
-        const table = try table_mod.Table.init(self.allocator, table_id, "sys.columns", cols);
+        const table = try table_mod.Table.init(self.allocator, table_id, name, cols);
         try self.catalog.addTable(table);
+    }
+
+    /// Registers the purely in-memory catalog views (no on-disk storage): sys.columns,
+    /// sys.schemas and sys.types. Runs on every open (they are never persisted), so their
+    /// shape can evolve without a catalog migration. Column sets mirror SQL Server.
+    fn ensureSyntheticCatalogTables(self: *Database) !void {
+        const F = types.ColumnMetadata; // shorthand
+        const text = types.ColumnType.TEXT;
+        const u32t = types.ColumnType.UINT32;
+        const i32t = types.ColumnType.INT32;
+
+        try self.registerSyntheticTable("sys.columns", &.{
+            F{ .name = "object_id", .type = u32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "table_name", .type = text, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "column_id", .type = u32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "name", .type = text, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "data_type", .type = text, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "max_length", .type = i32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "ordinal", .type = u32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "is_nullable", .type = u32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "is_identity", .type = u32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "is_primary_key", .type = u32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+        });
+
+        try self.registerSyntheticTable("sys.schemas", &.{
+            F{ .name = "schema_id", .type = u32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "name", .type = text, .size = 4, .offset = 0, .is_primary_key = true, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "principal_id", .type = u32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+        });
+
+        try self.registerSyntheticTable("sys.types", &.{
+            F{ .name = "user_type_id", .type = u32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "name", .type = text, .size = 4, .offset = 0, .is_primary_key = true, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "max_length", .type = i32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "is_nullable", .type = u32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+        });
     }
 
     /// Creates a user table: a new tree, catalog rows, WAL records, and caches.
