@@ -1126,6 +1126,84 @@ pub const TableScanIterator = struct {
 };
 
 
+/// In-memory leaf operator over a pre-built slice of rows.
+///
+/// Unlike [`TableScanIterator`], which decodes rows from a B+Tree on demand, this
+/// operator is handed a fully materialised `[]TableRow` at construction and simply
+/// replays it. It is used for the `sys.*` catalog tables, whose rows the executor
+/// synthesises from the in-memory catalog rather than reading raw metadata blobs
+/// out of storage (those blobs are not in the MVCC row layout the scan decoder
+/// expects, so a normal table scan cannot read them). The rest of the pipeline
+/// (filter, projection, sort, limit) then applies unchanged, so a query like
+/// `SELECT name, data_type FROM sys.columns WHERE table_name = 't' ORDER BY
+/// ordinal` works exactly as it would over a real table.
+///
+/// It owns every row in `rows` and frees them all in `deinit` (via
+/// [`freeTableRow`]). Because it keeps all rows alive for its whole lifetime it
+/// more than satisfies the [`Row`] borrow contract (a returned row stays valid
+/// until `deinit`, not merely until the next `next`).
+pub const MaterializedScanIterator = struct {
+    allocator: Allocator,
+    /// The synthesised rows, owned by this operator.
+    rows: []TableRow,
+    /// Cursor into `rows`.
+    idx: usize = 0,
+    /// Reusable one-element table-name array (the catalog table's name).
+    tables_slice: [1][]const u8,
+    /// Reusable one-element data array pointing at the current row.
+    data_slice: [1]TableRow = undefined,
+
+    /// Builds the operator. Takes ownership of `rows` (and every `TableRow` in it);
+    /// `table_name` must outlive the operator (catalog names are schema-stable).
+    pub fn init(allocator: Allocator, table_name: []const u8, rows: []TableRow) !*MaterializedScanIterator {
+        const self = try allocator.create(MaterializedScanIterator);
+        self.* = .{
+            .allocator = allocator,
+            .rows = rows,
+            .tables_slice = .{table_name},
+        };
+        return self;
+    }
+
+    /// Returns the type-erased [`RowIterator`] view. The `next` closure emits each
+    /// row in turn as a width-1 [`Row`], returning `null` once the slice is
+    /// exhausted; `deinit` frees every row and the operator.
+    pub fn iterator(self: *MaterializedScanIterator) RowIterator {
+        return .{
+            .ptr = self,
+            .tables = &self.tables_slice,
+            .nextFn = struct {
+                fn next(ctx: *anyopaque) anyerror!?Row {
+                    const s: *MaterializedScanIterator = @alignCast(@ptrCast(ctx));
+                    try s.exec_checkDeadline();
+                    if (s.idx >= s.rows.len) return null;
+                    s.data_slice[0] = s.rows[s.idx];
+                    s.idx += 1;
+                    return Row{
+                        .tables = &s.tables_slice,
+                        .data = &s.data_slice,
+                    };
+                }
+            }.next,
+            .deinitFn = struct {
+                fn deinit(ctx: *anyopaque) void {
+                    const s: *MaterializedScanIterator = @alignCast(@ptrCast(ctx));
+                    for (s.rows) |r| freeTableRow(s.allocator, r);
+                    s.allocator.free(s.rows);
+                    s.allocator.destroy(s);
+                }
+            }.deinit,
+        };
+    }
+
+    /// A materialised scan has no deadline-sensitive I/O, so this is a no-op kept
+    /// only so the `next` closure reads like the storage scans.
+    fn exec_checkDeadline(self: *MaterializedScanIterator) !void {
+        _ = self;
+    }
+};
+
+
 /// Secondary-index scan leaf operator: walks an index B+Tree over a value prefix,
 /// then fetches and MVCC-filters the matching base-table rows.
 ///

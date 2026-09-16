@@ -2424,17 +2424,35 @@ pub const QueryExecutor = struct {
             if (std.mem.eql(u8, tbl.name, sel.table_name)) break tbl;
         } else return error.TableNotFound;
 
-        const base_table_tree = try self.db.getTableTree(sel.table_name);
+        // System catalog tables (sys.tables, sys.indexes, sys.columns) are served
+        // from the in-memory catalog, not scanned from storage: their on-disk rows
+        // are raw metadata blobs (or, for sys.columns, do not exist at all), not the
+        // MVCC row layout the scan decoder expects. We synthesise their rows below
+        // and skip all storage-scan setup; there is no B+Tree to open for them.
+        const is_catalog_synth = isCatalogSynthTable(sel.table_name);
+        const base_table_tree = blk: {
+            if (is_catalog_synth) break :blk undefined;
+            break :blk try self.db.getTableTree(sel.table_name);
+        };
 
         var skip_index_scan = false;
-        if (self.getTableStats(sel.table_name)) |stats| {
-            if (stats.page_count < 5) {
-                skip_index_scan = true;
+        if (!is_catalog_synth) {
+            if (self.getTableStats(sel.table_name)) |stats| {
+                if (stats.page_count < 5) {
+                    skip_index_scan = true;
+                }
             }
         }
 
         var base_iter: query_iter.RowIterator = undefined;
         var used_index = false;
+
+        if (is_catalog_synth) {
+            const rows = try self.buildCatalogRows(base_table_meta, sel.table_name);
+            const mat = try query_iter.MaterializedScanIterator.init(self.allocator, base_table_meta.name, rows);
+            base_iter = mat.iterator();
+            used_index = true;
+        }
 
         var pk_col_name: ?[]const u8 = null;
         for (base_table_meta.columns) |col| {
@@ -5630,6 +5648,87 @@ pub const QueryExecutor = struct {
             },
             .TEXT, .BLOB => unreachable,
         }
+    }
+
+    /// True for the `sys.*` tables whose rows are synthesised from the in-memory
+    /// catalog rather than scanned from storage. Their on-disk representation (for
+    /// `sys.tables`/`sys.indexes`) is a raw metadata blob, not the MVCC row layout
+    /// the scan decoder expects, and `sys.columns` has no storage at all, so a
+    /// normal table scan cannot read any of them. See [`buildCatalogRows`].
+    fn isCatalogSynthTable(name: []const u8) bool {
+        return std.mem.eql(u8, name, "sys.tables") or
+            std.mem.eql(u8, name, "sys.indexes") or
+            std.mem.eql(u8, name, "sys.columns");
+    }
+
+    /// Resolves a table id to its name via the in-memory catalog, or null if none.
+    fn tableNameForId(self: *QueryExecutor, id: u32) ?[]const u8 {
+        for (self.db.catalog.tables.items) |t| {
+            if (t.id == id) return t.name;
+        }
+        return null;
+    }
+
+    /// Materialises the full row set of a synthesised `sys.*` catalog table from
+    /// the in-memory catalog.
+    ///
+    /// Each row is built by [`tableRowFromObject`] from a JSON object carrying every
+    /// declared column of `table_meta`, so the normal filter/projection/sort/limit
+    /// pipeline then applies unchanged (a `WHERE table_name = '...'` or `ORDER BY
+    /// ordinal` works exactly as over a real table). The returned rows, and their
+    /// owned cell strings, are handed to a [`query_iter.MaterializedScanIterator`]
+    /// which frees them on `deinit`. We temporarily clear any projection-pushdown
+    /// hint so every declared column is present regardless of the SELECT list;
+    /// downstream projection then picks whatever subset it needs.
+    fn buildCatalogRows(self: *QueryExecutor, table_meta: Table, table_name: []const u8) ![]query_iter.TableRow {
+        const saved_needed = self.scan_needed_cols;
+        self.scan_needed_cols = null;
+        defer self.scan_needed_cols = saved_needed;
+
+        var out = std.ArrayList(query_iter.TableRow).empty;
+        errdefer {
+            for (out.items) |r| query_iter.freeTableRow(self.allocator, r);
+            out.deinit(self.allocator);
+        }
+
+        if (std.mem.eql(u8, table_name, "sys.tables")) {
+            for (self.db.catalog.tables.items) |t| {
+                var obj = std.json.ObjectMap.empty;
+                defer obj.deinit(self.allocator);
+                try obj.put(self.allocator, "id", std.json.Value{ .integer = @intCast(t.id) });
+                try obj.put(self.allocator, "name", std.json.Value{ .string = t.name });
+                const root: i64 = @intCast(self.db.table_roots.get(t.name) orelse 0);
+                try obj.put(self.allocator, "root_page_id", std.json.Value{ .integer = root });
+                try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
+            }
+        } else if (std.mem.eql(u8, table_name, "sys.indexes")) {
+            for (self.db.catalog.indexes.items) |ix| {
+                var obj = std.json.ObjectMap.empty;
+                defer obj.deinit(self.allocator);
+                try obj.put(self.allocator, "name", std.json.Value{ .string = ix.name });
+                const tname = self.tableNameForId(ix.table_id) orelse "";
+                try obj.put(self.allocator, "table_name", std.json.Value{ .string = tname });
+                const root: i64 = @intCast(self.db.index_roots.get(ix.name) orelse 0);
+                try obj.put(self.allocator, "root_page_id", std.json.Value{ .integer = root });
+                try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
+            }
+        } else { // sys.columns: one row per column of every table
+            for (self.db.catalog.tables.items) |t| {
+                for (t.columns, 0..) |col, i| {
+                    var obj = std.json.ObjectMap.empty;
+                    defer obj.deinit(self.allocator);
+                    try obj.put(self.allocator, "table_name", std.json.Value{ .string = t.name });
+                    try obj.put(self.allocator, "name", std.json.Value{ .string = col.name });
+                    try obj.put(self.allocator, "data_type", std.json.Value{ .string = @tagName(col.type) });
+                    try obj.put(self.allocator, "ordinal", std.json.Value{ .integer = @intCast(i + 1) });
+                    try obj.put(self.allocator, "is_nullable", std.json.Value{ .integer = if (col.is_nullable) 1 else 0 });
+                    try obj.put(self.allocator, "is_primary_key", std.json.Value{ .integer = if (col.is_primary_key) 1 else 0 });
+                    try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
+                }
+            }
+        }
+
+        return out.toOwnedSlice(self.allocator);
     }
 
     /// Build a [`query_iter.TableRow`] from a legacy JSON-object row image (the

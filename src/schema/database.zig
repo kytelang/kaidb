@@ -3127,7 +3127,12 @@ pub const Database = struct {
     /// writes each one's hard-coded column schema. The exact column layouts here
     /// (offsets and types) are the contract the rest of the engine reads back.
     fn ensureSystemCatalogTables(self: *Database) !void {
-        if (self.table_roots.contains("sys.objects")) return;
+        if (self.table_roots.contains("sys.objects")) {
+            // Reopen of an existing database: the persisted sys.* tables are already
+            // present, but the purely in-memory synthetic ones still need registering.
+            try self.ensureSyntheticCatalogTables();
+            return;
+        }
 
         try self.registerSystemObject("sys.objects", "TABLE", 1);
 
@@ -3215,6 +3220,9 @@ pub const Database = struct {
             .{ .name = "object_name", .type = .TEXT, .size = 4, .offset = 8, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
             .{ .name = "privilege", .type = .TEXT, .size = 4, .offset = 12, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
         });
+
+        // Fresh database: register the in-memory synthetic catalog tables too.
+        try self.ensureSyntheticCatalogTables();
     }
 
     /// Rebuilds the in-memory catalog from the on-disk system tables.
@@ -3443,6 +3451,51 @@ pub const Database = struct {
                 }
             }
         }
+
+        // Register the purely-synthetic catalog tables (today just `sys.columns`).
+        // These have no B+Tree of their own; the query executor generates their
+        // rows on demand from the in-memory catalog. Done here, at the tail of
+        // every catalog load, so the entry exists on fresh and reopened databases
+        // alike.
+        try self.ensureSyntheticCatalogTables();
+    }
+
+    /// Registers the purely-synthetic catalog tables that have no physical storage.
+    ///
+    /// Today that is `sys.columns`, which projects every table's column list as
+    /// queryable rows so a client can introspect column names, types, ordinal and
+    /// nullability with plain SQL (`SELECT ... FROM sys.columns WHERE table_name =
+    /// '...'`). It is registered in the in-memory catalog only, never written to
+    /// disk and given no B+Tree: the executor recognises it (and the other `sys.*`
+    /// tables) as a catalog scan and synthesises the rows from `self.catalog`. The
+    /// guard keeps this idempotent across the repeated `loadCatalog` calls.
+    fn ensureSyntheticCatalogTables(self: *Database) !void {
+        if (self.catalog.getTable("sys.columns") != null) return;
+
+        const defs = [_]types.ColumnMetadata{
+            .{ .name = "table_name", .type = .TEXT, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "name", .type = .TEXT, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "data_type", .type = .TEXT, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "ordinal", .type = .UINT32, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "is_nullable", .type = .UINT32, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            .{ .name = "is_primary_key", .type = .UINT32, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+        };
+        var cols = try self.allocator.alloc(types.Column, defs.len);
+        for (defs, 0..) |d, i| {
+            cols[i] = types.Column{
+                .name = try self.allocator.dupe(u8, d.name),
+                .type = d.type,
+                .size = d.size,
+                .offset = d.offset,
+                .is_primary_key = d.is_primary_key,
+                .is_auto_increment = d.is_auto_increment,
+                .is_nullable = d.is_nullable,
+                .default_value = null,
+            };
+        }
+        const table_id: u32 = @intCast(self.catalog.tables.items.len + 1);
+        const table = try table_mod.Table.init(self.allocator, table_id, "sys.columns", cols);
+        try self.catalog.addTable(table);
     }
 
     /// Creates a user table: a new tree, catalog rows, WAL records, and caches.
