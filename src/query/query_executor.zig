@@ -337,6 +337,29 @@ pub const QueryResponse = struct {
     result_binary: bool = false,
     /// Human-readable failure message, or null on success.
     error_message: ?[]const u8 = null,
+    /// True when the rows were already streamed to the client via a [`RowSink`]
+    /// during the scan (see [`QueryExecutor.row_sink`]); `rows` is then empty and
+    /// the caller must NOT re-send them, only the final command tag. `rows_affected`
+    /// carries the streamed row count.
+    streamed: bool = false,
+};
+
+/// A callback seam that lets the connection layer receive SELECT rows AS the scan
+/// produces them, instead of the executor buffering the whole result set and the
+/// connection sending it afterwards. Streaming overlaps the client's row decode
+/// with the server's scan (the two run concurrently over one connection), which is
+/// how a mature engine hides its scan behind the client's materialisation. Only the
+/// scan-order (non-sorted) SELECT path uses it; a query that must sort still buffers.
+///
+///   begin: called once, after the column list is known, before any row — the sink
+///          sends the RowDescription here.
+///   row:   called per row with the row's text/binary cells (parallel to columns);
+///          the sink encodes and sends one DataRow. The cells are owned by the
+///          executor and freed right after this returns.
+pub const RowSink = struct {
+    ctx: *anyopaque,
+    begin: *const fn (ctx: *anyopaque, names: []const []const u8, types: []const ColumnType, binary: bool) anyerror!void,
+    row: *const fn (ctx: *anyopaque, cells: []const []const u8) anyerror!void,
 };
 
 /// Sentinel string used as the sort key for SQL NULL in ORDER BY.
@@ -813,6 +836,11 @@ pub const QueryExecutor = struct {
     /// Profiling (gated by env NOVADB_QPROF): when true, the SELECT path prints a
     /// per-query phase breakdown and `buildRowJson` accumulates into `qp_json`.
     qprof: bool = false,
+    /// Optional row sink: when set by the connection layer, the scan-order SELECT
+    /// path streams each row to it during the scan instead of buffering the whole
+    /// result set, so the client decodes rows concurrently with the server scan.
+    /// Null (the default) keeps the buffer-then-return behaviour. Cleared after use.
+    row_sink: ?RowSink = null,
     /// Gated by env `NOVADB_BINARY_RESULTS`: when set, a single-table `SELECT *`
     /// ships numeric columns as binary (big-endian fixed-width) cells and marks
     /// them binary in the RowDescription, instead of decimal text. Default off,
@@ -3848,6 +3876,22 @@ pub const QueryExecutor = struct {
                 var qp_sort = StopWatch{};
                 var qp_rows: u64 = 0;
 
+                // Streaming: when a sink is attached and this is the scan-order
+                // single-table `SELECT *` fast path (no sort/offset/distinct), emit
+                // each row to the client during the scan instead of buffering the
+                // whole result. Send the RowDescription up front via begin(); rows
+                // then stream in scan order. A sorted/offset/distinct query cannot
+                // stream (its final order is not the scan order) and stays buffered.
+                const do_stream = self.row_sink != null and star_expand and star_meta != null and
+                    can_stream and !sort_needed and !order_by_scan_desc and
+                    sel.offset == null and !sel.distinct;
+                var streamed_rows: u64 = 0;
+                if (do_stream) {
+                    if (self.binary_results) result_binary = true;
+                    const sink = self.row_sink.?;
+                    try sink.begin(sink.ctx, columns.items, col_types.items, result_binary);
+                }
+
                 // Running total of bytes buffered into `rows` so far, checked
                 // against `self.result_bytes_limit` inside the loop.
                 var result_bytes: usize = 0;
@@ -3990,21 +4034,31 @@ pub const QueryExecutor = struct {
                         // server survives instead of being killed. Streamable
                         // queries never reach the cap because they break at LIMIT
                         // just below.
-                        if (self.result_bytes_limit) |cap| {
-                            for (row_cells.items) |c| result_bytes += c.len;
-                            if (sort_needed) result_bytes += @sizeOf(usize); // sort-key overhead, approx
-                            if (result_bytes > cap) return error.OutOfMemory;
-                        }
-                        if (sort_needed) {
-                            const ob = sel.order_by.?;
-                            const keys = try self.allocator.alloc([]const u8, ob.len);
-                            for (ob, 0..) |ok, ki| {
-                                const kv = query_iter.getVal(&ast.Expr{ .column_ref = ok.column }, row);
-                                keys[ki] = try orderKeyString(self.allocator, kv);
+                        if (do_stream) {
+                            // Send this row now and free it; nothing is buffered, so the
+                            // memory cap and sort-key collection below do not apply.
+                            const sink = self.row_sink.?;
+                            try sink.row(sink.ctx, row_cells.items);
+                            for (row_cells.items) |c| self.allocator.free(c);
+                            row_cells.deinit(self.allocator);
+                            streamed_rows += 1;
+                        } else {
+                            if (self.result_bytes_limit) |cap| {
+                                for (row_cells.items) |c| result_bytes += c.len;
+                                if (sort_needed) result_bytes += @sizeOf(usize); // sort-key overhead, approx
+                                if (result_bytes > cap) return error.OutOfMemory;
                             }
-                            try sort_keys.append(self.allocator, keys);
+                            if (sort_needed) {
+                                const ob = sel.order_by.?;
+                                const keys = try self.allocator.alloc([]const u8, ob.len);
+                                for (ob, 0..) |ok, ki| {
+                                    const kv = query_iter.getVal(&ast.Expr{ .column_ref = ok.column }, row);
+                                    keys[ki] = try orderKeyString(self.allocator, kv);
+                                }
+                                try sort_keys.append(self.allocator, keys);
+                            }
+                            try rows.append(self.allocator, try row_cells.toOwnedSlice(self.allocator));
                         }
-                        try rows.append(self.allocator, try row_cells.toOwnedSlice(self.allocator));
                     } else {
                         row_cells.deinit(self.allocator);
                     }
@@ -4013,7 +4067,8 @@ pub const QueryExecutor = struct {
 
                     if (can_stream and sel.offset == null and !sel.distinct) {
                         if (sel.limit) |lim| {
-                            if (rows.items.len >= lim) break;
+                            const produced = if (do_stream) streamed_rows else rows.items.len;
+                            if (produced >= lim) break;
                         }
                     }
                 }
@@ -4127,8 +4182,9 @@ pub const QueryExecutor = struct {
                     .columns = try columns.toOwnedSlice(self.allocator),
                     .column_types = try col_types.toOwnedSlice(self.allocator),
                     .rows = try rows.toOwnedSlice(self.allocator),
-                    .rows_affected = 0,
+                    .rows_affected = if (do_stream) streamed_rows else 0,
                     .result_binary = result_binary,
+                    .streamed = do_stream,
                 };
             },
             .export_stmt => |exp| {

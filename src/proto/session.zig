@@ -553,9 +553,46 @@ fn handleBind(sess: *Session, writer: *Io.Writer, payload: []const u8) !void {
 /// error messages both become `XX000` error responses; the caller is expected
 /// to follow with a `ReadyForQuery`. The response is deep-freed by
 /// [`freeResponse`] on the way out.
+/// Context for the streaming row sink: the live writer + allocator. Its address is
+/// handed to the executor as `qe.RowSink.ctx` for the duration of one runSql call.
+const StreamCtx = struct { writer: *Io.Writer, a: Allocator };
+
+/// RowSink.begin: send the RowDescription once, before any streamed DataRow.
+fn streamBegin(ctx: *anyopaque, names: []const []const u8, types: []const ColumnType, binary: bool) anyerror!void {
+    const s: *StreamCtx = @alignCast(@ptrCast(ctx));
+    const fields = try s.a.alloc(wire.FieldDesc, names.len);
+    defer s.a.free(fields);
+    for (names, 0..) |name, i| {
+        const ct: ColumnType = if (i < types.len) types[i] else .TEXT;
+        fields[i] = oidmap.fieldDesc(name, ct, @intCast(i));
+        if (binary and oidmap.isBinaryType(ct)) fields[i].format = .binary;
+    }
+    try sendOwned(s.writer, s.a, try wire.encodeRowDescription(s.a, fields));
+}
+
+/// RowSink.row: encode and send one DataRow. Cells are non-null text/binary bytes
+/// parallel to the columns; they are owned by the executor and freed after return.
+fn streamRow(ctx: *anyopaque, cells: []const []const u8) anyerror!void {
+    const s: *StreamCtx = @alignCast(@ptrCast(ctx));
+    const vals = try s.a.alloc(?[]const u8, cells.len);
+    defer s.a.free(vals);
+    for (cells, 0..) |c, i| vals[i] = c;
+    try sendOwned(s.writer, s.a, try wire.encodeDataRow(s.a, vals));
+}
+
 fn runSql(sess: *Session, writer: *Io.Writer, sql: []const u8) !void {
     const a = sess.allocator;
     var tokbuf: [64]u8 = undefined;
+    // Stream SELECT rows to the client during the scan (overlaps the client's row
+    // decode with the server scan) — the default; NOVADB_NOSTREAM forces the old
+    // buffer-then-send path. The sink is attached only for the duration of this call
+    // and used solely by the scan-order SELECT * fast path (a sorted/offset/distinct
+    // query ignores it and still buffers); every other statement ignores it too.
+    var sctx = StreamCtx{ .writer = writer, .a = a };
+    if (std.c.getenv("NOVADB_NOSTREAM") == null) {
+        sess.executor.row_sink = .{ .ctx = @ptrCast(&sctx), .begin = streamBegin, .row = streamRow };
+    }
+    defer sess.executor.row_sink = null;
     // Coarse per-query wire profiling, gated by env NOVADB_QEXEC. Splits the
     // server's time into execute() (planner + storage) versus encode+socket
     // send, so a client-observed round trip can be decomposed into
@@ -575,6 +612,15 @@ fn runSql(sess: *Session, writer: *Io.Writer, sql: []const u8) !void {
 
     if (resp.error_message) |m| {
         try sendOwned(writer, a, try wire.encodeError(a, "ERROR", "XX000", m));
+        return;
+    }
+
+    // Streamed result: the sink already sent RowDescription + every DataRow during
+    // the scan, so only the final command tag remains.
+    if (resp.streamed) {
+        const tag = try std.fmt.allocPrint(a, "SELECT {d}", .{resp.rows_affected});
+        defer a.free(tag);
+        try sendOwned(writer, a, try wire.encodeCommandComplete(a, tag));
         return;
     }
 
