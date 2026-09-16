@@ -89,8 +89,8 @@ fn buildNovadb(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const tls_mod = tls_dep.module("tls");
 
     // Exposed as a public "btree" module (via addModule, not createModule) so
-    // dependents such as benchmark/ycsb can `dep.module("btree")`.
-    const mod = b.addModule("btree", .{
+    // external Zig dependents can `dep.module("btree")`.
+    const mod = b.addModule("kaidb", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .imports = &.{
@@ -101,7 +101,7 @@ fn buildNovadb(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     });
 
     const exe = b.addExecutable(.{
-        .name = "novadb",
+        .name = "kaidb",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -117,7 +117,7 @@ fn buildNovadb(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     });
 
     const cli_exe = b.addExecutable(.{
-        .name = "novadb-cli",
+        .name = "kaidb-cli",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/cli.zig"),
             .target = target,
@@ -132,4 +132,3 @@ fn buildNovadb(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 
     return .{ .exe = exe, .cli_exe = cli_exe, .mod = mod };
 }
-

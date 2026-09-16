@@ -93,14 +93,13 @@ const oidmap = @import("../proto/oidmap.zig");
 /// representation (`{d}` numerics, `true`/`false`, raw string, `NULL`). Used by
 /// the projection / GROUP BY / aggregate paths that consumed row cells as text
 /// before result cells became typed.
-fn scalarTextInto(a: std.mem.Allocator, v: std.json.Value) ![]const u8 {
+fn scalarTextInto(a: std.mem.Allocator, v: query_iter.Scalar) ![]const u8 {
     return switch (v) {
         .null => try a.dupe(u8, "NULL"),
         .string => |s| try a.dupe(u8, s),
         .integer => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
         .float => |f| try std.fmt.allocPrint(a, "{d}", .{f}),
         .bool => |b| try a.dupe(u8, if (b) "true" else "false"),
-        else => try a.dupe(u8, "NULL"),
     };
 }
 const StopWatch = @import("utils").StopWatch;
@@ -352,7 +351,7 @@ const ORDER_NULL_SENTINEL = "\x00\x01NULL\x01\x00";
 /// them back for numeric ordering) and strings pass through; a missing value or
 /// JSON null becomes [`ORDER_NULL_SENTINEL`]. The returned slice is owned by
 /// `allocator`.
-fn orderKeyString(allocator: std.mem.Allocator, v: ?std.json.Value) ![]const u8 {
+fn orderKeyString(allocator: std.mem.Allocator, v: ?query_iter.Scalar) ![]const u8 {
     if (v) |val| {
         return switch (val) {
             .null => try allocator.dupe(u8, ORDER_NULL_SENTINEL),
@@ -360,7 +359,6 @@ fn orderKeyString(allocator: std.mem.Allocator, v: ?std.json.Value) ![]const u8 
             .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
             .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
             .bool => |b| try allocator.dupe(u8, if (b) "1" else "0"),
-            else => try allocator.dupe(u8, ORDER_NULL_SENTINEL),
         };
     }
     return try allocator.dupe(u8, ORDER_NULL_SENTINEL);
@@ -823,6 +821,10 @@ pub const QueryExecutor = struct {
     /// Time spent materialising rows into JSON objects (`buildRowJson`), a subset
     /// of the scan phase. Reset per SELECT when profiling.
     qp_json: StopWatch = .{},
+    /// Time spent in the per-PK base-table B+Tree seek (`table_tree.search`/leaf
+    /// cursor `get`) inside `fetchVisibleFilteredJson`, a subset of scan. Isolates
+    /// base-table descent cost from secondary-index walk cost. QPROF only.
+    qp_seek: StopWatch = .{},
 
     /// Constructs a fresh session executor bound to `db`.
     ///
@@ -3386,11 +3388,11 @@ pub const QueryExecutor = struct {
 
                 var inserted: u64 = 0;
                 for (ins.rows) |row_values| {
-                var row_obj = std.json.ObjectMap.empty;
+                var row_obj: CatalogCellMap = .empty;
                 defer {
                     var i: usize = 0;
                     while (i < row_obj.entries.len) : (i += 1) {
-                        self.allocator.free(row_obj.entries.items(.value)[i].string);
+                        self.allocator.free(row_obj.entries.items(.value)[i].text);
                     }
                     row_obj.deinit(self.allocator);
                 }
@@ -3406,7 +3408,7 @@ pub const QueryExecutor = struct {
                     };
                     errdefer self.allocator.free(val_str);
 
-                    try row_obj.put(self.allocator, col_name, std.json.Value{ .string = val_str });
+                    try row_obj.put(self.allocator, col_name, query_iter.Cell{ .text = val_str });
 
                     if (pk_col_index) |idx| {
                         if (std.mem.eql(u8, table_meta.columns[idx].name, col_name)) {
@@ -3445,7 +3447,7 @@ pub const QueryExecutor = struct {
 
                         for (idx.key_columns) |col| {
                             const cell_val = row_obj.get(col.name);
-                            const raw_val = if (cell_val) |v| v.string else "NULL";
+                            const raw_val = if (cell_val) |v| v.text else "NULL";
                             const str_val = try schema.types.encodeIndexValueAlloc(self.allocator, colTypeByName(table_meta, col.name), raw_val);
                             try list.append(self.allocator, str_val);
                         }
@@ -3833,8 +3835,13 @@ pub const QueryExecutor = struct {
                 }
 
                 self.qprof = std.c.getenv("NOVADB_QPROF") != null;
-                self.binary_results = std.c.getenv("NOVADB_BINARY_RESULTS") != null;
+                // Binary numeric results are the default: the driver now decodes
+                // big-endian int/float cells directly from the socket buffer (no
+                // string alloc, no decimal round-trip), which is faster than parsing
+                // text digits. `NOVADB_TEXT_RESULTS` forces the legacy text encoding.
+                self.binary_results = std.c.getenv("NOVADB_TEXT_RESULTS") == null;
                 self.qp_json.reset();
+                self.qp_seek.reset();
                 const qp_io = self.db.pool.pager.io;
                 var qp_scan = StopWatch{};
                 var qp_proj = StopWatch{};
@@ -3881,8 +3888,11 @@ pub const QueryExecutor = struct {
                                                 row.data[0].cells[ix]
                                             else
                                                 .null;
-                                            // Binary path (opt-in): numeric columns ship
-                                            // as big-endian fixed-width bytes, no dtoa.
+                                            // Binary path (always): numeric columns ship
+                                            // as big-endian fixed-width bytes, no dtoa on the
+                                            // server and no atoi/strtod on the driver. This is
+                                            // the ONLY result format for numeric columns; there
+                                            // is no text-numeric fallback on the wire.
                                             if (self.binary_results and oidmap.isBinaryType(col.type) and cell != .null) {
                                                 try row_cells.append(self.allocator, try encodeBinaryCell(self.allocator, col.type, cell));
                                             } else if (cell == .text) {
@@ -3902,8 +3912,13 @@ pub const QueryExecutor = struct {
                                                 try row_cells.append(self.allocator, s);
                                             }
                                         }
-                                        // Numeric columns are binary in this response's
-                                        // RowDescription when the flag is on.
+                                        // Numeric columns ship binary only when explicitly
+                                        // enabled (env NOVADB_BINARY_RESULTS). Default is text:
+                                        // the driver's `takeI64`/`takeF64` parse digits straight
+                                        // from the socket buffer with no per-cell allocation,
+                                        // whereas the binary float path round-trips through a
+                                        // decimal string on the client (no bytes->double
+                                        // primitive), which measured slower for wide result sets.
                                         if (self.binary_results) result_binary = true;
                                         continue;
                                     }
@@ -3924,7 +3939,7 @@ pub const QueryExecutor = struct {
                                             try std.fmt.allocPrint(aa, "{s}.{s}", .{ row.tables[t_idx], nm })
                                         else
                                             nm;
-                                        try merged_obj.put(aa, key, tr.cells[i].scalar());
+                                        try merged_obj.put(aa, key, tr.cells[i].scalar().toJsonValue());
                                     }
                                 }
                                 const merged_val = std.json.Value{ .object = merged_obj };
@@ -4102,8 +4117,9 @@ pub const QueryExecutor = struct {
                     };
                     const scan_ms = ns.ms(qp_scan);
                     const json_ms = ns.ms(self.qp_json);
-                    std.debug.print("[QPROF] rows={d} scan={d:.1}ms (base-search+decode={d:.1} buildJson={d:.1}) project={d:.1}ms finalize(sort/limit)={d:.1}ms\n", .{
-                        qp_rows, scan_ms, scan_ms - json_ms, json_ms, ns.ms(qp_proj), ns.ms(qp_sort),
+                    const seek_ms = ns.ms(self.qp_seek);
+                    std.debug.print("[QPROF] rows={d} scan={d:.1}ms (baseSeek={d:.1} idxwalk+other={d:.1} buildJson={d:.1}) project={d:.1}ms finalize(sort/limit)={d:.1}ms\n", .{
+                        qp_rows, scan_ms, seek_ms, scan_ms - json_ms - seek_ms, json_ms, ns.ms(qp_proj), ns.ms(qp_sort),
                     });
                 }
 
@@ -4283,7 +4299,7 @@ pub const QueryExecutor = struct {
                                 const field_count = parseCsvLine(line, fields);
                                 if (field_count < csv_headers.items.len) continue;
 
-                                var row_obj: std.json.ObjectMap = .empty;
+                                var row_obj: CatalogCellMap = .empty;
                                 defer row_obj.deinit(self.allocator);
 
                                 var pk_val: ?[]const u8 = null;
@@ -4294,12 +4310,12 @@ pub const QueryExecutor = struct {
                                         const field_dup = try self.allocator.dupe(u8, trimmed);
                                         errdefer self.allocator.free(field_dup);
 
-                                        try row_obj.put(self.allocator, db_col.name, std.json.Value{ .string = field_dup });
+                                        try row_obj.put(self.allocator, db_col.name, query_iter.Cell{ .text = field_dup });
                                         if (pk_col_index) |pk_idx| {
                                             if (pk_idx == db_col_idx) pk_val = field_dup;
                                         }
                                     } else {
-                                        try row_obj.put(self.allocator, db_col.name, std.json.Value{ .string = try self.allocator.dupe(u8, "NULL") });
+                                        try row_obj.put(self.allocator, db_col.name, query_iter.Cell{ .text = try self.allocator.dupe(u8, "NULL") });
                                     }
                                 }
 
@@ -4316,7 +4332,7 @@ pub const QueryExecutor = struct {
 
                                 var i: usize = 0;
                                 while (i < row_obj.entries.len) : (i += 1) {
-                                    self.allocator.free(row_obj.entries.items(.value)[i].string);
+                                    self.allocator.free(row_obj.entries.items(.value)[i].text);
                                 }
                             }
                             return QueryResponse{ .rows_affected = rows_imported };
@@ -4413,7 +4429,7 @@ pub const QueryExecutor = struct {
 
                 const UpdateTask = struct {
                     key: []const u8,
-                    row_obj: std.json.ObjectMap,
+                    row_obj: CatalogCellMap,
                 };
                 var tasks = std.ArrayList(UpdateTask).empty;
                 defer {
@@ -4423,7 +4439,7 @@ pub const QueryExecutor = struct {
                         while (map_it.next()) |entry| {
                             self.allocator.free(entry.key_ptr.*);
                             switch (entry.value_ptr.*) {
-                                .string => |s| self.allocator.free(s),
+                                .text => |s| self.allocator.free(s),
                                 else => {},
                             }
                         }
@@ -4441,13 +4457,13 @@ pub const QueryExecutor = struct {
                         if (try self.getVisibleVersion(table_meta, val, false, current_tx)) |visible_row| {
                             defer self.freeTableRow(visible_row);
 
-                            var row_obj = std.json.ObjectMap.empty;
+                            var row_obj: CatalogCellMap = .empty;
                             errdefer {
                                 var it_err = row_obj.iterator();
                                 while (it_err.next()) |entry| {
                                     self.allocator.free(entry.key_ptr.*);
                                     switch (entry.value_ptr.*) {
-                                        .string => |s| self.allocator.free(s),
+                                        .text => |s| self.allocator.free(s),
                                         else => {},
                                     }
                                 }
@@ -4455,7 +4471,7 @@ pub const QueryExecutor = struct {
                             }
 
                             for (visible_row.names, 0..) |nm, ci_| {
-                                const vv: std.json.Value = if (try visible_row.cells[ci_].toTextAlloc(self.allocator)) |t| .{ .string = t } else .null;
+                                const vv: query_iter.Cell = if (try visible_row.cells[ci_].toTextAlloc(self.allocator)) |t| .{ .text = t } else .null;
                                 try row_obj.put(self.allocator, try self.allocator.dupe(u8, nm), vv);
                             }
 
@@ -4463,9 +4479,9 @@ pub const QueryExecutor = struct {
                                 const val_str = try self.updateAssignStr(assign.value, visible_row);
                                 const new_key = try self.allocator.dupe(u8, assign.column);
                                 errdefer self.allocator.free(new_key);
-                                if (try row_obj.fetchPut(self.allocator, new_key, std.json.Value{ .string = val_str })) |old_entry| {
+                                if (try row_obj.fetchPut(self.allocator, new_key, query_iter.Cell{ .text = val_str })) |old_entry| {
                                     self.allocator.free(new_key);
-                                    self.freeJsonValue(old_entry.value);
+                                    switch (old_entry.value) { .text => |t| self.allocator.free(t), else => {} }
                                 }
                             }
 
@@ -4489,13 +4505,13 @@ pub const QueryExecutor = struct {
                             if (!evaluateExpr(we, visible_row)) continue;
                         }
 
-                        var row_obj = std.json.ObjectMap.empty;
+                        var row_obj: CatalogCellMap = .empty;
                         errdefer {
                             var it_err = row_obj.iterator();
                             while (it_err.next()) |entry| {
                                 self.allocator.free(entry.key_ptr.*);
                                 switch (entry.value_ptr.*) {
-                                    .string => |s| self.allocator.free(s),
+                                    .text => |s| self.allocator.free(s),
                                     else => {},
                                 }
                             }
@@ -4503,7 +4519,7 @@ pub const QueryExecutor = struct {
                         }
 
                         for (visible_row.names, 0..) |nm, ci_| {
-                            const vv: std.json.Value = if (try visible_row.cells[ci_].toTextAlloc(self.allocator)) |t| .{ .string = t } else .null;
+                            const vv: query_iter.Cell = if (try visible_row.cells[ci_].toTextAlloc(self.allocator)) |t| .{ .text = t } else .null;
                             try row_obj.put(self.allocator, try self.allocator.dupe(u8, nm), vv);
                         }
 
@@ -4511,9 +4527,9 @@ pub const QueryExecutor = struct {
                             const val_str = try self.updateAssignStr(assign.value, visible_row);
                             const new_key = try self.allocator.dupe(u8, assign.column);
                             errdefer self.allocator.free(new_key);
-                            if (try row_obj.fetchPut(self.allocator, new_key, std.json.Value{ .string = val_str })) |old_entry| {
+                            if (try row_obj.fetchPut(self.allocator, new_key, query_iter.Cell{ .text = val_str })) |old_entry| {
                                 self.allocator.free(new_key);
-                                self.freeJsonValue(old_entry.value);
+                                switch (old_entry.value) { .text => |t| self.allocator.free(t), else => {} }
                             }
                         }
 
@@ -4544,7 +4560,7 @@ pub const QueryExecutor = struct {
 
                             for (idx.key_columns) |col| {
                                 const cell_val = task.row_obj.get(col.name);
-                                const raw_val = if (cell_val) |v| v.string else "NULL";
+                                const raw_val = if (cell_val) |v| v.text else "NULL";
                                 const str_val = try schema.types.encodeIndexValueAlloc(self.allocator, colTypeByName(table_meta, col.name), raw_val);
                                 try list.append(self.allocator, str_val);
                             }
@@ -5601,7 +5617,7 @@ pub const QueryExecutor = struct {
     }
 
     /// Owned text of an evaluator scalar via the executor allocator.
-    fn scalarText(self: *QueryExecutor, v: std.json.Value) ![]const u8 {
+    fn scalarText(self: *QueryExecutor, v: query_iter.Scalar) ![]const u8 {
         return scalarTextInto(self.allocator, v);
     }
 
@@ -5683,6 +5699,44 @@ pub const QueryExecutor = struct {
     /// which frees them on `deinit`. We temporarily clear any projection-pushdown
     /// hint so every declared column is present regardless of the SELECT list;
     /// downstream projection then picks whatever subset it needs.
+    /// A synthetic catalog row under construction: column-name -> typed [`query_iter.Cell`],
+    /// a native replacement for the former `std.json.ObjectMap` image. It carries no JSON;
+    /// [`tableRowFromCellMap`] turns it into the positional row the scan yields.
+    const CatalogCellMap = std.StringArrayHashMapUnmanaged(query_iter.Cell);
+
+    /// Build a [`query_iter.TableRow`] from a column-name -> [`query_iter.Cell`] map, mirroring
+    /// [`tableRowFromObject`] but JSON-free. Text cells are duped (the map holds borrowed
+    /// schema/catalog slices, so the row owns an independent copy for `freeTableRow`); a
+    /// column absent from the map becomes a NULL cell.
+    fn tableRowFromCellMap(self: *QueryExecutor, table: Table, map: *const CatalogCellMap) !query_iter.TableRow {
+        const ncols = if (self.scan_needed_cols) |need| need.len else table.columns.len;
+        const names = try self.allocator.alloc([]const u8, ncols);
+        errdefer self.allocator.free(names);
+        if (self.scan_needed_cols) |need| {
+            for (need, 0..) |cn, i| names[i] = cn;
+        } else {
+            for (table.columns, 0..) |col, i| names[i] = col.name;
+        }
+        const cells = try self.allocator.alloc(query_iter.Cell, ncols);
+        errdefer self.allocator.free(cells);
+        var done: usize = 0;
+        errdefer for (cells[0..done]) |c| switch (c) {
+            .text => |t| self.allocator.free(t),
+            else => {},
+        };
+        for (names, 0..) |cn, i| {
+            cells[i] = blk: {
+                const v = map.get(cn) orelse break :blk .null;
+                break :blk switch (v) {
+                    .text => |t| query_iter.Cell{ .text = try self.allocator.dupe(u8, t) },
+                    else => v,
+                };
+            };
+            done = i + 1;
+        }
+        return .{ .names = names, .cells = cells };
+    }
+
     fn buildCatalogRows(self: *QueryExecutor, table_meta: Table, table_name: []const u8) ![]query_iter.TableRow {
         const saved_needed = self.scan_needed_cols;
         self.scan_needed_cols = null;
@@ -5699,75 +5753,75 @@ pub const QueryExecutor = struct {
             // system catalog tables 'S') plus every index ('IX'), each with a type/desc.
             for (self.db.catalog.tables.items) |t| {
                 const is_sys = std.mem.startsWith(u8, t.name, "sys.");
-                var obj = std.json.ObjectMap.empty;
+                var obj: CatalogCellMap = .empty;
                 defer obj.deinit(self.allocator);
-                try obj.put(self.allocator, "object_id", std.json.Value{ .integer = @intCast(t.id) });
-                try obj.put(self.allocator, "name", std.json.Value{ .string = t.name });
-                try obj.put(self.allocator, "schema_id", std.json.Value{ .integer = 1 });
-                try obj.put(self.allocator, "type", std.json.Value{ .string = if (is_sys) "S" else "U" });
-                try obj.put(self.allocator, "type_desc", std.json.Value{ .string = if (is_sys) "SYSTEM_TABLE" else "USER_TABLE" });
-                try obj.put(self.allocator, "is_ms_shipped", std.json.Value{ .integer = if (is_sys) 1 else 0 });
+                try obj.put(self.allocator, "object_id", query_iter.Cell{ .int = @intCast(t.id) });
+                try obj.put(self.allocator, "name", query_iter.Cell{ .text = t.name });
+                try obj.put(self.allocator, "schema_id", query_iter.Cell{ .int = 1 });
+                try obj.put(self.allocator, "type", query_iter.Cell{ .text = if (is_sys) "S" else "U" });
+                try obj.put(self.allocator, "type_desc", query_iter.Cell{ .text = if (is_sys) "SYSTEM_TABLE" else "USER_TABLE" });
+                try obj.put(self.allocator, "is_ms_shipped", query_iter.Cell{ .int = if (is_sys) 1 else 0 });
                 const root: i64 = @intCast(self.db.table_roots.get(t.name) orelse 0);
-                try obj.put(self.allocator, "root_page_id", std.json.Value{ .integer = root });
-                try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
+                try obj.put(self.allocator, "root_page_id", query_iter.Cell{ .int = root });
+                try out.append(self.allocator, try self.tableRowFromCellMap(table_meta, &obj));
             }
             for (self.db.catalog.indexes.items) |ix| {
-                var obj = std.json.ObjectMap.empty;
+                var obj: CatalogCellMap = .empty;
                 defer obj.deinit(self.allocator);
-                try obj.put(self.allocator, "object_id", std.json.Value{ .integer = @intCast(ix.id) });
-                try obj.put(self.allocator, "name", std.json.Value{ .string = ix.name });
-                try obj.put(self.allocator, "schema_id", std.json.Value{ .integer = 1 });
-                try obj.put(self.allocator, "type", std.json.Value{ .string = "IX" });
-                try obj.put(self.allocator, "type_desc", std.json.Value{ .string = "INDEX" });
-                try obj.put(self.allocator, "is_ms_shipped", std.json.Value{ .integer = 0 });
+                try obj.put(self.allocator, "object_id", query_iter.Cell{ .int = @intCast(ix.id) });
+                try obj.put(self.allocator, "name", query_iter.Cell{ .text = ix.name });
+                try obj.put(self.allocator, "schema_id", query_iter.Cell{ .int = 1 });
+                try obj.put(self.allocator, "type", query_iter.Cell{ .text = "IX" });
+                try obj.put(self.allocator, "type_desc", query_iter.Cell{ .text = "INDEX" });
+                try obj.put(self.allocator, "is_ms_shipped", query_iter.Cell{ .int = 0 });
                 const root: i64 = @intCast(self.db.index_roots.get(ix.name) orelse 0);
-                try obj.put(self.allocator, "root_page_id", std.json.Value{ .integer = root });
-                try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
+                try obj.put(self.allocator, "root_page_id", query_iter.Cell{ .int = root });
+                try out.append(self.allocator, try self.tableRowFromCellMap(table_meta, &obj));
             }
         } else if (std.mem.eql(u8, table_name, "sys.tables")) {
             // Only user tables (MSSQL sys.tables): the sys.* catalog tables are excluded
             // here and appear in sys.objects instead.
             for (self.db.catalog.tables.items) |t| {
                 if (std.mem.startsWith(u8, t.name, "sys.")) continue;
-                var obj = std.json.ObjectMap.empty;
+                var obj: CatalogCellMap = .empty;
                 defer obj.deinit(self.allocator);
-                try obj.put(self.allocator, "object_id", std.json.Value{ .integer = @intCast(t.id) });
-                try obj.put(self.allocator, "name", std.json.Value{ .string = t.name });
-                try obj.put(self.allocator, "schema_id", std.json.Value{ .integer = 1 });
-                try obj.put(self.allocator, "type", std.json.Value{ .string = "U" });
-                try obj.put(self.allocator, "type_desc", std.json.Value{ .string = "USER_TABLE" });
-                try obj.put(self.allocator, "is_ms_shipped", std.json.Value{ .integer = 0 });
+                try obj.put(self.allocator, "object_id", query_iter.Cell{ .int = @intCast(t.id) });
+                try obj.put(self.allocator, "name", query_iter.Cell{ .text = t.name });
+                try obj.put(self.allocator, "schema_id", query_iter.Cell{ .int = 1 });
+                try obj.put(self.allocator, "type", query_iter.Cell{ .text = "U" });
+                try obj.put(self.allocator, "type_desc", query_iter.Cell{ .text = "USER_TABLE" });
+                try obj.put(self.allocator, "is_ms_shipped", query_iter.Cell{ .int = 0 });
                 const root: i64 = @intCast(self.db.table_roots.get(t.name) orelse 0);
-                try obj.put(self.allocator, "root_page_id", std.json.Value{ .integer = root });
-                try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
+                try obj.put(self.allocator, "root_page_id", query_iter.Cell{ .int = root });
+                try out.append(self.allocator, try self.tableRowFromCellMap(table_meta, &obj));
             }
         } else if (std.mem.eql(u8, table_name, "sys.indexes")) {
             for (self.db.catalog.indexes.items) |ix| {
-                var obj = std.json.ObjectMap.empty;
+                var obj: CatalogCellMap = .empty;
                 defer obj.deinit(self.allocator);
                 const tname = self.tableNameForId(ix.table_id) orelse "";
-                try obj.put(self.allocator, "object_id", std.json.Value{ .integer = @intCast(ix.table_id) });
-                try obj.put(self.allocator, "table_name", std.json.Value{ .string = tname });
-                try obj.put(self.allocator, "index_id", std.json.Value{ .integer = @intCast(ix.id) });
-                try obj.put(self.allocator, "name", std.json.Value{ .string = ix.name });
+                try obj.put(self.allocator, "object_id", query_iter.Cell{ .int = @intCast(ix.table_id) });
+                try obj.put(self.allocator, "table_name", query_iter.Cell{ .text = tname });
+                try obj.put(self.allocator, "index_id", query_iter.Cell{ .int = @intCast(ix.id) });
+                try obj.put(self.allocator, "name", query_iter.Cell{ .text = ix.name });
                 // kaidb secondary indexes are non-clustered B+Trees (MSSQL type 2).
-                try obj.put(self.allocator, "type", std.json.Value{ .integer = 2 });
-                try obj.put(self.allocator, "type_desc", std.json.Value{ .string = "NONCLUSTERED" });
+                try obj.put(self.allocator, "type", query_iter.Cell{ .int = 2 });
+                try obj.put(self.allocator, "type_desc", query_iter.Cell{ .text = "NONCLUSTERED" });
                 const uniq: i64 = if (ix.kind == .UNIQUE) 1 else 0;
-                try obj.put(self.allocator, "is_unique", std.json.Value{ .integer = uniq });
-                try obj.put(self.allocator, "is_primary_key", std.json.Value{ .integer = 0 });
+                try obj.put(self.allocator, "is_unique", query_iter.Cell{ .int = uniq });
+                try obj.put(self.allocator, "is_primary_key", query_iter.Cell{ .int = 0 });
                 const root: i64 = @intCast(self.db.index_roots.get(ix.name) orelse 0);
-                try obj.put(self.allocator, "root_page_id", std.json.Value{ .integer = root });
-                try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
+                try obj.put(self.allocator, "root_page_id", query_iter.Cell{ .int = root });
+                try out.append(self.allocator, try self.tableRowFromCellMap(table_meta, &obj));
             }
         } else if (std.mem.eql(u8, table_name, "sys.schemas")) {
             // kaidb is single-schema; expose the default 'dbo' schema (MSSQL convention).
-            var obj = std.json.ObjectMap.empty;
+            var obj: CatalogCellMap = .empty;
             defer obj.deinit(self.allocator);
-            try obj.put(self.allocator, "schema_id", std.json.Value{ .integer = 1 });
-            try obj.put(self.allocator, "name", std.json.Value{ .string = "dbo" });
-            try obj.put(self.allocator, "principal_id", std.json.Value{ .integer = 1 });
-            try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
+            try obj.put(self.allocator, "schema_id", query_iter.Cell{ .int = 1 });
+            try obj.put(self.allocator, "name", query_iter.Cell{ .text = "dbo" });
+            try obj.put(self.allocator, "principal_id", query_iter.Cell{ .int = 1 });
+            try out.append(self.allocator, try self.tableRowFromCellMap(table_meta, &obj));
         } else if (std.mem.eql(u8, table_name, "sys.types")) {
             // One row per kaidb column type (the engine's system types).
             const TypeRow = struct { id: i64, name: []const u8, max_len: i64 };
@@ -5784,31 +5838,31 @@ pub const QueryExecutor = struct {
                 .{ .id = 10, .name = "BLOB", .max_len = -1 },
             };
             for (type_rows) |tr| {
-                var obj = std.json.ObjectMap.empty;
+                var obj: CatalogCellMap = .empty;
                 defer obj.deinit(self.allocator);
-                try obj.put(self.allocator, "user_type_id", std.json.Value{ .integer = tr.id });
-                try obj.put(self.allocator, "name", std.json.Value{ .string = tr.name });
-                try obj.put(self.allocator, "max_length", std.json.Value{ .integer = tr.max_len });
-                try obj.put(self.allocator, "is_nullable", std.json.Value{ .integer = 1 });
-                try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
+                try obj.put(self.allocator, "user_type_id", query_iter.Cell{ .int = tr.id });
+                try obj.put(self.allocator, "name", query_iter.Cell{ .text = tr.name });
+                try obj.put(self.allocator, "max_length", query_iter.Cell{ .int = tr.max_len });
+                try obj.put(self.allocator, "is_nullable", query_iter.Cell{ .int = 1 });
+                try out.append(self.allocator, try self.tableRowFromCellMap(table_meta, &obj));
             }
         } else { // sys.columns: one row per column of every table (MSSQL sys.columns shape)
             for (self.db.catalog.tables.items) |t| {
                 for (t.columns, 0..) |col, i| {
                     const var_len = col.type == .TEXT or col.type == .BLOB;
-                    var obj = std.json.ObjectMap.empty;
+                    var obj: CatalogCellMap = .empty;
                     defer obj.deinit(self.allocator);
-                    try obj.put(self.allocator, "object_id", std.json.Value{ .integer = @intCast(t.id) });
-                    try obj.put(self.allocator, "table_name", std.json.Value{ .string = t.name });
-                    try obj.put(self.allocator, "column_id", std.json.Value{ .integer = @intCast(i + 1) });
-                    try obj.put(self.allocator, "name", std.json.Value{ .string = col.name });
-                    try obj.put(self.allocator, "data_type", std.json.Value{ .string = @tagName(col.type) });
-                    try obj.put(self.allocator, "max_length", std.json.Value{ .integer = if (var_len) -1 else @as(i64, @intCast(col.size)) });
-                    try obj.put(self.allocator, "ordinal", std.json.Value{ .integer = @intCast(i + 1) });
-                    try obj.put(self.allocator, "is_nullable", std.json.Value{ .integer = if (col.is_nullable) 1 else 0 });
-                    try obj.put(self.allocator, "is_identity", std.json.Value{ .integer = if (col.is_auto_increment) 1 else 0 });
-                    try obj.put(self.allocator, "is_primary_key", std.json.Value{ .integer = if (col.is_primary_key) 1 else 0 });
-                    try out.append(self.allocator, try self.tableRowFromObject(table_meta, .{ .object = obj }));
+                    try obj.put(self.allocator, "object_id", query_iter.Cell{ .int = @intCast(t.id) });
+                    try obj.put(self.allocator, "table_name", query_iter.Cell{ .text = t.name });
+                    try obj.put(self.allocator, "column_id", query_iter.Cell{ .int = @intCast(i + 1) });
+                    try obj.put(self.allocator, "name", query_iter.Cell{ .text = col.name });
+                    try obj.put(self.allocator, "data_type", query_iter.Cell{ .text = @tagName(col.type) });
+                    try obj.put(self.allocator, "max_length", query_iter.Cell{ .int = if (var_len) -1 else @as(i64, @intCast(col.size)) });
+                    try obj.put(self.allocator, "ordinal", query_iter.Cell{ .int = @intCast(i + 1) });
+                    try obj.put(self.allocator, "is_nullable", query_iter.Cell{ .int = if (col.is_nullable) 1 else 0 });
+                    try obj.put(self.allocator, "is_identity", query_iter.Cell{ .int = if (col.is_auto_increment) 1 else 0 });
+                    try obj.put(self.allocator, "is_primary_key", query_iter.Cell{ .int = if (col.is_primary_key) 1 else 0 });
+                    try out.append(self.allocator, try self.tableRowFromCellMap(table_meta, &obj));
                 }
             }
         }
@@ -6005,12 +6059,20 @@ pub const QueryExecutor = struct {
     pub fn fetchVisibleFilteredJson(self: *QueryExecutor, table: Table, table_tree: *BPlusTree, pk_val: []const u8, current_tx: u64, residual: ?*const ast.Expr, residual_cols: ?[]const []const u8) !?query_iter.TableRow {
         // Reuse the leaf cursor when one is active for THIS tree (equality index
         // scan, pk-ascending); otherwise a fresh root-to-leaf descent.
+        if (self.qprof) self.qp_seek.start(self.db.pool.pager.io);
         const val = blk: {
             if (self.base_searcher) |s| {
-                if (s.tree == table_tree) break :blk (try s.get(pk_val, self.allocator)) orelse return null;
+                if (s.tree == table_tree) break :blk (try s.get(pk_val, self.allocator)) orelse {
+                    if (self.qprof) self.qp_seek.stop(self.db.pool.pager.io);
+                    return null;
+                };
             }
-            break :blk (try table_tree.search(pk_val, self.allocator)) orelse return null;
+            break :blk (try table_tree.search(pk_val, self.allocator)) orelse {
+                if (self.qprof) self.qp_seek.stop(self.db.pool.pager.io);
+                return null;
+            };
         };
+        if (self.qprof) self.qp_seek.stop(self.db.pool.pager.io);
         defer self.allocator.free(val);
 
         if (val.len >= 36 and val[0] != '{') {
@@ -6222,7 +6284,7 @@ pub const QueryExecutor = struct {
     /// updates the table's root page id. `is_update` selects the semantics and
     /// the WAL op kind. Secondary-index maintenance is done by the callers, not
     /// here.
-    pub fn writeNewVersion(self: *QueryExecutor, table_tree: *BPlusTree, table_name: []const u8, key: []const u8, new_data: std.json.ObjectMap, is_update: bool) !void {
+    pub fn writeNewVersion(self: *QueryExecutor, table_tree: *BPlusTree, table_name: []const u8, key: []const u8, new_data: CatalogCellMap, is_update: bool) !void {
         const current_tx = self.current_tx_id orelse return error.NoActiveTransaction;
 
         const table = for (self.db.catalog.tables.items) |tbl| {
@@ -6264,8 +6326,8 @@ pub const QueryExecutor = struct {
         var heap_capacity: u32 = 0;
         var it = new_data.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.* == .string) {
-                heap_capacity += @intCast(entry.value_ptr.*.string.len + 4);
+            if (entry.value_ptr.* == .text) {
+                heap_capacity += @intCast(entry.value_ptr.*.text.len + 4);
             }
         }
         if (heap_capacity < 1024) heap_capacity = 1024;
@@ -6283,12 +6345,13 @@ pub const QueryExecutor = struct {
         for (table.columns) |col| {
             const cell_val = new_data.get(col.name) orelse continue;
             const str_val = switch (cell_val) {
-                .string => |s| try self.allocator.dupe(u8, s),
-                .integer => |i| try std.fmt.allocPrint(self.allocator, "{d}", .{i}),
+                .text => |s| try self.allocator.dupe(u8, s),
+                .int => |i| try std.fmt.allocPrint(self.allocator, "{d}", .{i}),
+                .uint => |u| try std.fmt.allocPrint(self.allocator, "{d}", .{u}),
                 .float => |f| try std.fmt.allocPrint(self.allocator, "{d}", .{f}),
-                .bool => |b| try self.allocator.dupe(u8, if (b) "true" else "false"),
+                .float32 => |f| try std.fmt.allocPrint(self.allocator, "{d}", .{f}),
+                .boolean => |b| try self.allocator.dupe(u8, if (b) "true" else "false"),
                 .null => try self.allocator.dupe(u8, "NULL"),
-                else => return error.UnsupportedValueType,
             };
             defer self.allocator.free(str_val);
             try builder.writeDynamic(col.name, str_val);
@@ -6507,12 +6570,12 @@ pub const QueryExecutor = struct {
     /// `error.UniqueConstraintViolation` on the first collision. NULLs are
     /// skipped (SQL treats NULLs as distinct). `exclude_pk` lets an UPDATE
     /// exclude the row being changed. Called before committing an INSERT/UPDATE.
-    fn validateUniqueConstraints(self: *QueryExecutor, table_id: u32, row_obj: std.json.ObjectMap, exclude_pk: ?[]const u8) !void {
+    fn validateUniqueConstraints(self: *QueryExecutor, table_id: u32, row_obj: CatalogCellMap, exclude_pk: ?[]const u8) !void {
         for (self.db.catalog.indexes.items) |idx| {
             if (idx.table_id == table_id and idx.kind == .UNIQUE) {
                 for (idx.key_columns) |col| {
                     const val = row_obj.get(col.name);
-                    const val_str = if (val) |v| (if (v == .string) v.string else "NULL") else "NULL";
+                    const val_str = if (val) |v| (if (v == .text) v.text else "NULL") else "NULL";
                     if (std.mem.eql(u8, val_str, "NULL")) continue;
                     if (try self.checkDuplicateValueExists(table_id, col.name, val_str, exclude_pk)) {
                         return error.UniqueConstraintViolation;
@@ -6529,13 +6592,13 @@ pub const QueryExecutor = struct {
     /// ([`checkParentRowExists`]); a missing parent yields
     /// `error.ForeignKeyConstraintViolation`. NULL FK values are allowed
     /// (unenforced), per SQL.
-    fn validateForeignKeyConstraintsForInsertOrUpdate(self: *QueryExecutor, table_id: u32, row_obj: std.json.ObjectMap) !void {
+    fn validateForeignKeyConstraintsForInsertOrUpdate(self: *QueryExecutor, table_id: u32, row_obj: CatalogCellMap) !void {
         for (self.db.catalog.foreign_keys.items) |fk| {
             if (fk.table_id == table_id) {
                 for (fk.columns, 0..) |col, idx| {
                     const ref_col = fk.referenced_columns[idx];
                     const val = row_obj.get(col.name);
-                    const val_str = if (val) |v| v.string else "NULL";
+                    const val_str = if (val) |v| v.text else "NULL";
 
                     if (std.mem.eql(u8, val_str, "NULL")) {
                         continue;
@@ -6587,7 +6650,7 @@ pub const QueryExecutor = struct {
     /// the old value is still referenced by a child, refuses the update with
     /// `error.ForeignKeyConstraintViolation`. This catches the case where
     /// editing a parent key would orphan existing children.
-    fn validateForeignKeyConstraintsForUpdate(self: *QueryExecutor, table_id: u32, old_row: query_iter.TableRow, new_row: std.json.ObjectMap) !void {
+    fn validateForeignKeyConstraintsForUpdate(self: *QueryExecutor, table_id: u32, old_row: query_iter.TableRow, new_row: CatalogCellMap) !void {
         try self.validateForeignKeyConstraintsForInsertOrUpdate(table_id, new_row);
 
         for (self.db.catalog.foreign_keys.items) |fk| {
@@ -6599,7 +6662,7 @@ pub const QueryExecutor = struct {
                     const old_val_str = ov orelse "NULL";
 
                     const new_val = new_row.get(ref_col.name);
-                    const new_val_str = if (new_val) |v| v.string else "NULL";
+                    const new_val_str = if (new_val) |v| v.text else "NULL";
 
                     if (!std.mem.eql(u8, old_val_str, new_val_str)) {
                         if (std.mem.eql(u8, old_val_str, "NULL")) continue;

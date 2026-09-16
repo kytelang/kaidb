@@ -54,6 +54,7 @@ const command = @import("command.zig");
 const qe = @import("../query/query_executor.zig");
 const ColumnType = @import("../schema/types.zig").ColumnType;
 const Database = @import("../schema.zig").Database;
+const StopWatch = @import("utils").StopWatch;
 /// Re-export of the fixed-size buffer pool used for inbound frame payloads.
 ///
 /// Re-exported here so callers that construct a [`Session`] can name the pool
@@ -555,12 +556,21 @@ fn handleBind(sess: *Session, writer: *Io.Writer, payload: []const u8) !void {
 fn runSql(sess: *Session, writer: *Io.Writer, sql: []const u8) !void {
     const a = sess.allocator;
     var tokbuf: [64]u8 = undefined;
+    // Coarse per-query wire profiling, gated by env NOVADB_QEXEC. Splits the
+    // server's time into execute() (planner + storage) versus encode+socket
+    // send, so a client-observed round trip can be decomposed into
+    // server-execute / server-encode+send / (network + client decode).
+    const qwire = std.c.getenv("NOVADB_QEXEC") != null;
+    const qio = sess.executor.db.pool.pager.io;
+    var sw_exec = StopWatch{};
+    if (qwire) sw_exec.start(qio);
     const resp = sess.executor.execute(.{ .sql = sql, .session_token = sess.tokenHex(&tokbuf) }) catch |err| {
         const msg = try std.fmt.allocPrint(a, "execution error: {s}", .{@errorName(err)});
         defer a.free(msg);
         try sendOwned(writer, a, try wire.encodeError(a, "ERROR", "XX000", msg));
         return;
     };
+    if (qwire) sw_exec.stop(qio);
     defer freeResponse(a, resp);
 
     if (resp.error_message) |m| {
@@ -568,6 +578,8 @@ fn runSql(sess: *Session, writer: *Io.Writer, sql: []const u8) !void {
         return;
     }
 
+    var sw_wire = StopWatch{};
+    if (qwire) sw_wire.start(qio);
     if (resp.columns.len > 0) {
         const fields = try a.alloc(wire.FieldDesc, resp.columns.len);
         defer a.free(fields);
@@ -589,10 +601,35 @@ fn runSql(sess: *Session, writer: *Io.Writer, sql: []const u8) !void {
         const tag = try std.fmt.allocPrint(a, "SELECT {d}", .{resp.rows.len});
         defer a.free(tag);
         try sendOwned(writer, a, try wire.encodeCommandComplete(a, tag));
+        if (qwire) {
+            sw_wire.stop(qio);
+            const to_ms = struct {
+                fn f(sw: StopWatch) f64 {
+                    return @as(f64, @floatFromInt(sw.elapsedNs())) / 1_000_000.0;
+                }
+            };
+            const n = @min(sql.len, 52);
+            std.debug.print("[QWIRE] exec={d:.2}ms encode+send={d:.2}ms rows={d} binary={} sql=\"{s}\"\n", .{
+                to_ms.f(sw_exec), to_ms.f(sw_wire), resp.rows.len, resp.result_binary, sql[0..n],
+            });
+        }
     } else {
+        if (qwire) sw_wire.start(qio);
         const tag = try std.fmt.allocPrint(a, "OK {d}", .{resp.rows_affected});
         defer a.free(tag);
         try sendOwned(writer, a, try wire.encodeCommandComplete(a, tag));
+        if (qwire) {
+            sw_wire.stop(qio);
+            const to_ms = struct {
+                fn f(sw: StopWatch) f64 {
+                    return @as(f64, @floatFromInt(sw.elapsedNs())) / 1_000_000.0;
+                }
+            };
+            const n = @min(sql.len, 40);
+            std.debug.print("[QDML] exec={d:.2}ms reply={d:.2}ms affected={d} sql=\"{s}\"\n", .{
+                to_ms.f(sw_exec), to_ms.f(sw_wire), resp.rows_affected, sql[0..n],
+            });
+        }
     }
 }
 

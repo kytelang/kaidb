@@ -15,11 +15,14 @@ the same source data (employees, customers, products), loads them into NovaDB in
 either **SQL** or **document** mode, indexes `EmployeeID` / `CustomerID` /
 `TotalDue`, and runs the same ten queries the reference runs against MongoDB.
 
-Harness: `benchmark/ycsb`, commands `orders-sql` and `orders-doc`
-(`--record_count=N`, `--data_dir=<json dir>`). Same generated data and query set
-in both modes; the document side stores a real nested `SalesOrderDetails` array,
-the SQL side stores the line items as a `TEXT` JSON column plus typed columns
-(`employee_id`/`customer_id` INTEGER, `total_due` etc. DOUBLE).
+Harness (historical): this SQL-vs-document comparison was produced by the old Zig
+YCSB harness (`benchmark/ycsb`, commands `orders-sql` / `orders-doc`), which has
+since been removed. The cross-engine Q1..Q10 comparison (kaidb vs PostgreSQL vs
+MySQL) now lives in the Kyte harness `benchmark/orders-compare`. The numbers below
+are kept as the historical SQL-vs-document evidence. Same generated data and query
+set in both modes; the document side stores a real nested `SalesOrderDetails`
+array, the SQL side stores the line items as a `TEXT` JSON column plus typed
+columns (`employee_id`/`customer_id` INTEGER, `total_due` etc. DOUBLE).
 
 ## Results (100,000 orders, fresh server each, indexes created after load)
 

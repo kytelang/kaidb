@@ -53,7 +53,7 @@
 //! operand yield `unknown`, `AND`/`OR`/`NOT` follow Kleene logic ([`and3`],
 //! [`or3`], [`not3`]), and only a definite `true` passes a filter (see
 //! [`evalExpr`]). The scalar evaluator [`evalScalar`] returns an optional
-//! `std.json.Value` where `null` means SQL NULL (or "not computable"), and it is
+//! `Scalar` where `null` means SQL NULL (or "not computable"), and it is
 //! parameterised over a resolver (`anytype` context with a `resolve(col)`
 //! method) so the same code serves both row-shaped input ([`RowResolver`]) and a
 //! single JSON object ([`JsonResolver`]), the latter used for row-at-a-time
@@ -106,6 +106,21 @@ fn useBaseCursor() bool {
 /// the pages in flight / cache-resident. `leaf_ids` is reused scratch. Any error
 /// inside `collectLeafPageIds` just yields fewer hints; correctness is unaffected
 /// because the real reads still go through the normal search path.
+/// Adaptive prefetch gate: return true (do the base-leaf prefetch) only while the
+/// buffer pool is still missing enough that hiding disk latency is worth the extra
+/// per-PK base-tree descent. Once the pool serves nearly everything from RAM, the
+/// prefetch is pure overhead, so return false. Cumulative pool hit ratio is the
+/// signal (`hit_count / fetch_count`); below a warm-up threshold of fetches we keep
+/// prefetch on so a genuinely cold scan is never penalised.
+fn shouldPrefetch(table_tree: *BPlusTree) bool {
+    const pool = table_tree.pool;
+    const fc = pool.fetch_count.load(.monotonic);
+    if (fc < 20000) return true; // not enough signal yet: default to prefetch (cold-safe)
+    const hc = pool.hit_count.load(.monotonic);
+    // Prefetch while the hit ratio is under 98% (disk-bound); skip once resident.
+    return (hc *% 100) < (fc *% 98);
+}
+
 fn prefetchBaseLeaves(table_tree: *BPlusTree, pks: []const []const u8, leaf_ids: *std.ArrayList(page.PageId), a: Allocator) void {
     leaf_ids.clearRetainingCapacity();
     table_tree.collectLeafPageIds(pks, leaf_ids, a);
@@ -143,6 +158,33 @@ pub const Row = struct {
 /// have a handful of columns, so a linear scan beats a per-row hashmap and costs
 /// no allocation). `is_null` marks an outer-join non-match where the whole slot
 /// reads as NULL.
+/// The transient value the SQL expression evaluator works in: a native scalar
+/// (no JSON). The variant names deliberately match the `Scalar` subset
+/// the evaluator used (`null`/`bool`/`integer`/`float`/`string`) so the switch
+/// arms and value literals in the evaluator are unchanged. Document/at-rest
+/// values (objects, arrays) are NOT scalars and are handled separately by
+/// `cloneJson`/`freeClonedJson`, which stay on `Scalar`.
+pub const Scalar = union(enum) {
+    null,
+    bool: bool,
+    integer: i64,
+    float: f64,
+    string: []const u8,
+
+    /// Bridge to `std.json.Value` for the paths that still build a JSON row image
+    /// (the join / non-catalog `SELECT *` blob, Group A in json-to-binary.md).
+    /// Removed once those shapes emit positional cells.
+    pub fn toJsonValue(self: Scalar) std.json.Value {
+        return switch (self) {
+            .null => .null,
+            .bool => |b| .{ .bool = b },
+            .integer => |n| .{ .integer = n },
+            .float => |f| .{ .float = f },
+            .string => |s| .{ .string = s },
+        };
+    }
+};
+
 /// One decoded result-cell value. Numeric variants carry the value inline (no
 /// allocation, no decimal formatting), so a `SELECT` can ship them as either
 /// binary wire bytes or on-demand text without a per-row `dtoa`/`itoa`. `.text`
@@ -158,7 +200,7 @@ pub const Cell = union(enum) {
 
     /// This cell as a transient evaluator scalar (numbers become `.integer`/
     /// `.float`, text becomes `.string`).
-    pub fn scalar(self: Cell) std.json.Value {
+    pub fn scalar(self: Cell) Scalar {
         return switch (self) {
             .null => .null,
             .text => |t| .{ .string = t },
@@ -218,7 +260,7 @@ pub const TableRow = struct {
     /// `null` when the column is absent (treated as unresolved). This is the seam
     /// that keeps the evaluator on its existing scalar type while row storage is
     /// json-free and typed.
-    pub fn getScalar(self: TableRow, col: []const u8) ?std.json.Value {
+    pub fn getScalar(self: TableRow, col: []const u8) ?Scalar {
         const i = self.find(col) orelse return null;
         return self.cells[i].scalar();
     }
@@ -311,7 +353,7 @@ pub const RowIterator = struct {
 /// right, returning the first match, which is how a bare column name works in a
 /// join without an ambiguity check. Returns `null` if no table matches, the
 /// matched value is not an object, or the key is missing.
-pub fn getValCol(col_name: []const u8, row: Row) ?std.json.Value {
+pub fn getValCol(col_name: []const u8, row: Row) ?Scalar {
     if (std.mem.indexOfScalar(u8, col_name, '.')) |dot_idx| {
         const tbl = col_name[0..dot_idx];
         const col = col_name[dot_idx + 1 ..];
@@ -335,7 +377,7 @@ pub fn getValCol(col_name: []const u8, row: Row) ?std.json.Value {
 /// functions, `CASE`) returns `null`; the full evaluator is [`evalScalar`]. This
 /// narrow helper exists for the hash join, which only needs to pull a join-key
 /// column value out of a row.
-pub fn getVal(expr: *const ast.Expr, row: Row) ?std.json.Value {
+pub fn getVal(expr: *const ast.Expr, row: Row) ?Scalar {
     switch (expr.*) {
         .column_ref => |col_name| return getValCol(col_name, row),
         .literal_int => |val| return .{ .integer = val },
@@ -396,7 +438,7 @@ const RowResolver = struct {
     row: Row,
     /// Resolves `col` (qualified or bare) against [`RowResolver.row`] using
     /// [`getValCol`].
-    fn resolve(self: RowResolver, col: []const u8) ?std.json.Value {
+    fn resolve(self: RowResolver, col: []const u8) ?Scalar {
         return getValCol(col, self.row);
     }
 };
@@ -410,7 +452,7 @@ pub const JsonResolver = struct {
     row: TableRow,
     /// Resolves `col` against [`JsonResolver.row`]; strips any `table.` prefix
     /// since there is a single unnamed row. Returns `null` if the column is absent.
-    fn resolve(self: JsonResolver, col: []const u8) ?std.json.Value {
+    fn resolve(self: JsonResolver, col: []const u8) ?Scalar {
         if (std.mem.indexOfScalar(u8, col, '.')) |di| return self.row.getScalar(col[di + 1 ..]);
         return self.row.getScalar(col);
     }
@@ -418,7 +460,7 @@ pub const JsonResolver = struct {
 
 /// Evaluates a scalar (value-producing) SQL expression against a resolver.
 ///
-/// `ctx` is any type with a `resolve(col) ?std.json.Value` method, so this same
+/// `ctx` is any type with a `resolve(col) ?Scalar` method, so this same
 /// code drives both [`RowResolver`] and [`JsonResolver`] without duplication. A
 /// returned `null` means SQL NULL *or* "not computable" (the two are deliberately
 /// merged here); [`eval3`] maps that to `unknown` for predicates. Supports
@@ -428,7 +470,7 @@ pub const JsonResolver = struct {
 /// [`evalFunc`]. Placeholders (`?`) resolve to `null` because parameters are
 /// expected to be substituted before execution. Any unsupported node returns
 /// `null`.
-fn evalScalar(expr: *const ast.Expr, ctx: anytype) ?std.json.Value {
+fn evalScalar(expr: *const ast.Expr, ctx: anytype) ?Scalar {
     switch (expr.*) {
         .column_ref => |c| {
             const v = ctx.resolve(c) orelse return null;
@@ -485,7 +527,7 @@ threadlocal var fn_scratch_toggle: bool = false;
 /// same-slot buffer is reused; `TRIM` instead returns a subslice of its input
 /// and needs no buffer. `COALESCE`/`NULLIF` short-circuit before the shared
 /// `arg0` is computed because they have argument-count semantics of their own.
-fn evalFunc(fc: ast.FuncCall, ctx: anytype) ?std.json.Value {
+fn evalFunc(fc: ast.FuncCall, ctx: anytype) ?Scalar {
     const name = fc.name;
     if (std.mem.eql(u8, name, "COALESCE")) {
         for (fc.args) |arg| {
@@ -539,7 +581,7 @@ fn evalFunc(fc: ast.FuncCall, ctx: anytype) ?std.json.Value {
 /// everything else (float, bool, object, ...) yields `null`. The string path is
 /// what lets numeric text stored as JSON participate in integer arithmetic and
 /// comparison. Compare with [`asF64`], the floating-point counterpart.
-fn asI64(v: std.json.Value) ?i64 {
+fn asI64(v: Scalar) ?i64 {
     return switch (v) {
         .integer => |i| i,
         .string => |s| std.fmt.parseInt(i64, s, 10) catch null,
@@ -553,7 +595,7 @@ fn asI64(v: std.json.Value) ?i64 {
 /// non-numeric values yield `null`. Used as the fallback numeric path in
 /// [`arith`] and the function evaluator when the integer path ([`asI64`]) does
 /// not apply.
-fn asF64(v: std.json.Value) ?f64 {
+fn asF64(v: Scalar) ?f64 {
     return switch (v) {
         .float => |f| f,
         .integer => |i| @as(f64, @floatFromInt(i)),
@@ -569,7 +611,7 @@ fn asF64(v: std.json.Value) ?f64 {
 /// traps) and truncating division; division by zero returns `null` (SQL NULL).
 /// Otherwise it falls back to `f64` via [`asF64`], with float division by zero
 /// also `null`. A non-arithmetic `op` or a non-numeric operand returns `null`.
-fn arith(l: std.json.Value, op: ast.OpType, r: std.json.Value) ?std.json.Value {
+fn arith(l: Scalar, op: ast.OpType, r: Scalar) ?Scalar {
     if (asI64(l)) |a| {
         if (asI64(r)) |b| {
             return switch (op) {
@@ -597,7 +639,7 @@ fn arith(l: std.json.Value, op: ast.OpType, r: std.json.Value) ?std.json.Value {
 /// A string is returned as-is; an integer is formatted into the caller-supplied
 /// `buf` (so the slice borrows `buf`); anything else returns `null`. Used by the
 /// `LIKE` branch of [`eval3`] to obtain both the subject text and the pattern.
-fn valStr(v: std.json.Value, buf: []u8) ?[]const u8 {
+fn valStr(v: Scalar, buf: []u8) ?[]const u8 {
     return switch (v) {
         .string => |s| s,
         .integer => |i| std.fmt.bufPrint(buf, "{d}", .{i}) catch null,
@@ -819,7 +861,7 @@ pub fn cmpDecimalStr(a_in: []const u8, b_in: []const u8) ?i32 {
 /// ([`eval3`] treats a missing operand as `unknown` before ever calling here).
 /// A non-comparison `op` or a value that fits no path returns `false`. An
 /// allocation failure in the string fallback also returns `false`.
-pub fn compareValues(left: std.json.Value, op: ast.OpType, right: std.json.Value) bool {
+pub fn compareValues(left: Scalar, op: ast.OpType, right: Scalar) bool {
     {
         const ls: ?[]const u8 = switch (left) {
             .string => |s| s,
@@ -942,11 +984,11 @@ pub fn evalExprJson(expr: *const ast.Expr, row: TableRow) bool {
 /// The [`JsonResolver`] counterpart of [`evalScalar`]; used to compute a
 /// projected/derived value from one materialised row outside the operator
 /// pipeline.
-pub fn evalScalarJson(expr: *const ast.Expr, row: TableRow) ?std.json.Value {
+pub fn evalScalarJson(expr: *const ast.Expr, row: TableRow) ?Scalar {
     return evalScalar(expr, JsonResolver{ .row = row });
 }
 
-/// Deep-copies a `std.json.Value` so it can outlive the storage it was decoded
+/// Deep-copies a `Scalar` so it can outlive the storage it was decoded
 /// from.
 ///
 /// Scans hand out rows that borrow scan-owned storage valid only until the next
@@ -1334,7 +1376,16 @@ pub const IndexScanIterator = struct {
         // Prefetch pass: resolve this batch's PKs to base-table leaf pages and
         // hint the OS to read them ahead concurrently. Best-effort throughout,
         // so a batch of 1 (prefetch disabled) or any failure just skips it.
-        if (self.prefetch_batch > 1 and self.pk_batch.items.len > 1) {
+        //
+        // ADAPTIVE: the prefetch only earns its keep when base pages are on disk
+        // (it overlaps random-read latency). Once the working set is resident in
+        // the buffer pool, the OS readahead hint is a no-op but `collectLeafPageIds`
+        // still pays a full base-tree descent per PK - pure overhead that measurably
+        // slowed warm wide-range scans (Q3/Q8). So gate it on the pool hit ratio:
+        // run prefetch only while the pool is actually MISSING (cold/disk), and
+        // skip it once the pool is serving from RAM. This keeps the cold-scan
+        // speedup and removes the warm-scan tax, with no config knob.
+        if (self.prefetch_batch > 1 and self.pk_batch.items.len > 1 and shouldPrefetch(self.table_tree)) {
             prefetchBaseLeaves(self.table_tree, self.pk_batch.items, &self.leaf_ids, self.allocator);
         }
         return true;
@@ -2406,7 +2457,6 @@ pub const HashJoinIterator = struct {
                                 .integer => |n| try std.fmt.allocPrint(allocator, "{d}", .{n}),
                                 .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
                                 .bool => |b| try allocator.dupe(u8, if (b) "true" else "false"),
-                                else => null,
                             };
                             if (key_txt) |kt| {
                                 defer allocator.free(kt);

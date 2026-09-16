@@ -1,0 +1,641 @@
+// orders-compare: the Q1..Q10 "orders" benchmark, run head to head across
+// kaidb, PostgreSQL and MySQL from ONE Kyte program.
+//
+// It generates a synthetic orders dataset with a seeded RNG (so every engine
+// loads BYTE-IDENTICAL rows), loads it into each engine, builds the same four
+// indexes, then runs the same ten queries against each and prints a comparison
+// table. Because the data and the SQL are identical across engines, the row
+// counts match and only the timings differ, which is the whole point.
+//
+// This is a client round-trip benchmark: each query time is `conn.query(...)`
+// wall time (server executes + all result rows come back over the wire). Every
+// query is run twice and the WARM (second) pass is reported.
+//
+// SAFETY: the harness only ever creates/drops a table called `orders` in the
+// database named in each engine's URL. Point the SQL engines at a THROWAWAY
+// database (default `novabench`), never at an application database.
+//
+// Configuration is by environment variable (all optional):
+//   ORDERS_ROWS      row count to generate         (default 1000000)
+//   ORDERS_ENGINES   comma list of engines to run  (default kaidb,postgres,mysql)
+//   ORDERS_BATCH     rows per INSERT statement      (default 500)
+//   ORDERS_SEED      RNG seed                        (default 12345)
+//   KAIDB_URL        kaidb DSN     (default admin:admin@127.0.0.1:3009?db=default&tls=false)
+//   PG_URL           postgres DSN  (default postgresql://postgres@127.0.0.1:5432/novabench?sslmode=disable)
+//   MYSQL_URL        mysql DSN     (default mysql://root@127.0.0.1:3306/novabench?sslmode=disable)
+import postgres;
+import mysql;
+import novadb;
+import data.db;
+import list;
+import string;
+import datetime;
+import env;
+import bytes;
+import net.poller;
+import collections.string_builder;
+import io.file;
+
+// ---------------------------------------------------------------------------
+// Small config + RNG helpers
+// ---------------------------------------------------------------------------
+
+// Parse a non-negative decimal int, or `fallback` for anything non-numeric.
+fn parseIntOr(s: string, fallback: int): int {
+    let t = string.trim(s);
+    if (t.length == 0) { return fallback; }
+    let n = 0;
+    let i = 0;
+    while (i < t.length) {
+        let code = t[i] & 255;
+        if (code < 48 || code > 57) { return fallback; }
+        n = n * 10 + (code - 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn envStr(name: string, dflt: string): string {
+    let v = env.get(name);
+    if (string.eql(v, "")) { return dflt; }
+    return v;
+}
+
+fn envInt(name: string, dflt: int): int {
+    return parseIntOr(env.get(name), dflt);
+}
+
+// A tiny deterministic LCG (same shape as the nova YCSB generator) so a run is
+// reproducible and every engine sees identical data.
+pub class Rand {
+    pub state: long,
+    init(seed: long) {
+        let s = seed % 2147483647;
+        if (s <= 0) { s = s + 2147483646; }
+        self.state = s;
+    }
+    pub fn next(self: Rand): long {
+        self.state = (self.state * 48271) % 2147483647;
+        return self.state;
+    }
+    // A non-negative int in [0, n).
+    pub fn intn(self: Rand, n: int): int {
+        if (n <= 0) { return 0; }
+        return (self.next() % (n as long)) as int;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Result model (filled by the reactor task, read by main afterwards)
+// ---------------------------------------------------------------------------
+
+// One query's outcome on one engine.
+pub class QResult {
+    pub label: string,
+    pub ms: long,
+    pub rows: int,
+    pub detail: string,   // scalar value for COUNT/AVG, else ""
+    init(label: string) { self.label = label; self.ms = -1; self.rows = 0; self.detail = ""; }
+}
+
+// One engine's whole run.
+pub class EngineResult {
+    pub name: string,
+    pub ok: bool,
+    pub note: string,
+    pub loadMs: long,
+    pub indexMs: long,
+    pub qs: list.List<QResult>,
+    init(name: string) {
+        self.name = name; self.ok = false; self.note = "";
+        self.loadMs = -1; self.indexMs = -1; self.qs = list.List<QResult>();
+    }
+}
+
+// The shared collector: main allocates it, the reactor task fills it.
+pub class Results {
+    pub engines: list.List<EngineResult>,
+    init() { self.engines = list.List<EngineResult>(); }
+}
+
+// ---------------------------------------------------------------------------
+// Per-engine SQL dialect (only the bits that differ)
+// ---------------------------------------------------------------------------
+
+fn isKaidb(kind: string): bool { return string.eql(kind, "kaidb"); }
+
+// Column type for the integer key column.
+fn pkType(kind: string): string {
+    if (isKaidb(kind)) { return "INTEGER"; }
+    return "BIGINT";
+}
+// Column type for the id-like integer columns (employee_id, customer_id).
+fn intType(kind: string): string {
+    if (isKaidb(kind)) { return "INTEGER"; }
+    return "BIGINT";
+}
+// Column type for the money-like columns (stored as whole-number doubles).
+fn dblType(kind: string): string {
+    if (string.eql(kind, "postgres")) { return "DOUBLE PRECISION"; }
+    return "DOUBLE";
+}
+
+// CREATE TABLE <tbl> (...) with a column-level primary key (portable across all
+// three engines; kaidb rejects a table-level PRIMARY KEY clause).
+fn createTableSql(kind: string, tbl: string): string {
+    return "CREATE TABLE " + tbl + " (" +
+        "id " + pkType(kind) + " PRIMARY KEY, " +
+        "order_date TEXT, due_date TEXT, ship_date TEXT, " +
+        "employee_id " + intType(kind) + ", " +
+        "customer_id " + intType(kind) + ", " +
+        "sub_total " + dblType(kind) + ", " +
+        "tax_amt " + dblType(kind) + ", " +
+        "freight " + dblType(kind) + ", " +
+        "total_due " + dblType(kind) + ", " +
+        "details TEXT)";
+}
+
+// The four secondary indexes (identical across engines), built AFTER the load.
+// Index names are derived from the table name so a fresh table gets fresh index
+// names (kaidb index names are global, so a stable name would collide on rerun).
+fn indexSqls(tbl: string): list.List<string> {
+    let l = list.List<string>();
+    l.push("CREATE INDEX idx_" + tbl + "_emp ON " + tbl + " (employee_id)");
+    l.push("CREATE INDEX idx_" + tbl + "_cust ON " + tbl + " (customer_id)");
+    l.push("CREATE INDEX idx_" + tbl + "_td ON " + tbl + " (total_due)");
+    l.push("CREATE INDEX idx_" + tbl + "_emp_td ON " + tbl + " (employee_id, total_due)");
+    return l;
+}
+
+// The ten benchmark queries (identical text for every engine; no trailing `;`,
+// which kaidb rejects). Labels double as the report row names.
+fn queryList(): list.List<QResult> {
+    let l = list.List<QResult>();
+    l.push(QResult("Q1  employee_id=279 LIMIT 10000"));
+    l.push(QResult("Q2  emp=279 AND total_due>10000 LIMIT 10000"));
+    l.push(QResult("Q3  Q2 ORDER BY total_due DESC LIMIT 10000"));
+    l.push(QResult("Q4  total_due>50000 LIMIT 5000"));
+    l.push(QResult("Q5  Q4 ORDER BY total_due DESC LIMIT 5000"));
+    l.push(QResult("Q6  customer_id=1045 LIMIT 10000"));
+    l.push(QResult("Q7  employee_id IN (279,281,283) LIMIT 10000"));
+    l.push(QResult("Q8  total_due 10000..50000 LIMIT 10000"));
+    l.push(QResult("Q9  COUNT(*) employee_id=279"));
+    l.push(QResult("Q10 AVG(total_due) BY employee_id top 5"));
+    return l;
+}
+
+fn querySql(i: int, tbl: string): string {
+    if (i == 0) { return "SELECT * FROM " + tbl + " WHERE employee_id = 279 LIMIT 10000"; }
+    if (i == 1) { return "SELECT * FROM " + tbl + " WHERE employee_id = 279 AND total_due > 10000 LIMIT 10000"; }
+    if (i == 2) { return "SELECT * FROM " + tbl + " WHERE employee_id = 279 AND total_due > 10000 ORDER BY total_due DESC LIMIT 10000"; }
+    if (i == 3) { return "SELECT * FROM " + tbl + " WHERE total_due > 50000 LIMIT 5000"; }
+    if (i == 4) { return "SELECT * FROM " + tbl + " WHERE total_due > 50000 ORDER BY total_due DESC LIMIT 5000"; }
+    if (i == 5) { return "SELECT * FROM " + tbl + " WHERE customer_id = 1045 LIMIT 10000"; }
+    if (i == 6) { return "SELECT * FROM " + tbl + " WHERE employee_id IN (279,281,283) LIMIT 10000"; }
+    if (i == 7) { return "SELECT * FROM " + tbl + " WHERE total_due > 10000 AND total_due < 50000 LIMIT 10000"; }
+    if (i == 8) { return "SELECT COUNT(*) FROM " + tbl + " WHERE employee_id = 279"; }
+    return "SELECT employee_id, AVG(total_due) AS a FROM " + tbl + " GROUP BY employee_id ORDER BY a DESC LIMIT 5";
+}
+
+// Connect to `kind` at `url`, returning the engine-neutral Connection trait
+// (the same shape the pool's `acquire` returns). Branching here keeps each
+// concrete driver local rather than storing a Driver trait object.
+async fn connectFor(kind: string, url: string): db.Connection {
+    if (string.eql(kind, "postgres")) { let d = postgres.PgDriver(); return await d.connect(url); }
+    if (string.eql(kind, "mysql")) { let d = mysql.MyDriver(); return await d.connect(url); }
+    let d = novadb.KyteDriver();
+    return await d.connect(url);
+}
+
+// ---------------------------------------------------------------------------
+// The run (async, on the reactor)
+// ---------------------------------------------------------------------------
+
+fn nowMs(): long { return datetime.nowNs() / 1000000; }
+
+// Load `rows` generated orders into an already-created `orders` table, in
+// batches of `batch` multi-row INSERTs. Returns the load wall time in ms, or -1
+// on the first failing statement (with the error copied into `er.note`).
+async fn loadOrders(conn: db.Connection, kind: string, tbl: string, rows: int, batch: int, seed: int, er: EngineResult): long {
+    let rng = Rand(seed as long);
+    let t0 = nowMs();
+    let done = 0;
+    while (done < rows) {
+        let n = batch;
+        if (done + n > rows) { n = rows - done; }
+        let sb = string_builder.StringBuilder();
+        sb.append("INSERT INTO " + tbl + " (id, order_date, due_date, ship_date, employee_id, customer_id, sub_total, tax_amt, freight, total_due, details) VALUES ");
+        let k = 0;
+        while (k < n) {
+            let id = done + k + 1;
+            let emp = 274 + rng.intn(17);          // 274..290 (includes 279,281,283)
+            let cust = 1000 + rng.intn(200);        // 1000..1199 (includes 1045)
+            let total = rng.intn(100001);           // 0..100000 (whole-number double)
+            let sub = total;
+            let tax = rng.intn(1000);
+            let frt = rng.intn(500);
+            if (k > 0) { sb.append(","); }
+            sb.append("(");
+            sb.append(`${id}`); sb.append(",'2011-05-31','2011-06-12','2011-06-07',");
+            sb.append(`${emp}`); sb.append(",");
+            sb.append(`${cust}`); sb.append(",");
+            sb.append(`${sub}`); sb.append(",");
+            sb.append(`${tax}`); sb.append(",");
+            sb.append(`${frt}`); sb.append(",");
+            sb.append(`${total}`); sb.append(",'{}')");
+            k = k + 1;
+        }
+        let sql = sb.toString();
+        sb.delete();
+        let ex = await conn.exec(sql, db.noParams());
+        if (!ex.ok()) {
+            er.note = "load failed at row " + `${done}` + ": " + ex.err.message;
+            return -1;
+        }
+        done = done + n;
+    }
+    return nowMs() - t0;
+}
+
+// kaidb-only pipelined load: generate the SAME seeded batches as loadOrders, but
+// send them through the driver's `execPipelineLoad` so up to `window` INSERT
+// frames are in flight at once instead of one synchronous round-trip per batch.
+// The server processes them in order (single connection = ordered replies); the
+// win is that the ~per-batch coroutine round-trip park no longer serialises the
+// load, so throughput approaches the server's true insert rate. Data is identical
+// to the sequential path, so the cross-engine row/aggregate cross-check still holds.
+async fn loadOrdersPipelined(kc: novadb.KyteConnection, tbl: string, rows: int, batch: int, seed: int, window: int, er: EngineResult): long {
+    let rng = Rand(seed as long);
+    let t0 = nowMs();
+    let sqls = List<string>();
+    let done = 0;
+    while (done < rows) {
+        let n = batch;
+        if (done + n > rows) { n = rows - done; }
+        let sb = string_builder.StringBuilder();
+        sb.append("INSERT INTO " + tbl + " (id, order_date, due_date, ship_date, employee_id, customer_id, sub_total, tax_amt, freight, total_due, details) VALUES ");
+        let k = 0;
+        while (k < n) {
+            let id = done + k + 1;
+            let emp = 274 + rng.intn(17);
+            let cust = 1000 + rng.intn(200);
+            let total = rng.intn(100001);
+            let sub = total;
+            let tax = rng.intn(1000);
+            let frt = rng.intn(500);
+            if (k > 0) { sb.append(","); }
+            sb.append("(");
+            sb.append(`${id}`); sb.append(",'2011-05-31','2011-06-12','2011-06-07',");
+            sb.append(`${emp}`); sb.append(",");
+            sb.append(`${cust}`); sb.append(",");
+            sb.append(`${sub}`); sb.append(",");
+            sb.append(`${tax}`); sb.append(",");
+            sb.append(`${frt}`); sb.append(",");
+            sb.append(`${total}`); sb.append(",'{}')");
+            k = k + 1;
+        }
+        sqls.push(sb.toString());
+        sb.delete();
+        done = done + n;
+    }
+    let ex = await kc.execPipelineLoad(sqls, window);
+    if (!ex.ok()) {
+        er.note = "pipelined load failed: " + ex.err.message;
+        return -1;
+    }
+    return nowMs() - t0;
+}
+
+// Build the four indexes; returns total build wall time in ms, or -1 on failure.
+async fn buildIndexes(conn: db.Connection, tbl: string, er: EngineResult): long {
+    let idx = indexSqls(tbl);
+    let t0 = nowMs();
+    let i = 0;
+    while (i < idx.size()) {
+        let s = idx.get(i) ?? "";
+        let ex = await conn.exec(s, db.noParams());
+        if (!ex.ok()) {
+            er.note = "index build failed: " + ex.err.message;
+            return -1;
+        }
+        i = i + 1;
+    }
+    return nowMs() - t0;
+}
+
+// The current row count of `tbl`, or -1 if the table does not exist / errors.
+async fn tableCount(conn: db.Connection, tbl: string): int {
+    let rs = await conn.query("SELECT COUNT(*) FROM " + tbl, db.noParams());
+    if (!rs.ok() || rs.rowCount() == 0) { return -1; }
+    let row = rs.rows.get(0) ?? undefined;
+    if (row == undefined) { return -1; }
+    return row.getInt(0);
+}
+
+// Ensure an EMPTY orders table exists and return its name.
+//
+// Postgres/MySQL: DROP the base name and CREATE it fresh; DROP reclaims storage
+// there, so the base name is genuinely clean.
+//
+// kaidb: DROP does not reclaim a table's storage, and neither DROP+CREATE nor
+// DELETE clears the primary-key index (COUNT reads 0 while the PK index still
+// holds the old ids, so a reload collides with KeyAlreadyExists). A COUNT check
+// therefore cannot prove emptiness. The only reliably clean table is one whose
+// NAME was never used, so kaidb always gets a fresh, run-unique name. This does
+// leak the old table in nova.db (that is the DROP-does-not-reclaim bug); restart
+// kaidb with a clean data dir to reclaim. Returns "" if no clean table is made.
+async fn ensureCleanTable(conn: db.Connection, kind: string, base: string, suffix: string, er: EngineResult): string {
+    let tbl = base;
+    if (isKaidb(kind)) {
+        tbl = base + "_" + suffix;
+        console.log("   note: kaidb DROP does not reclaim storage; using fresh table '" + tbl + "'");
+        er.note = "used fresh table '" + tbl + "' (kaidb DROP does not reclaim '" + base + "')";
+    }
+    let _d = await conn.exec("DROP TABLE " + tbl, db.noParams());
+    let cr = await conn.exec(createTableSql(kind, tbl), db.noParams());
+    if (!cr.ok()) {
+        er.note = "create table failed: " + cr.err.message;
+        return "";
+    }
+    // For the SQL engines confirm the reset landed empty; for kaidb a fresh name
+    // is clean by construction (COUNT is not a trustworthy emptiness signal there).
+    if (!isKaidb(kind)) {
+        let c0 = await tableCount(conn, tbl);
+        if (c0 < 0) {
+            er.note = "reset/verify query failed after DROP+CREATE (engine not writable? e.g. a read-only or recovery-mode server)";
+            return "";
+        }
+        if (c0 != 0) {
+            er.note = "table not empty after DROP+CREATE (held " + `${c0}` + " rows)";
+            return "";
+        }
+    }
+    return tbl;
+}
+
+// Run one engine end to end: connect, reset table, load, index, warm+time Q1..Q10.
+async fn runEngine(kind: string, name: string, url: string, base: string, suffix: string, rows: int, batch: int, seed: int): EngineResult {
+    let er = EngineResult(name);
+    let conn = await connectFor(kind, url);
+
+    // Probe: kaidb rejects a bare `SELECT 1` at the parser, so treat a non-08
+    // (non-connection) error as "reachable" for kaidb only.
+    let probe = await conn.query("SELECT 1", db.noParams());
+    if (!probe.ok()) {
+        if (!(isKaidb(kind) && !string.startsWith(probe.err.code, "08"))) {
+            er.note = "connect/probe failed: " + probe.err.message;
+            conn.close();
+            return er;
+        }
+    }
+
+    let tbl = await ensureCleanTable(conn, kind, base, suffix, er);
+    if (string.eql(tbl, "")) { conn.close(); return er; }
+
+    if (isKaidb(kind)) {
+        // Dedicated pipelined connection for the bulk load (load and query need
+        // not share a connection); `window` in-flight batches hide round-trip park.
+        let window = envInt("ORDERS_PIPELINE", 64);
+        let lc = await novadb.connectKaidb(url);
+        er.loadMs = await loadOrdersPipelined(lc, tbl, rows, batch, seed, window, er);
+        lc.close();
+    } else {
+        er.loadMs = await loadOrders(conn, kind, tbl, rows, batch, seed, er);
+    }
+    if (er.loadMs < 0) { conn.close(); return er; }
+
+    // Verify the load actually landed: COUNT(*) must equal the row count we
+    // generated. This catches an engine that accepted the writes but stored
+    // nothing (for example a PostgreSQL standby in read-only recovery mode,
+    // which returns success for a write it silently drops).
+    let stored = await tableCount(conn, tbl);
+    if (stored != rows) {
+        er.note = "load verification failed: expected " + `${rows}` + " rows, table holds " + `${stored}`;
+        conn.close();
+        return er;
+    }
+
+    er.indexMs = await buildIndexes(conn, tbl, er);
+    if (er.indexMs < 0) { conn.close(); return er; }
+
+    er.qs = queryList();
+    let qi = 0;
+    while (qi < er.qs.size()) {
+        let q = er.qs.get(qi) ?? QResult("?");
+        let sql = querySql(qi, tbl);
+        // Warm pass: run once to prime caches, then time the second run.
+        let _warm = await conn.query(sql, db.noParams());
+        let t0 = nowMs();
+        let rs = await conn.query(sql, db.noParams());
+        q.ms = nowMs() - t0;
+        if (!rs.ok()) {
+            q.detail = "ERR: " + rs.err.message;
+        } else {
+            q.rows = rs.rowCount();
+            // Q9 (COUNT) and Q10 (AVG) carry a scalar worth showing.
+            if ((qi == 8 || qi == 9) && rs.rowCount() > 0) {
+                let row = rs.rows.get(0) ?? undefined;
+                if (row != undefined) {
+                    if (qi == 8) { q.detail = "count=" + row.getText(0); }
+                    else { q.detail = "top=" + row.getText(0) + " avg=" + row.getText(1); }
+                }
+            }
+        }
+        qi = qi + 1;
+    }
+
+    er.ok = true;
+    conn.close();
+    return er;
+}
+
+// The whole benchmark on the reactor: iterate the requested engines in order,
+// collecting each EngineResult into `res`. Flips `done` when finished so the
+// driver loop in main can stop pumping the reactor.
+async fn runAll(engines: list.List<string>, urlKaidb: string, urlPg: string, urlMy: string,
+                base: string, suffix: string, rows: int, batch: int, seed: int, res: Results, done: long): void {
+    let i = 0;
+    while (i < engines.size()) {
+        let kind = engines.get(i) ?? "";
+        let url = urlKaidb;
+        let name = "kaidb";
+        if (string.eql(kind, "postgres")) { url = urlPg; name = "PostgreSQL"; }
+        if (string.eql(kind, "mysql")) { url = urlMy; name = "MySQL"; }
+        console.log("== " + name + " ==");
+        let er = await runEngine(kind, name, url, base, suffix, rows, batch, seed);
+        if (er.ok) {
+            console.log("   loaded " + `${rows}` + " rows in " + `${er.loadMs}` + " ms, indexes " + `${er.indexMs}` + " ms");
+        } else {
+            console.log("   skipped: " + er.note);
+        }
+        res.engines.push(er);
+        i = i + 1;
+    }
+    bytes.write_i32(done, 0, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Reporting
+// ---------------------------------------------------------------------------
+
+fn pad(s: string, w: int): string {
+    let out = s;
+    while (out.length < w) { out = out + " "; }
+    return out;
+}
+
+// Render the comparison as a fixed-width text table AND a markdown table.
+fn report(res: Results, rows: int): string {
+    let labels = queryList();
+    let sb = string_builder.StringBuilder();
+    sb.append("# Orders Q1..Q10, kaidb vs PostgreSQL vs MySQL\n\n");
+    sb.append("Rows: " + `${rows}`);
+    sb.append(", warm pass, full client round-trip (all result rows fetched).\n\n");
+
+    // Load / index summary.
+    sb.append("## Load and index build\n\n");
+    sb.append("| Engine | Load (ms) | Index build (ms) | Status |\n");
+    sb.append("|---|--:|--:|---|\n");
+    let e = 0;
+    while (e < res.engines.size()) {
+        let er = res.engines.get(e) ?? EngineResult("?");
+        let status = "ok";
+        if (!er.ok) { status = "SKIPPED: " + er.note; }
+        sb.append("| " + er.name + " | " + `${er.loadMs}` + " | " + `${er.indexMs}` + " | " + status + " |\n");
+        e = e + 1;
+    }
+
+    // Per-query timings, one column per engine that ran.
+    sb.append("\n## Query timings (ms, warm)\n\n");
+    sb.append("| Query |");
+    let h = 0;
+    while (h < res.engines.size()) {
+        let er = res.engines.get(h) ?? EngineResult("?");
+        sb.append(" " + er.name + " |");
+        h = h + 1;
+    }
+    sb.append("\n|---|");
+    let h2 = 0;
+    while (h2 < res.engines.size()) { sb.append("--:|"); h2 = h2 + 1; }
+    sb.append("\n");
+
+    let qi = 0;
+    while (qi < labels.size()) {
+        let lab = labels.get(qi) ?? QResult("?");
+        sb.append("| " + lab.label + " |");
+        let c = 0;
+        while (c < res.engines.size()) {
+            let er = res.engines.get(c) ?? EngineResult("?");
+            let cell = "-";
+            if (er.ok && qi < er.qs.size()) {
+                let q = er.qs.get(qi) ?? QResult("?");
+                if (q.ms < 0) { cell = "-"; }
+                else { cell = `${q.ms}`; }
+            }
+            sb.append(" " + cell + " |");
+            c = c + 1;
+        }
+        sb.append("\n");
+        qi = qi + 1;
+    }
+
+    // Row counts + scalars (a correctness cross-check: identical data should
+    // give identical counts across engines).
+    sb.append("\n## Result rows (correctness cross-check)\n\n");
+    sb.append("| Query |");
+    let h3 = 0;
+    while (h3 < res.engines.size()) {
+        let er = res.engines.get(h3) ?? EngineResult("?");
+        sb.append(" " + er.name + " |");
+        h3 = h3 + 1;
+    }
+    sb.append("\n|---|");
+    let h4 = 0;
+    while (h4 < res.engines.size()) { sb.append("--:|"); h4 = h4 + 1; }
+    sb.append("\n");
+    let ri = 0;
+    while (ri < labels.size()) {
+        let lab = labels.get(ri) ?? QResult("?");
+        sb.append("| " + lab.label + " |");
+        let c2 = 0;
+        while (c2 < res.engines.size()) {
+            let er = res.engines.get(c2) ?? EngineResult("?");
+            let cell = "-";
+            if (er.ok && ri < er.qs.size()) {
+                let q = er.qs.get(ri) ?? QResult("?");
+                cell = `${q.rows}`;
+                if (!string.eql(q.detail, "")) { cell = cell + " (" + q.detail + ")"; }
+            }
+            sb.append(" " + cell + " |");
+            c2 = c2 + 1;
+        }
+        sb.append("\n");
+        ri = ri + 1;
+    }
+
+    let out = sb.toString();
+    sb.delete();
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
+fn main(): int {
+    let rows = envInt("ORDERS_ROWS", 1000000);
+    let batch = envInt("ORDERS_BATCH", 500);
+    let seed = envInt("ORDERS_SEED", 12345);
+    let enginesCsv = envStr("ORDERS_ENGINES", "kaidb,postgres,mysql");
+    let urlKaidb = envStr("KAIDB_URL", "admin:admin@127.0.0.1:3009?db=default&tls=false");
+    let urlPg = envStr("PG_URL", "postgresql://postgres@127.0.0.1:5432/novabench?sslmode=disable");
+    let urlMy = envStr("MYSQL_URL", "mysql://root@127.0.0.1:3306/novabench?sslmode=disable");
+    let outPath = envStr("ORDERS_OUT", "orders_compare_report.md");
+    let base = envStr("ORDERS_TABLE", "orders");
+    // A run-unique suffix used only as a fallback table name when an engine's
+    // DROP does not reclaim storage (kaidb). Derived from the wall clock so
+    // repeated runs do not collide.
+    let suffix = `${datetime.nowNs()}`;
+
+    let engines = string.split(enginesCsv, ",");
+    // Trim whitespace on each engine token.
+    let clean = list.List<string>();
+    let ei = 0;
+    while (ei < engines.size()) {
+        let t = string.trim(engines.get(ei) ?? "");
+        if (!string.eql(t, "")) { clean.push(t); }
+        ei = ei + 1;
+    }
+
+    console.log("orders-compare: rows=" + `${rows}` + " batch=" + `${batch}` + " engines=" + enginesCsv);
+
+    let res = Results();
+    let r = poller.Reactor(64, 8192, 32);
+    poller.setCurrent(r.kq);
+    let done = bytes.alloc(4);
+    bytes.write_i32(done, 0, 0);
+
+    coroStart(runAll(clean, urlKaidb, urlPg, urlMy, base, suffix, rows, batch, seed, res, done));
+
+    let guard = 0;
+    while (bytes.read_i32(done, 0) == 0 && guard < 200000000) {
+        let nev = r.pollComplete(500);
+        poller.batchBegin();
+        let i = 0;
+        while (i < nev) { kyte_reactor_resume(r.completedToken(i)); i = i + 1; }
+        guard = guard + 1;
+    }
+    poller.setCurrent(0);
+    bytes.free(done);
+    r.destroy();
+
+    let text = report(res, rows);
+    console.log("\n" + text);
+
+    // Also write the markdown report to the working directory.
+    let f = file.File.open(outPath, "w");
+    let _w = f.writeString(text);
+    f.close();
+    console.log("wrote " + outPath);
+    return 0;
+}

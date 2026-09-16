@@ -48,6 +48,7 @@ const schema = @import("../schema.zig");
 /// scratch allocator, and the MVCC-aware [`QueryExecutor.writeNewVersion`] used
 /// to persist the computed stats row.
 const QueryExecutor = @import("query_executor.zig").QueryExecutor;
+const query_iter = @import("iterator.zig");
 
 /// The two size figures the cost-based optimiser needs about one table.
 ///
@@ -135,23 +136,23 @@ pub fn analyzeTable(db: *Database, executor: *QueryExecutor, table_name: []const
     const stats_tree = try db.getTableTree("sys.table_stats");
     defer stats_tree.deinit();
 
-    var row_obj = std.json.ObjectMap.empty;
+    var row_obj: std.StringArrayHashMapUnmanaged(query_iter.Cell) = .empty;
     defer row_obj.deinit(executor.allocator);
     defer {
-        if (row_obj.get("row_count")) |v| executor.allocator.free(v.string);
-        if (row_obj.get("page_count")) |v| executor.allocator.free(v.string);
-        if (row_obj.get("table_name")) |v| executor.allocator.free(v.string);
+        if (row_obj.get("row_count")) |v| executor.allocator.free(v.text);
+        if (row_obj.get("page_count")) |v| executor.allocator.free(v.text);
+        if (row_obj.get("table_name")) |v| executor.allocator.free(v.text);
     }
 
     const row_count_str = try std.fmt.allocPrint(executor.allocator, "{d}", .{row_count});
     errdefer executor.allocator.free(row_count_str);
-    try row_obj.put(executor.allocator, "row_count", .{ .string = row_count_str });
+    try row_obj.put(executor.allocator, "row_count", .{ .text = row_count_str });
 
     const page_count_str = try std.fmt.allocPrint(executor.allocator, "{d}", .{page_count});
     errdefer executor.allocator.free(page_count_str);
-    try row_obj.put(executor.allocator, "page_count", .{ .string = page_count_str });
+    try row_obj.put(executor.allocator, "page_count", .{ .text = page_count_str });
 
-    try row_obj.put(executor.allocator, "table_name", .{ .string = try executor.allocator.dupe(u8, table_name) });
+    try row_obj.put(executor.allocator, "table_name", .{ .text = try executor.allocator.dupe(u8, table_name) });
 
     const exists = if (try stats_tree.search(table_name, executor.allocator)) |v| s: {
         executor.allocator.free(v);
