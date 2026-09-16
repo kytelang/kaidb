@@ -1,11 +1,11 @@
-# orders-compare
+# query-perf-compare
 
-The Q1..Q10 "orders" benchmark, run head to head across **kaidb**, **PostgreSQL**
+The Q1..Q18 "orders" query-performance benchmark, run head to head across **kaidb**, **PostgreSQL**
 and **MySQL** from a single Kyte program.
 
 It generates a synthetic orders dataset with a seeded RNG, so every engine loads
 byte-identical rows, then loads it into each engine, builds the same four
-indexes, and runs the same ten queries against each. Because the data and the SQL
+indexes, and runs the same eighteen queries against each. Because the data and the SQL
 are identical, the result row counts match across engines and only the timings
 differ. Each query is run twice and the warm (second) pass is reported as the
 full client round-trip time (server executes plus all result rows returned).
@@ -34,6 +34,18 @@ needs no float formatting.
 | Q8  | `... WHERE total_due > 10000 AND total_due < 50000 LIMIT 10000` |
 | Q9  | `SELECT COUNT(*) ... WHERE employee_id = 279` |
 | Q10 | `SELECT employee_id, AVG(total_due) ... GROUP BY employee_id ORDER BY a DESC LIMIT 5` |
+| Q11 | `... WHERE id = 500000` (primary-key point seek) |
+| Q12 | `... WHERE id >= 200000 AND id <= 210000` (primary-key range scan) |
+| Q13 | `SELECT COUNT(*) FROM orders` (whole-table count) |
+| Q14 | `SELECT MIN(total_due), MAX(total_due) FROM orders` (index endpoints) |
+| Q15 | `SELECT DISTINCT employee_id FROM orders` |
+| Q16 | `SELECT customer_id, COUNT(*) AS c ... GROUP BY customer_id HAVING COUNT(*) > 4900 ORDER BY c DESC LIMIT 10` |
+| Q17 | `... WHERE employee_id = 279 AND total_due >= 20000 AND total_due <= 40000 LIMIT 10000` (composite index) |
+| Q18 | `... WHERE employee_id = 279 ORDER BY total_due LIMIT 100 OFFSET 50000` (deep pagination) |
+
+Q1-Q10 are the original mixed set; Q11-Q18 probe distinct planner paths (primary-key
+access, whole-table aggregates, DISTINCT, high-cardinality grouping, composite index,
+deep OFFSET pagination).
 
 ## Prerequisites
 
@@ -70,11 +82,11 @@ half of every round-trip and the load time.
 ```sh
 export PATH="$HOME/.kyte/bin:$PATH"          # if kyte is not already on PATH
 kyte build --release
-codesign -s - -f build/release/bin/orders-compare   # macOS only
+codesign -s - -f build/release/bin/query-perf-compare   # macOS only
 ```
 
 (For a quick functional check only, a plain `kyte build` produces
-`build/debug/bin/orders-compare`; do not quote debug timings.)
+`build/debug/bin/query-perf-compare`; do not quote debug timings.)
 
 ## Run
 
@@ -88,36 +100,39 @@ Everything is configured by environment variable (all optional):
 | `ORDERS_SEED` | `12345` | RNG seed (same seed gives identical data) |
 | `ORDERS_PIPELINE` | `64` | kaidb only: INSERT batches in flight during load. Set `1` to load kaidb through the same synchronous path as PostgreSQL/MySQL (apples-to-apples load). |
 | `ORDERS_TABLE` | `orders` | base table name |
-| `ORDERS_OUT` | `orders_compare_report.md` | markdown report path |
+| `ORDERS_OUT` | (unset) | if set, also write the markdown report to this file |
 | `KAIDB_URL` | `admin:admin@127.0.0.1:3009?db=default&tls=false` | kaidb DSN |
 | `PG_URL` | `postgresql://postgres@127.0.0.1:5432/bench?sslmode=disable` | PostgreSQL DSN |
 | `MYSQL_URL` | `mysql://root@127.0.0.1:3306/bench?sslmode=disable` | MySQL DSN |
 
 ```sh
-# full run: 1M rows, all three engines, report written to report.md
-ORDERS_ROWS=1000000 ORDERS_ENGINES=kaidb,postgres,mysql \
-  ORDERS_OUT=report.md ./build/release/bin/orders-compare
+# full run: 1M rows, all three engines (report printed to the console)
+ORDERS_ROWS=1000000 ORDERS_ENGINES=kaidb,postgres,mysql ./build/release/bin/query-perf-compare
+
+# capture the report to a file as well
+ORDERS_OUT=report.md ./build/release/bin/query-perf-compare
 
 # quick smoke, kaidb and MySQL only
-ORDERS_ROWS=50000 ORDERS_ENGINES=kaidb,mysql ./build/release/bin/orders-compare
+ORDERS_ROWS=50000 ORDERS_ENGINES=kaidb,mysql ./build/release/bin/query-perf-compare
 ```
 
-The report is printed to the console **and** written to `ORDERS_OUT`. It has three
-tables: load and index-build times, per-query warm timings, and a result-row
-cross-check (identical data must give identical counts across engines, which is
-the benchmark's built-in correctness gate).
+The markdown report is **printed to the console (stdout)** as the primary output, so
+you can read it directly or redirect it (`... > report.md`). It is written to a file
+as well only when `ORDERS_OUT` is set. It has three tables: load and index-build
+times, per-query warm timings, and a result-row cross-check (identical data must give
+identical counts across engines, which is the benchmark's built-in correctness gate).
 
 ### Useful variants
 
 ```sh
 # apples-to-apples load: run kaidb through the SAME synchronous path as PG/MySQL
-ORDERS_ENGINES=kaidb ORDERS_PIPELINE=1 ./build/release/bin/orders-compare
+ORDERS_ENGINES=kaidb ORDERS_PIPELINE=1 ./build/release/bin/query-perf-compare
 
 # turn OFF kaidb server-side result streaming (the old buffer-then-send path)
-NOVADB_NOSTREAM=1 ./build/release/bin/orders-compare
+NOVADB_NOSTREAM=1 ./build/release/bin/query-perf-compare
 
 # per-stage server profiling
-NOVADB_QEXEC=1 NOVADB_QPROF=1 ./build/release/bin/orders-compare
+NOVADB_QEXEC=1 NOVADB_QPROF=1 ./build/release/bin/query-perf-compare
 ```
 
 ### Getting stable numbers

@@ -1,5 +1,5 @@
 {
-  "name": "orders-compare",
+  "name": "query-perf-compare",
   "version": "0.1.0",
   "type": "app",
   "dependencies": []

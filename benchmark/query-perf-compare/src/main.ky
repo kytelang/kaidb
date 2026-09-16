@@ -1,4 +1,4 @@
-// orders-compare: the Q1..Q10 "orders" benchmark, run head to head across
+// query-perf-compare: the Q1..Q10 "orders" benchmark, run head to head across
 // kaidb, PostgreSQL and MySQL from ONE Kyte program.
 //
 // It generates a synthetic orders dataset with a seeded RNG (so every engine
@@ -181,6 +181,14 @@ fn queryList(): list.List<QResult> {
     l.push(QResult("Q8  total_due 10000..50000 LIMIT 10000"));
     l.push(QResult("Q9  COUNT(*) employee_id=279"));
     l.push(QResult("Q10 AVG(total_due) BY employee_id top 5"));
+    l.push(QResult("Q11 PK point id=500000"));
+    l.push(QResult("Q12 PK range id 200000..210000"));
+    l.push(QResult("Q13 COUNT(*) whole table"));
+    l.push(QResult("Q14 MIN/MAX(total_due) whole table"));
+    l.push(QResult("Q15 DISTINCT employee_id"));
+    l.push(QResult("Q16 GROUP BY customer_id HAVING c>4900 top 10"));
+    l.push(QResult("Q17 emp=279 AND total_due 20000..40000 LIMIT 10000"));
+    l.push(QResult("Q18 emp=279 ORDER BY total_due LIMIT 100 OFFSET 50000"));
     return l;
 }
 
@@ -194,7 +202,23 @@ fn querySql(i: int, tbl: string): string {
     if (i == 6) { return "SELECT * FROM " + tbl + " WHERE employee_id IN (279,281,283) LIMIT 10000"; }
     if (i == 7) { return "SELECT * FROM " + tbl + " WHERE total_due > 10000 AND total_due < 50000 LIMIT 10000"; }
     if (i == 8) { return "SELECT COUNT(*) FROM " + tbl + " WHERE employee_id = 279"; }
-    return "SELECT employee_id, AVG(total_due) AS a FROM " + tbl + " GROUP BY employee_id ORDER BY a DESC LIMIT 5";
+    if (i == 9) { return "SELECT employee_id, AVG(total_due) AS a FROM " + tbl + " GROUP BY employee_id ORDER BY a DESC LIMIT 5"; }
+    // Q11: primary-key point seek (clustered index, single row).
+    if (i == 10) { return "SELECT * FROM " + tbl + " WHERE id = 500000"; }
+    // Q12: primary-key range scan (clustered, ~10k contiguous rows).
+    if (i == 11) { return "SELECT * FROM " + tbl + " WHERE id >= 200000 AND id <= 210000"; }
+    // Q13: whole-table COUNT(*) (full aggregate, no filter).
+    if (i == 12) { return "SELECT COUNT(*) FROM " + tbl; }
+    // Q14: MIN/MAX over an indexed column (index-endpoint optimisation).
+    if (i == 13) { return "SELECT MIN(total_due) AS lo, MAX(total_due) AS hi FROM " + tbl; }
+    // Q15: DISTINCT over a low-cardinality indexed column (~17 values).
+    if (i == 14) { return "SELECT DISTINCT employee_id FROM " + tbl; }
+    // Q16: GROUP BY a high-cardinality column with HAVING + top-N.
+    if (i == 15) { return "SELECT customer_id, COUNT(*) AS c FROM " + tbl + " GROUP BY customer_id HAVING COUNT(*) > 4900 ORDER BY c DESC LIMIT 10"; }
+    // Q17: composite-index equality + range (uses the (employee_id,total_due) index).
+    if (i == 16) { return "SELECT * FROM " + tbl + " WHERE employee_id = 279 AND total_due >= 20000 AND total_due <= 40000 LIMIT 10000"; }
+    // Q18: deep OFFSET pagination (cost of skipping 50k rows before returning 100).
+    return "SELECT * FROM " + tbl + " WHERE employee_id = 279 ORDER BY total_due LIMIT 100 OFFSET 50000";
 }
 
 // Connect to `kind` at `url`, returning the engine-neutral Connection trait
@@ -438,12 +462,15 @@ async fn runEngine(kind: string, name: string, url: string, base: string, suffix
             q.detail = "ERR: " + rs.err.message;
         } else {
             q.rows = rs.rowCount();
-            // Q9 (COUNT) and Q10 (AVG) carry a scalar worth showing.
-            if ((qi == 8 || qi == 9) && rs.rowCount() > 0) {
+            // Scalar-returning queries carry a value worth showing in the cross-check:
+            // Q9/Q13 COUNT, Q10 AVG top row, Q14 MIN/MAX.
+            if ((qi == 8 || qi == 9 || qi == 12 || qi == 13) && rs.rowCount() > 0) {
                 let row = rs.rows.get(0) ?? undefined;
                 if (row != undefined) {
                     if (qi == 8) { q.detail = "count=" + row.getText(0); }
-                    else { q.detail = "top=" + row.getText(0) + " avg=" + row.getText(1); }
+                    else if (qi == 9) { q.detail = "top=" + row.getText(0) + " avg=" + row.getText(1); }
+                    else if (qi == 12) { q.detail = "count=" + row.getText(0); }
+                    else { q.detail = "min=" + row.getText(0) + " max=" + row.getText(1); }
                 }
             }
         }
@@ -494,7 +521,7 @@ fn pad(s: string, w: int): string {
 fn report(res: Results, rows: int): string {
     let labels = queryList();
     let sb = string_builder.StringBuilder();
-    sb.append("# Orders Q1..Q10, kaidb vs PostgreSQL vs MySQL\n\n");
+    sb.append("# query-perf-compare: Q1..Q" + `${labels.size()}` + ", kaidb vs PostgreSQL vs MySQL\n\n");
     sb.append("Rows: " + `${rows}`);
     sb.append(", warm pass, full client round-trip (all result rows fetched).\n\n");
 
@@ -596,7 +623,7 @@ fn main(): int {
     let urlKaidb = envStr("KAIDB_URL", "admin:admin@127.0.0.1:3009?db=default&tls=false");
     let urlPg = envStr("PG_URL", "postgresql://postgres@127.0.0.1:5432/bench?sslmode=disable");
     let urlMy = envStr("MYSQL_URL", "mysql://root@127.0.0.1:3306/bench?sslmode=disable");
-    let outPath = envStr("ORDERS_OUT", "orders_compare_report.md");
+    let outPath = envStr("ORDERS_OUT", "");
     let base = envStr("ORDERS_TABLE", "orders");
     // A run-unique suffix used only as a fallback table name when an engine's
     // DROP does not reclaim storage (kaidb). Derived from the wall clock so
@@ -613,7 +640,7 @@ fn main(): int {
         ei = ei + 1;
     }
 
-    console.log("orders-compare: rows=" + `${rows}` + " batch=" + `${batch}` + " engines=" + enginesCsv);
+    console.log("query-perf-compare: rows=" + `${rows}` + " batch=" + `${batch}` + " engines=" + enginesCsv + "\n");
 
     let res = Results();
     let r = poller.Reactor(64, 8192, 32);
@@ -635,13 +662,16 @@ fn main(): int {
     bytes.free(done);
     r.destroy();
 
+    // The report is emitted to the console (stdout) as markdown; redirect or copy
+    // it from there. A file copy is written only when ORDERS_OUT is set.
     let text = report(res, rows);
     console.log("\n" + text);
 
-    // Also write the markdown report to the working directory.
-    let f = file.File.open(outPath, "w");
-    let _w = f.writeString(text);
-    f.close();
-    console.log("wrote " + outPath);
+    if (!string.eql(outPath, "")) {
+        let f = file.File.open(outPath, "w");
+        let _w = f.writeString(text);
+        f.close();
+        console.log("wrote " + outPath);
+    }
     return 0;
 }
