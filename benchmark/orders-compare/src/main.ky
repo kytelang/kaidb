@@ -395,10 +395,16 @@ async fn runEngine(kind: string, name: string, url: string, base: string, suffix
     if (isKaidb(kind)) {
         // Dedicated pipelined connection for the bulk load (load and query need
         // not share a connection); `window` in-flight batches hide round-trip park.
+        // ORDERS_PIPELINE<=1 routes kaidb through the SAME synchronous loadOrders
+        // path as PostgreSQL/MySQL, for an apples-to-apples load number.
         let window = envInt("ORDERS_PIPELINE", 64);
-        let lc = await kaidb.connectKaidb(url);
-        er.loadMs = await loadOrdersPipelined(lc, tbl, rows, batch, seed, window, er);
-        lc.close();
+        if (window <= 1) {
+            er.loadMs = await loadOrders(conn, kind, tbl, rows, batch, seed, er);
+        } else {
+            let lc = await kaidb.connectKaidb(url);
+            er.loadMs = await loadOrdersPipelined(lc, tbl, rows, batch, seed, window, er);
+            lc.close();
+        }
     } else {
         er.loadMs = await loadOrders(conn, kind, tbl, rows, batch, seed, er);
     }
