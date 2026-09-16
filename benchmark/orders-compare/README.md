@@ -55,6 +55,7 @@ Everything is configured by environment variable (all optional):
 | `ORDERS_ENGINES` | `kaidb,postgres,mysql` | comma list of engines to run, in order |
 | `ORDERS_BATCH` | `500` | rows per multi-row INSERT |
 | `ORDERS_SEED` | `12345` | RNG seed (same seed gives identical data) |
+| `ORDERS_PIPELINE` | `64` | kaidb only: INSERT batches in flight during load. Set `1` to load kaidb through the same synchronous path as PostgreSQL/MySQL (apples-to-apples load). |
 | `ORDERS_TABLE` | `orders` | base table name |
 | `ORDERS_OUT` | `orders_compare_report.md` | markdown report path |
 | `KAIDB_URL` | `admin:admin@127.0.0.1:3009?db=default&tls=false` | kaidb DSN |
