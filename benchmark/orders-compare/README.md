@@ -35,12 +35,36 @@ needs no float formatting.
 | Q9  | `SELECT COUNT(*) ... WHERE employee_id = 279` |
 | Q10 | `SELECT employee_id, AVG(total_due) ... GROUP BY employee_id ORDER BY a DESC LIMIT 5` |
 
+## Prerequisites
+
+All three servers must be running and writable, on the ports in the DSN defaults
+below. The harness only touches the `orders` table in the DB named in each URL, so
+point the SQL engines at a throwaway database.
+
+| Engine | Start | Port | Database |
+|---|---|---|---|
+| kaidb | run the `btree` server (streaming is on by default) | `3009` | `db=default` |
+| PostgreSQL | `brew services start postgresql@18` | `5432` | `novabench` |
+| MySQL | `brew services start mysql` | `3306` | `novabench` |
+
+Create the throwaway databases once (safe to re-run):
+
+```sh
+/opt/homebrew/opt/postgresql@18/bin/createdb -p 5432 novabench 2>/dev/null || true
+mysql -uroot -e "CREATE DATABASE IF NOT EXISTS novabench;"
+```
+
+If a server is down or read-only (for example a PostgreSQL cluster stuck in
+recovery mode), that engine is reported as skipped by the post-load row-count
+check rather than producing bogus zero-millisecond "wins".
+
 ## Build
 
 The three driver packages are symlinked under `packages/` (kyte-postgres,
 kyte-mysql, kyte-kaidb). From this directory:
 
 ```sh
+export PATH="$HOME/.kyte/bin:$PATH"          # if kyte is not already on PATH
 kyte build
 codesign -s - -f build/debug/bin/orders-compare   # macOS only
 ```
@@ -63,17 +87,40 @@ Everything is configured by environment variable (all optional):
 | `MYSQL_URL` | `mysql://root@127.0.0.1:3306/novabench?sslmode=disable` | MySQL DSN |
 
 ```sh
-# full default run (1M rows, all three engines)
-./build/debug/bin/orders-compare
+# full run: 1M rows, all three engines, report written to report.md
+ORDERS_ROWS=1000000 ORDERS_ENGINES=kaidb,postgres,mysql \
+  ORDERS_OUT=report.md ./build/debug/bin/orders-compare
 
 # quick smoke, kaidb and MySQL only
 ORDERS_ROWS=50000 ORDERS_ENGINES=kaidb,mysql ./build/debug/bin/orders-compare
 ```
 
-The report is printed to the console and written to `ORDERS_OUT`. It has three
+The report is printed to the console **and** written to `ORDERS_OUT`. It has three
 tables: load and index-build times, per-query warm timings, and a result-row
 cross-check (identical data must give identical counts across engines, which is
 the benchmark's built-in correctness gate).
+
+### Useful variants
+
+```sh
+# apples-to-apples load: run kaidb through the SAME synchronous path as PG/MySQL
+ORDERS_ENGINES=kaidb ORDERS_PIPELINE=1 ./build/debug/bin/orders-compare
+
+# turn OFF kaidb server-side result streaming (the old buffer-then-send path)
+NOVADB_NOSTREAM=1 ./build/debug/bin/orders-compare
+
+# per-stage server profiling
+NOVADB_QEXEC=1 NOVADB_QPROF=1 ./build/debug/bin/orders-compare
+```
+
+### Getting stable numbers
+
+A single run has outliers: a background flush / checkpoint / vacuum tick can spike
+any one query on any engine. **Run it three times and take the per-query median**;
+that is how the numbers in `comparison.md` were produced. Do not trust a lone spike
+(for example a one-off Q2 at 102 ms that settles to ~17 ms on a re-run).
+
+The full, analysed 1M results and the "why" behind them live in `comparison.md`.
 
 ## Safety
 
