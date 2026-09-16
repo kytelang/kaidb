@@ -63,11 +63,18 @@ check rather than producing bogus zero-millisecond "wins".
 The three driver packages are symlinked under `packages/` (kyte-postgres,
 kyte-mysql, kyte-kaidb). From this directory:
 
+Always build `--release` for benchmarking. The default (debug) build leaves the
+client-side driver decode and row generation unoptimised, which inflates the client
+half of every round-trip and the load time.
+
 ```sh
 export PATH="$HOME/.kyte/bin:$PATH"          # if kyte is not already on PATH
-kyte build
-codesign -s - -f build/debug/bin/orders-compare   # macOS only
+kyte build --release
+codesign -s - -f build/release/bin/orders-compare   # macOS only
 ```
+
+(For a quick functional check only, a plain `kyte build` produces
+`build/debug/bin/orders-compare`; do not quote debug timings.)
 
 ## Run
 
@@ -89,10 +96,10 @@ Everything is configured by environment variable (all optional):
 ```sh
 # full run: 1M rows, all three engines, report written to report.md
 ORDERS_ROWS=1000000 ORDERS_ENGINES=kaidb,postgres,mysql \
-  ORDERS_OUT=report.md ./build/debug/bin/orders-compare
+  ORDERS_OUT=report.md ./build/release/bin/orders-compare
 
 # quick smoke, kaidb and MySQL only
-ORDERS_ROWS=50000 ORDERS_ENGINES=kaidb,mysql ./build/debug/bin/orders-compare
+ORDERS_ROWS=50000 ORDERS_ENGINES=kaidb,mysql ./build/release/bin/orders-compare
 ```
 
 The report is printed to the console **and** written to `ORDERS_OUT`. It has three
@@ -104,13 +111,13 @@ the benchmark's built-in correctness gate).
 
 ```sh
 # apples-to-apples load: run kaidb through the SAME synchronous path as PG/MySQL
-ORDERS_ENGINES=kaidb ORDERS_PIPELINE=1 ./build/debug/bin/orders-compare
+ORDERS_ENGINES=kaidb ORDERS_PIPELINE=1 ./build/release/bin/orders-compare
 
 # turn OFF kaidb server-side result streaming (the old buffer-then-send path)
-NOVADB_NOSTREAM=1 ./build/debug/bin/orders-compare
+NOVADB_NOSTREAM=1 ./build/release/bin/orders-compare
 
 # per-stage server profiling
-NOVADB_QEXEC=1 NOVADB_QPROF=1 ./build/debug/bin/orders-compare
+NOVADB_QEXEC=1 NOVADB_QPROF=1 ./build/release/bin/orders-compare
 ```
 
 ### Getting stable numbers
