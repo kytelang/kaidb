@@ -78,12 +78,19 @@ grouping, composite index, deep pagination).
 | Q17 `emp = 279 AND total_due 20000..40000 LIMIT 10000` | 40 | **12** | 27 | PostgreSQL |
 | Q18 `emp = 279 ORDER BY total_due LIMIT 100 OFFSET 50000` | 213 | **34** | 81 | PostgreSQL |
 
-> **Improvement in progress (branch `perf/q12-pk-range-scan`, commit `98d81c6`):**
-> Q12 is now a bounded clustered scan instead of a full-table scan, taking it from
-> **~228 ms to ~10 ms** (3-run stable, row count unchanged at 10001, matching
-> PostgreSQL). The baseline table above is the shipped engine; this note records the
-> branch result until it is merged and the whole set is re-measured. See
-> `q11-18-perf-improve.md` for the remaining fixes (Q16/Q17/Q18 and the range family).
+> **Improvements in progress (branch `perf/q12-pk-range-scan`).** The baseline table
+> above is the shipped engine; these are measured on the branch (3-run stable,
+> `--release`, row counts unchanged) until it merges and the whole set is re-run:
+> - **Q12 clustered PK range: ~228 -> ~10 ms** (`98d81c6`) - bounded seek+stop scan
+>   instead of a full-table scan; now matches PostgreSQL.
+> - **Q16 GROUP BY + HAVING: ~262 -> ~12 ms** (`8e44c82`) - HAVING no longer forces
+>   the hash path off the index-only aggregate; now ahead of PostgreSQL (~45).
+> - **Q4/Q8/Q17/Q1 base-row fetch: modest** (`304b35f`, Q4 15->13, Q8 31->28,
+>   Q17 39->32) - PK-sorted batches + default leaf-reuse cursor; small because the
+>   descent is not the dominant cost here.
+>
+> Still open (see `q11-18-perf-improve.md`): Q18 deep OFFSET and per-row allocation
+> reuse.
 
 Across all 18, on an optimised (`--release`) client:
 

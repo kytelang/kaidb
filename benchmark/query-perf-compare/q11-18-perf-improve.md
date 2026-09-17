@@ -30,16 +30,32 @@ Real targets: **Q12** (clustered PK range), the range-scan family **Q4/Q5/Q8/Q17
 
 ---
 
-## STATUS
+## STATUS (branch `perf/q12-pk-range-scan`)
 
-- **Fix 1 (Q12 clustered PK range): DONE** on branch `perf/q12-pk-range-scan`
-  (commit `98d81c6`). Q12 **228 ms -> 10 ms** (matches PostgreSQL), 3-run stable,
-  row count unchanged at 10001, all other query row counts unchanged, engine tests
-  119/120 (pre-existing mutual-TLS failure). See the fix below for what shipped.
-  Gotcha noted for the next session: build the server `zig build -Doptimize=ReleaseFast`
-  (plain `zig build` is Debug = ~100x slower, load looks like it hangs), and start it
-  on a fresh data dir (the leaked-table bloat makes `nova.db` balloon to GBs).
-- Fixes 2-5: not started.
+- **Fix 1 (Q12 clustered PK range): DONE** (commit `98d81c6`). Q12 **228 -> 10 ms**
+  (matches PostgreSQL), row count unchanged at 10001.
+- **Fix 3 (Q16 GROUP BY + HAVING): DONE** (commit `8e44c82`). Q16 **262 -> 12 ms**
+  (now ahead of PostgreSQL ~45), row count unchanged at 10.
+- **Fix 2 (secondary/equality base-row fetch): DONE, MODEST** (commit `304b35f`).
+  PK-sorted range batches + leaf-reuse cursor by default. Q4 15->13, Q8 31->28,
+  Q17 39->32, Q1 15->13. Honest: small gains - the base-fetch descent is not the
+  dominant cost at these selectivities (decode/materialisation is); correct and
+  never a regression, but not a big mover.
+- **Fix 4 (Q18 deep OFFSET): NOT DONE.** A real win requires skipping the offset
+  rows BEFORE base-fetch + row materialisation (the dominant cost): teach the
+  composite ordered scan to count-skip from index entries using the single-txn
+  all-committed visibility fast path, then materialise only the LIMIT window. This
+  is deeper iterator surgery than Fixes 1-3, so it is left as the next real task
+  rather than half-done. A shallow version (stream-and-free the skipped rows in the
+  executor loop instead of buffering all + sorting) would avoid the buffer/sort but
+  still pay ~50k base fetches, so it is not worth it on its own.
+- **Fix 5 (per-row allocation reuse): NOT DONE** (broad, riskier; do last).
+
+All done fixes: 3-run stable, engine tests 119/120 (pre-existing mutual-TLS
+replication failure). GOTCHA (cost ~1h once): build the server
+`zig build -Doptimize=ReleaseFast` (plain `zig build` is Debug ~100x slower, a 1M
+load then looks like a hang), and start it on a FRESH `data/` dir (leaked-table
+bloat balloons `nova.db` to GBs). The `kaidb-cli` REPL infinite-loops on piped EOF.
 
 ## Fix 1 (highest impact, ~20x): Q12 clustered PK range = full scan -> seek + stop  [DONE]
 
