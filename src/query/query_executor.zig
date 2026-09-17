@@ -2145,10 +2145,23 @@ pub const QueryExecutor = struct {
     /// transaction. Returns null (fall back to the hash GROUP BY) otherwise, or
     /// on any unsupported projection / type shape.
     fn tryIndexGroupAgg(self: *QueryExecutor, sel: ast.SelectStmt) !?QueryResponse {
-        if (sel.joins.len != 0 or sel.where_expr != null or sel.having_expr != null) return null;
+        if (sel.joins.len != 0 or sel.where_expr != null) return null;
         const gb = sel.group_by orelse return null;
         if (gb.len != 1 or sel.projections.len == 0) return null;
         if (self.db.txn_manager.activeTxnCount(self.db.pool.pager.io) != 1) return null;
+
+        // HAVING is allowed on this fast path only when every aggregate it
+        // references is already one of the SELECT projections (so it can be read
+        // from the group's `accs` with no extra accumulators). If HAVING needs a
+        // HAVING-only aggregate, we would have to fold it from the index too;
+        // rather than wire that here, fall back to the hash GROUP BY, which
+        // already handles it. `collectHavingAggs` returns exactly those extras.
+        if (sel.having_expr) |he| {
+            var hv_probe = std.ArrayList(ast.AggregateCall).empty;
+            defer hv_probe.deinit(self.allocator);
+            try collectHavingAggs(sel, he, &hv_probe, self.allocator);
+            if (hv_probe.items.len != 0) return null;
+        }
 
         const gcol = gb[0];
 
@@ -2295,6 +2308,17 @@ pub const QueryExecutor = struct {
                         try self.allocator.dupe(u8, "NULL"),
                     else => try self.allocator.dupe(u8, ""),
                 };
+            }
+            // HAVING: drop groups that fail the predicate. Every aggregate it can
+            // reference is a projection aggregate (guarded above), so the empty
+            // `hv` specs suffice; `col_vals = cells` lets it read the group column.
+            if (sel.having_expr) |he| {
+                const grp = GroupAcc{ .col_vals = cells, .aggs = g.accs, .hv = &.{} };
+                if (!evalHaving(sel, grp, &.{}, he)) {
+                    for (cells) |c| self.allocator.free(c);
+                    self.allocator.free(cells);
+                    continue;
+                }
             }
             try rows.append(self.allocator, cells);
         }
