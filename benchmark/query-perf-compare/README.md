@@ -153,13 +153,15 @@ An engine that cannot actually store the data (for example a PostgreSQL server
 in read-only recovery mode) is detected by the post-load row-count check and
 reported as skipped rather than producing bogus zero-millisecond "wins".
 
-## kaidb note (engine bug worked around here)
+## Table reuse across runs
 
-On kaidb, `DROP TABLE` does not reclaim the table's storage, and neither
-`DROP`+`CREATE` of the same name nor `DELETE FROM` clears the table's
-primary-key index. A reload of the same ids therefore fails with
-`KeyAlreadyExists` even though `COUNT(*)` reads zero. To stay re-runnable, the
-harness gives kaidb a fresh, run-unique table name (`orders_<timestamp>`) each
-run. That leaks the previous table inside `nova.db`; restart kaidb with a clean
-data directory to reclaim the space. PostgreSQL and MySQL reclaim on `DROP`, so
-they reuse the base name.
+All three engines reset the SAME table name (`orders`) with `DROP`+`CREATE` each
+run. On kaidb, `DROP TABLE` now cascades to the table's secondary indexes and frees
+every base + index tree page back to the pager's free list, so a same-name recreate
+is genuinely empty and the reclaimed pages are reused by the next load. As a result
+`nova.db` stays flat across repeated runs (it held at ~412 MB over three 1M runs) and
+kaidb does **not** need a fresh data directory or a server restart between runs.
+
+(Historically kaidb `DROP` stranded the whole tree, so the harness used a run-unique
+name and you had to restart on a clean data dir; that is fixed as of the
+`DROP reclaims tree pages` change.)

@@ -49,9 +49,10 @@ Read this honestly, both ways:
   pipelining, not the *kaidb server* out-inserting InnoDB. PostgreSQL's wire protocol
   supports pipelining too; this harness simply does not use it for PG/MySQL.
 
-kaidb's load figure drifts up across repeated runs in the same server process (each
-run's `DROP` does not reclaim space, so `nova.db` bloats); a fresh server loads at
-the low end. These runs were on a freshly started server.
+kaidb's load figure is now stable across repeated runs in one server process: its
+`DROP` reclaims the table's pages (base + indexes) back to the pager free list, so
+`nova.db` stays flat (~412 MB over three 1M runs) instead of growing ~1 GB per run.
+No fresh data directory or restart is needed between runs.
 
 ## Query latency (ms, warm, full client round-trip, all rows fetched)
 
