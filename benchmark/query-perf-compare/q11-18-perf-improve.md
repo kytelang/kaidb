@@ -41,14 +41,15 @@ Real targets: **Q12** (clustered PK range), the range-scan family **Q4/Q5/Q8/Q17
   Q17 39->32, Q1 15->13. Honest: small gains - the base-fetch descent is not the
   dominant cost at these selectivities (decode/materialisation is); correct and
   never a regression, but not a big mover.
-- **Fix 4 (Q18 deep OFFSET): NOT DONE.** A real win requires skipping the offset
-  rows BEFORE base-fetch + row materialisation (the dominant cost): teach the
-  composite ordered scan to count-skip from index entries using the single-txn
-  all-committed visibility fast path, then materialise only the LIMIT window. This
-  is deeper iterator surgery than Fixes 1-3, so it is left as the next real task
-  rather than half-done. A shallow version (stream-and-free the skipped rows in the
-  executor loop instead of buffering all + sorting) would avoid the buffer/sort but
-  still pay ~50k base fetches, so it is not worth it on its own.
+- **Fix 4 (Q18 deep OFFSET): DONE** (commit `52e0b39`). Q18 **185 -> 1 ms** fetch-free
+  (beats PostgreSQL ~41), row count unchanged at 100. The offset is pushed into the
+  composite ordered index scan (`skip_remaining`); the executor then treats it as
+  consumed (`scan_offset_pushed`: streams + breaks at LIMIT, no re-skip). Two skip
+  tiers: fetch-free (advance the index cursor alone) when a single txn is in flight
+  and the key range fully captures the WHERE (`whereCapturedByCompositeKey`);
+  otherwise `rowQualifies` verifies each skipped row (visibility + residual) but skips
+  the row build (~106 ms tier). Only the composite ORDER-BY-second scan is wired;
+  single-column ordered range scans still buffer-and-discard (follow-up).
 - **Fix 5 (per-row allocation reuse): NOT DONE** (broad, riskier; do last).
 
 All done fixes: 3-run stable, engine tests 119/120 (pre-existing mutual-TLS

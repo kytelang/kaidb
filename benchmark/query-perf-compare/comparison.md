@@ -17,7 +17,8 @@ three engines show occasional single-query spikes (a background flush / checkpoi
 
 kaidb here includes the query-perf branch `perf/q12-pk-range-scan` (Q12 bounded
 clustered range scan, Q16 HAVING on the index-only aggregate, PK-sorted base-row
-fetch); see `q11-18-perf-improve.md` for the fix log and what is still open.
+fetch, Q18 offset pushed into the ordered index scan); see `q11-18-perf-improve.md`
+for the fix log and what is still open.
 
 ## Load + index build
 
@@ -32,10 +33,10 @@ path* as the SQL engines (`ORDERS_PIPELINE=1`).
 
 | Engine | 1M load | throughput | index build | dispatch |
 |---|--:|--:|--:|:--|
-| **kaidb (pipelined, default)** | **~5.9 s** | ~169k rows/s | ~5.1 s | 64 batches in flight |
+| **kaidb (pipelined, default)** | **~6.4 s** | ~155k rows/s | ~5.0 s | 64 batches in flight |
 | kaidb (synchronous, same path) | ~57 s | ~18k rows/s | ~5.1 s | one batch at a time |
-| PostgreSQL | ~13.8 s | ~72k rows/s | ~1.3 s | one batch at a time |
-| MySQL (InnoDB) | ~15.5 s | ~65k rows/s | ~3.0 s | one batch at a time |
+| PostgreSQL | ~12.9 s | ~78k rows/s | ~1.4 s | one batch at a time |
+| MySQL (InnoDB) | ~13.4 s | ~75k rows/s | ~3.3 s | one batch at a time |
 
 Read this honestly, both ways:
 
@@ -43,8 +44,8 @@ Read this honestly, both ways:
   PostgreSQL and MySQL. Per batch, kaidb pays a full round-trip and commit that the
   SQL engines absorb more cheaply, so on an equal synchronous footing it loses badly.
 - **As the driver actually ships (pipelined):** overlapping 64 batches hides that
-  per-batch park and takes kaidb to ~5.9 s, the fastest of the four and ~2.3x
-  PostgreSQL / ~2.6x MySQL. This is a real, usable win, but it is the *kaidb driver*
+  per-batch park and takes kaidb to ~6.4 s, the fastest of the four and ~2x
+  PostgreSQL / MySQL. This is a real, usable win, but it is the *kaidb driver*
   pipelining, not the *kaidb server* out-inserting InnoDB. PostgreSQL's wire protocol
   supports pipelining too; this harness simply does not use it for PG/MySQL.
 
@@ -60,42 +61,43 @@ deep pagination).
 
 | Query | kaidb | PostgreSQL | MySQL | fastest |
 |---|--:|--:|--:|:--|
-| Q1  `emp = 279 LIMIT 10000` | 16 | **15** | 17 | PostgreSQL |
-| Q2  `emp = 279 AND total_due > 10000 LIMIT 10000` | 14 | **13** | 18 | PostgreSQL |
-| Q3  Q2 `ORDER BY total_due DESC` | 29 | 30 | **24** | MySQL |
-| Q4  `total_due > 50000 LIMIT 5000` | 14 | **5** | 12 | PostgreSQL |
-| Q5  Q4 `ORDER BY total_due DESC` | 17 | **5** | 12 | PostgreSQL |
-| Q6  `customer_id = 1045 LIMIT 10000` | 9 | **6** | 11 | PostgreSQL |
-| Q7  `emp IN (279,281,283) LIMIT 10000` | 19 | **15** | 17 | PostgreSQL |
-| Q8  `total_due 10000..50000 LIMIT 10000` | 28 | **23** | 26 | PostgreSQL |
-| Q9  `COUNT(*) WHERE emp = 279` | **~0** | 14 | 5 | kaidb |
-| Q10 `AVG(total_due) GROUP BY emp ORDER BY a DESC LIMIT 5` | **30** | 51 | 129 | kaidb |
+| Q1  `emp = 279 LIMIT 10000` | 13 | 16 | 19 | ~tie (kaidb/PG) |
+| Q2  `emp = 279 AND total_due > 10000 LIMIT 10000` | 14 | 15 | 20 | ~tie (kaidb/PG) |
+| Q3  Q2 `ORDER BY total_due DESC` | 32 | 34 | 32 | ~tie (kaidb/MySQL) |
+| Q4  `total_due > 50000 LIMIT 5000` | 16 | **5** | 15 | PostgreSQL |
+| Q5  Q4 `ORDER BY total_due DESC` | 16 | **5** | 16 | PostgreSQL |
+| Q6  `customer_id = 1045 LIMIT 10000` | 9 | **5** | 13 | PostgreSQL |
+| Q7  `emp IN (279,281,283) LIMIT 10000` | 15 | 15 | 20 | ~tie (kaidb/PG) |
+| Q8  `total_due 10000..50000 LIMIT 10000` | 40 | **24** | 27 | PostgreSQL |
+| Q9  `COUNT(*) WHERE emp = 279` | **1** | 13 | 6 | kaidb |
+| Q10 `AVG(total_due) GROUP BY emp ORDER BY a DESC LIMIT 5` | **32** | 56 | 130 | kaidb |
 | Q11 PK point `id = 500000` | **~0** | **~0** | **~0** | tie |
-| Q12 PK range `id 200000..210000` (10k rows) | **10** | **10** | 18 | kaidb / PG tie |
-| Q13 `COUNT(*)` whole table | **4** | 18 | 71 | kaidb |
+| Q12 PK range `id 200000..210000` (10k rows) | **10** | **10** | 17 | kaidb / PG tie |
+| Q13 `COUNT(*)` whole table | **5** | 16 | 76 | kaidb |
 | Q14 `MIN/MAX(total_due)` whole table | **~0** | **~0** | **~0** | tie |
 | Q15 `DISTINCT employee_id` | **~0** | 41 | **~0** | kaidb / MySQL tie |
-| Q16 `GROUP BY customer_id HAVING count > 4900` top 10 | **12** | 44 | 103 | kaidb |
-| Q17 `emp = 279 AND total_due 20000..40000 LIMIT 10000` | 35 | **12** | 23 | PostgreSQL |
-| Q18 `emp = 279 ORDER BY total_due LIMIT 100 OFFSET 50000` | 185 | **33** | 98 | PostgreSQL |
+| Q16 `GROUP BY customer_id HAVING count > 4900` top 10 | **20** | 46 | 120 | kaidb |
+| Q17 `emp = 279 AND total_due 20000..40000 LIMIT 10000` | 39 | **13** | 23 | PostgreSQL |
+| Q18 `emp = 279 ORDER BY total_due LIMIT 100 OFFSET 50000` | **1** | 41 | 96 | kaidb |
 
 Across all 18, on an optimised (`--release`) client:
 
-- **PostgreSQL is fastest on 9** (Q1, Q2, Q4, Q5, Q6, Q7, Q8, Q17, Q18) and tied first
-  on Q11/Q14. Its heap + B-tree path from a warm cache is the tightest of the three on
-  the range, point-in-list and pagination shapes.
-- **kaidb is fastest on 4** (Q9 filtered count; Q10 grouped aggregate; Q13 whole-table
-  count; Q16 grouped aggregate with HAVING) and tied first on **4** (Q11 PK point, Q12
-  PK range, Q14 MIN/MAX, Q15 DISTINCT). It also wins the load. Its strengths are
-  aggregates, counts, DISTINCT and primary-key access.
-- **MySQL is fastest on 1** (Q3, `ORDER BY ... DESC` via its backward index scan) and
-  is otherwise mid-pack or last, badly so on the grouped aggregate (Q10) and the
-  whole-table count (Q13).
+- **kaidb is fastest or tied on ~13.** Clear wins: the aggregates / counts (Q9, Q10,
+  Q13, Q16), DISTINCT (Q15), the deep OFFSET (Q18, now ~1 ms after pushing the offset
+  into the index scan), and the load. Tied first: the indexed point / `IN` lookups
+  (Q1, Q2, Q7) and the PK/endpoint queries (Q11, Q12, Q14). Q3 is a three-way ~tie.
+- **PostgreSQL is fastest on the range scans** (Q4, Q5, Q6, Q8, Q17) at ~5-24 ms, where
+  its warm heap + B-tree path is tighter than kaidb's; and it is level with kaidb on the
+  point lookups.
+- **MySQL is not clearly fastest on anything** here (it ties Q3) and trails badly on the
+  grouped aggregates (Q10, Q16) and the whole-table count (Q13).
 
-So kaidb does **not** broadly beat PostgreSQL on this workload: PG leads the
-range/point-in-list/pagination queries. kaidb owns the aggregate/count/DISTINCT
-family and the load, and after the branch fixes it is now level with PG on the
-clustered PK range (Q12) and ahead on grouped-aggregate-with-HAVING (Q16).
+The indexed point / `IN` lookups (Q1, Q2, Q7) are close enough that they swap leader
+run-to-run between kaidb and PostgreSQL (single-digit-ms differences within the flush /
+checkpoint noise), so read them as ties rather than a win either way. The stable,
+structural results are: kaidb wins the aggregate / count / DISTINCT family, the
+index-only and PK queries, the deep OFFSET and the load; PostgreSQL wins the
+medium-selectivity range scans (Q4/Q5/Q6/Q8/Q17).
 
 ## Where kaidb wins
 
@@ -107,17 +109,17 @@ clustered PK range (Q12) and ahead on grouped-aggregate-with-HAVING (Q16).
   instant for all three; Q12 (10k-row clustered range) now ties PostgreSQL at ~10 ms
   after the bounded seek+stop scan (it was ~228 ms as a full-table scan).
 - **DISTINCT.** Q15 is ~0 ms (loose index scan), beating PostgreSQL's ~41 ms.
+- **Deep pagination (Q18, OFFSET 50000): ~1 ms vs PG ~41 ms** - the offset is pushed
+  into the ordered index scan and counted past from the index alone (no base-row
+  fetch, no materialisation), then only the LIMIT window is built. It was ~185 ms when
+  it fetched and discarded every skipped row.
 
 ## Where kaidb still loses
 
-- **Deep pagination (Q18, OFFSET 50000): ~185 ms vs PG ~33 ms** - kaidb fetches and
-  materialises every skipped row before discarding it. The largest remaining gap; the
-  fix is to count-skip the offset from the index before base-row fetch (see
-  `q11-18-perf-improve.md`, Fix 4, not yet done).
-- **Medium range / point-in-list scans (Q4/Q5/Q7/Q8/Q17): ~14-35 ms vs PG ~5-23 ms.**
-  PostgreSQL's warm heap + B-tree path is simply tighter. The PK-sorted base-row
-  fetch trimmed these only modestly (the per-row descent was not the dominant cost;
-  decode/materialisation is).
+- **Medium range scans (Q4/Q5/Q8/Q17): ~16-40 ms vs PG ~5-24 ms.** PostgreSQL's warm
+  heap + B-tree path is simply tighter. The PK-sorted base-row fetch trimmed these only
+  modestly (the per-row descent was not the dominant cost; decode/materialisation is).
+  This is the clearest remaining gap.
 - **`ORDER BY ... DESC` (Q3, Q5):** kaidb scans ascending then reverses (so it cannot
   stream), whereas MySQL/PG walk the index backwards. A backward index scan would
   help here and let these stream.
