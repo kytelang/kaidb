@@ -117,6 +117,7 @@ const VERSION = page_mod.VERSION;
 const PagePool = @import("../storage/pool.zig").PagePool;
 /// The slotted-page B+Tree; every table, index and catalog table is one.
 const BPlusTree = @import("../storage/btree.zig").BPlusTree;
+const overflow = @import("../storage/overflow.zig");
 /// Reader/writer lock; the database-wide gate for vacuum and checkpoint.
 const RwLock = @import("utils").sync.RwLock;
 /// The per-table access lock (readers / writers / exclusive) from `utils.sync`.
@@ -3827,8 +3828,94 @@ pub const Database = struct {
     /// removes the table from the in-memory catalog. The underlying data pages are
     /// not explicitly reclaimed here beyond dropping the root reference.
     /// [`error.TableNotFound`] if the table is unknown.
+    /// Frees every page of the B+Tree rooted at `root_id` back to the pager's
+    /// free list, so a DROP actually reclaims the space instead of stranding the
+    /// whole tree (the file then stops growing across drop/recreate churn).
+    ///
+    /// Walks the tree with an explicit stack: an internal node queues its
+    /// `leftmost_child_id` plus the child id in every separator cell; a leaf frees
+    /// each overflow-flagged cell's chain. Child ids and overflow heads are copied
+    /// out while the page is pinned, then the page is unpinned and discarded
+    /// (`discardPage` requires no outstanding pin). A zero root is a no-op. This
+    /// is NOT WAL-logged: a crash mid-drop can leak the not-yet-freed pages (the
+    /// pager persists its free list only at a checkpoint), which degrades to
+    /// wasted space, never corruption. Undo pages of prior row versions, if any,
+    /// are not reached here and remain a separate reclamation concern.
+    fn freeTreePages(self: *Database, root_id: PageId) !void {
+        if (root_id == 0) return;
+        var stack = std.ArrayList(PageId).empty;
+        defer stack.deinit(self.allocator);
+        var children = std.ArrayList(PageId).empty;
+        defer children.deinit(self.allocator);
+        var ovf = std.ArrayList(PageId).empty;
+        defer ovf.deinit(self.allocator);
+        try stack.append(self.allocator, root_id);
+        while (stack.pop()) |pid| {
+            children.clearRetainingCapacity();
+            ovf.clearRetainingCapacity();
+            // An unreadable page (bad checksum / beyond EOF) is skipped rather than
+            // crashing the drop: leak it, do not fault.
+            const frame = self.pool.fetchPage(pid) catch continue;
+            {
+                const p = self.pool.pageOf(frame);
+                const h = p.headerPtr();
+                switch (h.page_type) {
+                    .internal => {
+                        if (h.leftmost_child_id != 0) try children.append(self.allocator, h.leftmost_child_id);
+                        var i: u16 = 0;
+                        while (i < h.num_cells) : (i += 1) {
+                            const c = p.getCell(i) orelse continue;
+                            if (c.value.len >= @sizeOf(PageId))
+                                try children.append(self.allocator, std.mem.readInt(PageId, c.value[0..@sizeOf(PageId)], .little));
+                        }
+                    },
+                    .leaf => {
+                        var i: u16 = 0;
+                        while (i < h.num_cells) : (i += 1) {
+                            const c = p.getCell(i) orelse continue;
+                            if (c.flags.value_overflow and c.value.len >= overflow.OverflowDescriptor.SIZE) {
+                                const d = overflow.OverflowDescriptor.decode(c.value);
+                                try ovf.append(self.allocator, d.first_page_id);
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+            self.pool.unpinPage(pid, false);
+            for (ovf.items) |ofp| overflow.freeChain(self.pool, ofp) catch {};
+            self.pool.discardPage(pid) catch {};
+            for (children.items) |ch| try stack.append(self.allocator, ch);
+        }
+    }
+
     pub fn dropTable(self: *Database, name: []const u8, tx_id: u64) !void {
         const root_id = self.table_roots.get(name) orelse return error.TableNotFound;
+
+        // Cascade: drop every secondary index of this table first (each frees its
+        // own tree pages), so a later CREATE of the same name does not collide on
+        // index names and the index storage is reclaimed too. Collect the names
+        // up front because dropIndex mutates the catalog.
+        {
+            var tbl_id: ?u32 = null;
+            for (self.catalog.tables.items) |tbl| {
+                if (std.mem.eql(u8, tbl.name, name)) {
+                    tbl_id = tbl.id;
+                    break;
+                }
+            }
+            if (tbl_id) |tid| {
+                var idx_names = std.ArrayList([]const u8).empty;
+                defer {
+                    for (idx_names.items) |n| self.allocator.free(n);
+                    idx_names.deinit(self.allocator);
+                }
+                for (self.catalog.indexes.items) |idx| {
+                    if (idx.table_id == tid) try idx_names.append(self.allocator, try self.allocator.dupe(u8, idx.name));
+                }
+                for (idx_names.items) |n| self.dropIndex(n, name, tx_id) catch {};
+            }
+        }
         const lsn1 = self.reserveLsn();
         const lsn2 = self.reserveLsn();
         try self.master_tree.delete(name);
@@ -3881,7 +3968,8 @@ pub const Database = struct {
             var tbl = self.catalog.tables.swapRemove(idx);
             tbl.deinit();
         }
-        _ = root_id;
+        // Reclaim the base tree's pages (was previously stranded).
+        self.freeTreePages(root_id) catch {};
     }
 
     /// Drops an index, mirroring [`Database.dropTable`] for `sys.indexes`.
@@ -3946,7 +4034,8 @@ pub const Database = struct {
             var idx_val = self.catalog.indexes.swapRemove(idx);
             idx_val.deinit();
         }
-        _ = root_id;
+        // Reclaim the index tree's pages (was previously stranded).
+        self.freeTreePages(root_id) catch {};
     }
 
     /// Records that a table's B+Tree root has moved to a new page.

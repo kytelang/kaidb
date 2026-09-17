@@ -369,30 +369,29 @@ async fn tableCount(conn: db.Connection, tbl: string): int {
 // leak the old table in nova.db (that is the DROP-does-not-reclaim bug); restart
 // kaidb with a clean data dir to reclaim. Returns "" if no clean table is made.
 async fn ensureCleanTable(conn: db.Connection, kind: string, base: string, suffix: string, er: EngineResult): string {
+    // All three engines now reset the SAME stable table name with DROP+CREATE:
+    // kaidb's DROP cascades to the table's indexes and frees their pages (and the
+    // base tree's), so a recreate is genuinely empty and the file does not grow
+    // across runs. `suffix` is retained in the signature for compatibility but no
+    // longer used.
+    let _sfx = suffix;
     let tbl = base;
-    if (isKaidb(kind)) {
-        tbl = base + "_" + suffix;
-        console.log("   note: kaidb DROP does not reclaim storage; using fresh table '" + tbl + "'");
-        er.note = "used fresh table '" + tbl + "' (kaidb DROP does not reclaim '" + base + "')";
-    }
     let _d = await conn.exec("DROP TABLE " + tbl, db.noParams());
     let cr = await conn.exec(createTableSql(kind, tbl), db.noParams());
     if (!cr.ok()) {
         er.note = "create table failed: " + cr.err.message;
         return "";
     }
-    // For the SQL engines confirm the reset landed empty; for kaidb a fresh name
-    // is clean by construction (COUNT is not a trustworthy emptiness signal there).
-    if (!isKaidb(kind)) {
-        let c0 = await tableCount(conn, tbl);
-        if (c0 < 0) {
-            er.note = "reset/verify query failed after DROP+CREATE (engine not writable? e.g. a read-only or recovery-mode server)";
-            return "";
-        }
-        if (c0 != 0) {
-            er.note = "table not empty after DROP+CREATE (held " + `${c0}` + " rows)";
-            return "";
-        }
+    // Confirm the reset landed empty (catches a non-writable engine, and verifies
+    // the kaidb DROP+CREATE reuse is genuinely clean).
+    let c0 = await tableCount(conn, tbl);
+    if (c0 < 0) {
+        er.note = "reset/verify query failed after DROP+CREATE (engine not writable? e.g. a read-only or recovery-mode server)";
+        return "";
+    }
+    if (c0 != 0) {
+        er.note = "table not empty after DROP+CREATE (held " + `${c0}` + " rows)";
+        return "";
     }
     return tbl;
 }
