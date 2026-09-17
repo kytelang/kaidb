@@ -1090,15 +1090,25 @@ pub const TableScanIterator = struct {
     tables_slice: [1][]const u8,
     /// Reusable one-element data array holding the current row's object.
     data_slice: [1]TableRow = undefined,
+    /// Inclusive upper bound on the clustered key, or `null` for a scan-to-end.
+    /// When set, the scan stops at the first cell whose key sorts `.gt` this
+    /// slice, turning a seek-only scan into a bounded window. Owned by this
+    /// operator (duped in `init`, freed in `deinit`) because the scan outlives
+    /// the caller's transient bound strings. The residual FILTER still runs, so
+    /// the window only has to be a superset of the qualifying rows.
+    stop_key: ?[]const u8 = null,
 
-    /// Allocates and initialises a table scan, optionally seeking to a start key.
+    /// Allocates and initialises a table scan, optionally seeking to a start key
+    /// and stopping at an inclusive upper-bound key.
     ///
     /// With `opt_start_key` the underlying cursor is positioned with
     /// `iteratorAfter(start_key)` for a range scan; without it a full-table
-    /// `iterator()` is used. Returns a heap-allocated operator owned by
-    /// `allocator`; the caller drives it through [`TableScanIterator.iterator`]
-    /// and must eventually `deinit` the resulting [`RowIterator`].
-    pub fn init(allocator: Allocator, exec: *QueryExecutor, table: Table, table_tree: *BPlusTree, current_tx: u64, opt_start_key: ?[]const u8) anyerror!*TableScanIterator {
+    /// `iterator()` is used. `opt_stop_key`, when set, bounds the walk above (see
+    /// `stop_key`); it is duplicated into `allocator`. Returns a heap-allocated
+    /// operator owned by `allocator`; the caller drives it through
+    /// [`TableScanIterator.iterator`] and must eventually `deinit` the resulting
+    /// [`RowIterator`].
+    pub fn init(allocator: Allocator, exec: *QueryExecutor, table: Table, table_tree: *BPlusTree, current_tx: u64, opt_start_key: ?[]const u8, opt_stop_key: ?[]const u8) anyerror!*TableScanIterator {
         const self = try allocator.create(TableScanIterator);
         const btree_iter = if (opt_start_key) |start_key|
             try table_tree.iteratorAfter(start_key)
@@ -1113,6 +1123,7 @@ pub const TableScanIterator = struct {
             .btree_iter = btree_iter,
             .current_tx = current_tx,
             .tables_slice = .{table.name},
+            .stop_key = if (opt_stop_key) |sk| try allocator.dupe(u8, sk) else null,
         };
         return self;
     }
@@ -1140,6 +1151,11 @@ pub const TableScanIterator = struct {
                     }
 
                     while (try s.btree_iter.next()) |cell| {
+                        // Bounded clustered window: stop at the first key past the
+                        // inclusive upper bound (keys are in ascending order).
+                        if (s.stop_key) |ek| {
+                            if (std.mem.order(u8, cell.key, ek) == .gt) return null;
+                        }
                         if (try s.exec.getVisibleVersion(s.table, cell.value, cell.flags.value_overflow, s.current_tx)) |visible_row| {
                             s.current_row_json = visible_row;
                             s.data_slice[0] = visible_row;
@@ -1158,6 +1174,7 @@ pub const TableScanIterator = struct {
                     if (s.current_row_json) |row_json| {
                         s.exec.freeTableRow(row_json);
                     }
+                    if (s.stop_key) |sk| s.allocator.free(sk);
                     s.btree_iter.deinit();
                     s.table_tree.deinit();
                     s.allocator.destroy(s);

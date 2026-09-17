@@ -1334,6 +1334,54 @@ pub const QueryExecutor = struct {
         return null;
     }
 
+    /// A clustered (primary-key) scan window: an inclusive lower seek key and an
+    /// inclusive upper stop key, either of which may be null. Both are owned by
+    /// the caller.
+    const PkWindow = struct { start: ?[]const u8, stop: ?[]const u8 };
+
+    /// Chooses a bounded clustered-scan window for a primary-key predicate.
+    ///
+    /// The base table is keyed by the primary key stored as raw decimal/text and
+    /// ordered byte-lexically. A numeric range like `id >= a AND id <= b` can be
+    /// turned into a seek-to-`a` + stop-at-`b` window ONLY when the lexical order
+    /// of the keys in that window coincides with numeric order. That holds when
+    /// both bounds are non-negative decimals of the SAME digit width (equal length
+    /// + no sign): every id numerically in `[a, b]` is then also lexically in
+    /// `[a, b]`, so the window is a correct superset. Other-width strings (e.g.
+    /// "21" or "2000000") may also fall inside the lexical window, but the
+    /// downstream `FilterIterator` re-checks the full predicate and drops them, so
+    /// the result stays exact. Mixed-width or signed bounds fall back to the
+    /// existing one-sided lower-bound seek (no stop key), and everything else to a
+    /// full scan. Both returned strings are owned by the caller.
+    ///
+    /// This is deliberately conservative: it never returns an unsafe stop key, so
+    /// correctness never depends on the residual. A fully general clustered range
+    /// (across digit widths, or negative ids) needs an order-preserving key
+    /// encoding for the base tree, which is a separate, larger change.
+    fn pkClusteredWindow(self: *QueryExecutor, where_expr: ?*const ast.Expr, pk_col: []const u8) !PkWindow {
+        if (where_expr) |we| {
+            var lo: ?CmpBound = null;
+            var hi: ?CmpBound = null;
+            defer {
+                if (lo) |l| self.allocator.free(l.txt);
+                if (hi) |h| self.allocator.free(h.txt);
+            }
+            try self.collectColBounds(we, pk_col, &lo, &hi);
+            if (lo != null and hi != null) {
+                const l = lo.?;
+                const h = hi.?;
+                if (l.txt.len > 0 and l.txt.len == h.txt.len and l.txt[0] != '-' and h.txt[0] != '-') {
+                    const start = try self.allocator.dupe(u8, l.txt);
+                    errdefer self.allocator.free(start);
+                    const stop = try self.allocator.dupe(u8, h.txt);
+                    return .{ .start = start, .stop = stop };
+                }
+            }
+        }
+        // No safe two-sided window: keep the existing one-sided lower-bound seek.
+        return .{ .start = try self.getStartKeyForCol(where_expr, pk_col), .stop = null };
+    }
+
     /// Renders a literal expression as owned decimal/text, matching how INSERT
     /// stores column values. Returns null for non-literal operands. Caller frees.
     fn literalText(self: *QueryExecutor, e: *const ast.Expr) !?[]const u8 {
@@ -2734,16 +2782,22 @@ pub const QueryExecutor = struct {
 
         if (!used_index) {
             var start_key: ?[]const u8 = null;
+            var stop_key: ?[]const u8 = null;
             if (pk_col_name) |pk_name| {
-                start_key = try self.getStartKeyForCol(sel.where_expr, pk_name);
+                const pk_range = try self.pkClusteredWindow(sel.where_expr, pk_name);
+                start_key = pk_range.start;
+                stop_key = pk_range.stop;
             }
-            defer if (start_key) |val| self.allocator.free(val);            const table_scan = try query_iter.TableScanIterator.init(
+            defer if (start_key) |val| self.allocator.free(val);
+            defer if (stop_key) |val| self.allocator.free(val);
+            const table_scan = try query_iter.TableScanIterator.init(
                 self.allocator,
                 self,
                 base_table_meta,
                 base_table_tree,
                 current_tx,
                 start_key,
+                stop_key,
             );
             base_iter = table_scan.iterator();
         }
@@ -2764,6 +2818,7 @@ pub const QueryExecutor = struct {
                 right_table_meta,
                 right_table_tree,
                 current_tx,
+                null,
                 null,
             );
             const right_iter = right_scan.iterator();
