@@ -78,6 +78,13 @@ grouping, composite index, deep pagination).
 | Q17 `emp = 279 AND total_due 20000..40000 LIMIT 10000` | 40 | **12** | 27 | PostgreSQL |
 | Q18 `emp = 279 ORDER BY total_due LIMIT 100 OFFSET 50000` | 213 | **34** | 81 | PostgreSQL |
 
+> **Improvement in progress (branch `perf/q12-pk-range-scan`, commit `98d81c6`):**
+> Q12 is now a bounded clustered scan instead of a full-table scan, taking it from
+> **~228 ms to ~10 ms** (3-run stable, row count unchanged at 10001, matching
+> PostgreSQL). The baseline table above is the shipped engine; this note records the
+> branch result until it is merged and the whole set is re-measured. See
+> `q11-18-perf-improve.md` for the remaining fixes (Q16/Q17/Q18 and the range family).
+
 Across all 18, on an optimised (`--release`) client:
 
 - **PostgreSQL is the overall leader**, fastest on **10** (Q1, Q2, Q4, Q5, Q6, Q8, Q12,

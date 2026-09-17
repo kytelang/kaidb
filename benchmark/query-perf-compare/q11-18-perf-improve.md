@@ -30,7 +30,18 @@ Real targets: **Q12** (clustered PK range), the range-scan family **Q4/Q5/Q8/Q17
 
 ---
 
-## Fix 1 (highest impact, ~20x): Q12 clustered PK range = full scan -> seek + stop
+## STATUS
+
+- **Fix 1 (Q12 clustered PK range): DONE** on branch `perf/q12-pk-range-scan`
+  (commit `98d81c6`). Q12 **228 ms -> 10 ms** (matches PostgreSQL), 3-run stable,
+  row count unchanged at 10001, all other query row counts unchanged, engine tests
+  119/120 (pre-existing mutual-TLS failure). See the fix below for what shipped.
+  Gotcha noted for the next session: build the server `zig build -Doptimize=ReleaseFast`
+  (plain `zig build` is Debug = ~100x slower, load looks like it hangs), and start it
+  on a fresh data dir (the leaked-table bloat makes `nova.db` balloon to GBs).
+- Fixes 2-5: not started.
+
+## Fix 1 (highest impact, ~20x): Q12 clustered PK range = full scan -> seek + stop  [DONE]
 
 **Cause.** `buildIteratorTree` only range-scans *secondary* indexes; the base
 (clustered PK) tree is never range-scanned. Every `rangeScan`/`iteratorAfter`/
