@@ -1577,6 +1577,19 @@ pub const IndexRangeScanIterator = struct {
     base_cursor: ?BPlusTree.LeafReuseSearcher = null,
     prev_base_searcher: ?*BPlusTree.LeafReuseSearcher = null,
     cursor_ready: bool = false,
+    /// Number of leading QUALIFYING rows to skip before emitting (an OFFSET pushed
+    /// into the scan by the planner, only when this scan yields the final ORDER BY
+    /// order). Each skipped row is verified with `rowQualifies` (visibility +
+    /// residual, no row build), so the count is exact; the expensive
+    /// materialisation is skipped for the offset rows. Set by the planner; the
+    /// executor then applies no further offset.
+    skip_remaining: usize = 0,
+    /// When true, the skip advances the index cursor alone, counting each entry as
+    /// a qualifying visible row WITHOUT a base-row fetch. The planner sets this
+    /// only when the scan's key range fully captures the WHERE (every in-range
+    /// entry qualifies) and a single transaction is in flight (all entries
+    /// visible). Otherwise the skip verifies each row with `rowQualifies`.
+    skip_no_fetch: bool = false,
 
     /// Refill `pk_batch` with up to `prefetch_batch` PKs from the bounded range
     /// cursor, then prefetch their base leaves. When `may_reorder` is set the PKs
@@ -1667,6 +1680,31 @@ pub const IndexRangeScanIterator = struct {
                     if (s.current_row_json) |row_json| {
                         s.exec.freeTableRow(row_json);
                         s.current_row_json = null;
+                    }
+
+                    // Pushed OFFSET: count past the leading qualifying rows without
+                    // materialising them (the planner sets skip_remaining only when
+                    // this scan produces the final ORDER BY order).
+                    if (s.skip_no_fetch) {
+                        // Fetch-free: the key range captures the whole WHERE and all
+                        // entries are visible, so each index entry is one qualifying
+                        // row. Advance the index cursor alone, no base access.
+                        while (s.skip_remaining > 0) {
+                            const cell = (try s.range_iter.next()) orelse return null;
+                            _ = pkAfterNthColon(cell.key, s.pk_after_colon) orelse continue;
+                            s.skip_remaining -= 1;
+                        }
+                    } else {
+                        while (s.skip_remaining > 0) {
+                            if (s.pk_cursor >= s.pk_batch.items.len) {
+                                if (!try s.refillBatch()) return null;
+                            }
+                            const skip_pk = s.pk_batch.items[s.pk_cursor];
+                            s.pk_cursor += 1;
+                            if (try s.exec.rowQualifies(s.table, s.table_tree, skip_pk, s.current_tx, s.residual, s.residual_cols)) {
+                                s.skip_remaining -= 1;
+                            }
+                        }
                     }
 
                     while (true) {

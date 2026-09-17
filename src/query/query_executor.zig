@@ -832,6 +832,10 @@ pub const QueryExecutor = struct {
     residual_expr: ?*const ast.Expr = null,
     residual_cols_buf: [32][]const u8 = undefined,
     residual_cols: ?[]const []const u8 = null,
+    /// True when the base scan has consumed the query's OFFSET itself (an ordered
+    /// index scan that skipped the leading rows via `skip_remaining`), so the
+    /// executor must NOT re-apply the offset and may stream + break at LIMIT.
+    scan_offset_pushed: bool = false,
 
     /// Profiling (gated by env NOVADB_QPROF): when true, the SELECT path prints a
     /// per-query phase breakdown and `buildRowJson` accumulates into `qp_json`.
@@ -1380,6 +1384,44 @@ pub const QueryExecutor = struct {
         }
         // No safe two-sided window: keep the existing one-sided lower-bound seek.
         return .{ .start = try self.getStartKeyForCol(where_expr, pk_col), .stop = null };
+    }
+
+    /// Whether `e` is a literal (int/float/text) value node.
+    fn isLiteralExpr(e: *const ast.Expr) bool {
+        return switch (e.*) {
+            .literal_int, .literal_float, .literal_text => true,
+            else => false,
+        };
+    }
+
+    /// Whether a composite `(lead, second)` index scan seeked to `lead = const`
+    /// with an encoded range on `second` FULLY captures `e` - i.e. every index
+    /// entry in that key window provably satisfies the whole predicate, so the
+    /// residual is redundant. True only for an AND-tree whose leaves are the
+    /// `lead = literal` equality and range comparisons (`< <= > >=` / BETWEEN) on
+    /// `second`; any other column, operator (OR, `<>`, NOT), or function makes it
+    /// false (then the caller must verify each row instead of trusting the range).
+    fn whereCapturedByCompositeKey(self: *QueryExecutor, e: *const ast.Expr, lead: []const u8, second: []const u8) bool {
+        switch (e.*) {
+            .binary_op => |b| switch (b.op) {
+                .AND => return self.whereCapturedByCompositeKey(b.left, lead, second) and
+                    self.whereCapturedByCompositeKey(b.right, lead, second),
+                .EQ => {
+                    if (b.left.* == .column_ref and std.mem.eql(u8, b.left.column_ref, lead) and isLiteralExpr(b.right)) return true;
+                    if (b.right.* == .column_ref and std.mem.eql(u8, b.right.column_ref, lead) and isLiteralExpr(b.left)) return true;
+                    return false;
+                },
+                .GT, .GTE, .LT, .LTE => {
+                    if (b.left.* == .column_ref and std.mem.eql(u8, b.left.column_ref, second) and isLiteralExpr(b.right)) return true;
+                    if (b.right.* == .column_ref and std.mem.eql(u8, b.right.column_ref, second) and isLiteralExpr(b.left)) return true;
+                    return false;
+                },
+                else => return false,
+            },
+            .between => |bt| return !bt.negated and bt.operand.* == .column_ref and
+                std.mem.eql(u8, bt.operand.column_ref, second),
+            else => return false,
+        }
     }
 
     /// Renders a literal expression as owned decimal/text, matching how INSERT
@@ -2508,6 +2550,7 @@ pub const QueryExecutor = struct {
         // enumerable (collectExprCols bails on functions/CASE/subqueries).
         self.residual_expr = null;
         self.residual_cols = null;
+        self.scan_offset_pushed = false;
         if (sel.joins.len == 0) {
             if (sel.where_expr) |we| {
                 var ns = NeededSet{};
@@ -2658,6 +2701,24 @@ pub const QueryExecutor = struct {
                         asc_scan.residual = self.residual_expr;
                         asc_scan.residual_cols = self.residual_cols;
                         asc_scan.pk_after_colon = 2;
+                        // Push an OFFSET into the scan: this scan yields the final
+                        // ORDER BY order, so the leading `offset` qualifying rows can
+                        // be counted past (rowQualifies, no materialise) instead of
+                        // being built, buffered and discarded by the executor.
+                        if (sel.offset) |off| if (off > 0) {
+                            asc_scan.skip_remaining = off;
+                            self.scan_offset_pushed = true;
+                            // Fetch-free skip when the key range captures the whole
+                            // WHERE and a single txn is in flight (every in-range
+                            // entry is a visible, qualifying row). Otherwise the skip
+                            // verifies each row with rowQualifies.
+                            const single_txn = self.db.txn_manager.activeTxnCount(self.db.pool.pager.io) == 1;
+                            if (single_txn) {
+                                if (sel.where_expr) |we| {
+                                    if (self.whereCapturedByCompositeKey(we, lead, second_col)) asc_scan.skip_no_fetch = true;
+                                } else asc_scan.skip_no_fetch = true;
+                            }
+                        };
                         base_iter = asc_scan.iterator();
                     }
                     used_index = true;
@@ -3975,7 +4036,7 @@ pub const QueryExecutor = struct {
                 // stream (its final order is not the scan order) and stays buffered.
                 const do_stream = self.row_sink != null and star_expand and star_meta != null and
                     can_stream and !sort_needed and !order_by_scan_desc and
-                    sel.offset == null and !sel.distinct;
+                    (sel.offset == null or self.scan_offset_pushed) and !sel.distinct;
                 var streamed_rows: u64 = 0;
                 if (do_stream) {
                     if (self.binary_results) result_binary = true;
@@ -4156,7 +4217,7 @@ pub const QueryExecutor = struct {
 
                     if (self.qprof) qp_proj.stop(qp_io);
 
-                    if (can_stream and sel.offset == null and !sel.distinct) {
+                    if (can_stream and (sel.offset == null or self.scan_offset_pushed) and !sel.distinct) {
                         if (sel.limit) |lim| {
                             const produced = if (do_stream) streamed_rows else rows.items.len;
                             if (produced >= lim) break;
@@ -4200,7 +4261,9 @@ pub const QueryExecutor = struct {
                         seen_keys.deinit(self.allocator);
                         seen.deinit();
                     }
-                    const off: usize = if (sel.offset) |o| o else 0;
+                    // The base scan already consumed the offset (pushed down), so do
+                    // not skip again here.
+                    const off: usize = if (self.scan_offset_pushed) 0 else if (sel.offset) |o| o else 0;
                     var distinct_pos: usize = 0;
                     var w: usize = 0;
                     for (rows.items) |row| {
@@ -6244,6 +6307,52 @@ pub const QueryExecutor = struct {
         }
         // Cold / legacy layout: no raw pre-filter, full reconstruction as before.
         return try self.getVisibleVersion(table, val, false, current_tx);
+    }
+
+    /// Like [`fetchVisibleFilteredJson`] but returns only whether the row for
+    /// `pk_val` is visible to `current_tx` and passes `residual`, WITHOUT building
+    /// the row image. Used to count rows past an OFFSET without paying the
+    /// per-row materialisation (see the scan iterators' `skip_remaining`). It
+    /// still fetches the stored value to check MVCC visibility and the residual,
+    /// so it is a partial (not fetch-free) skip; the win is skipping buildRowJson.
+    pub fn rowQualifies(self: *QueryExecutor, table: Table, table_tree: *BPlusTree, pk_val: []const u8, current_tx: u64, residual: ?*const ast.Expr, residual_cols: ?[]const []const u8) !bool {
+        const val = blk: {
+            if (self.base_searcher) |s| {
+                if (s.tree == table_tree) break :blk (try s.get(pk_val, self.allocator)) orelse return false;
+            }
+            break :blk (try table_tree.search(pk_val, self.allocator)) orelse return false;
+        };
+        defer self.allocator.free(val);
+
+        if (val.len >= 36 and val[0] != '{') {
+            const xmin = std.mem.readInt(u64, val[4..12], .little);
+            const oldest_tx = self.db.txn_manager.getOldestActiveTxId(self.db.pool.pager.io);
+            if (xmin < oldest_tx) {
+                const fixed_len = std.mem.readInt(u32, val[28..32], .little);
+                const heap_len = std.mem.readInt(u32, val[32..36], .little);
+                if (36 + fixed_len + heap_len <= val.len) {
+                    const xmax = std.mem.readInt(u64, val[12..20], .little);
+                    if (!self.rowVisible(current_tx, xmin, xmax)) return false;
+                    if (residual) |res| {
+                        _ = residual_cols;
+                        const fixed = val[36 .. 36 + fixed_len];
+                        const heap = val[36 + fixed_len .. 36 + fixed_len + heap_len];
+                        const reader = RowReader.init(table, fixed, heap);
+                        if (rawEval(table, reader, res) == false) return false;
+                    }
+                    return true;
+                }
+            }
+        }
+        // Cold / legacy layout: reconstruct the visible row and apply the residual
+        // WHERE over it (evalExprJson), so a skipped row is only counted when it
+        // genuinely qualifies. Rare path (fresh rows take the fast path above).
+        if (try self.getVisibleVersion(table, val, false, current_tx)) |row| {
+            defer self.freeTableRow(row);
+            if (residual) |res| return query_iter.evalExprJson(res, row);
+            return true;
+        }
+        return false;
     }
 
     const PushdownError = error{PushdownUnsupported};
