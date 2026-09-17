@@ -2754,6 +2754,18 @@ pub const QueryExecutor = struct {
                             );
                             range_scan.residual = self.residual_expr;
                             range_scan.residual_cols = self.residual_cols;
+                            // This scan's ascending value order is relied upon only
+                            // when it directly satisfies `ORDER BY <this col> ASC`
+                            // (single key, ascending). In every other case (no
+                            // ORDER BY, or one on another column that the executor
+                            // sorts downstream) the row order is free, so each
+                            // look-ahead batch may be reordered into primary-key
+                            // order for a near-sequential base-row fetch.
+                            const served_asc = sel.joins.len == 0 and if (sel.order_by) |ob|
+                                (ob.len == 1 and !ob[0].desc and std.mem.eql(u8, ob[0].column, idx.key_columns[0].name))
+                            else
+                                false;
+                            range_scan.may_reorder = !served_asc;
                             base_iter = range_scan.iterator();
                         }
                         used_index = true;

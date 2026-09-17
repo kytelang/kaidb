@@ -98,7 +98,13 @@ fn resolvePrefetchBatch() usize {
 /// because it holds the base tree's shared structure lock for the scan's
 /// lifetime (fine for a single reader, but it delays writers).
 fn useBaseCursor() bool {
-    return std.c.getenv("NOVADB_BASE_CURSOR") != null;
+    // Default ON: the equality index scan yields PKs in pk-ascending order, so
+    // the base-table leaf-reuse cursor answers most fetches without re-descending
+    // from the root. `LeafReuseSearcher.get` re-descends whenever a key leaves the
+    // current leaf, so it stays correct even if order is imperfect. Set
+    // NOVADB_BASE_CURSOR=0 to force the old per-fetch descent.
+    if (std.c.getenv("NOVADB_BASE_CURSOR")) |v| return !(v[0] == '0');
+    return true;
 }
 
 /// Best-effort: resolve `pks` to their base-table leaf pages and hint the OS to
@@ -1555,11 +1561,37 @@ pub const IndexRangeScanIterator = struct {
     prefetch_batch: usize = DEFAULT_PREFETCH_BATCH,
     /// Reusable scratch for the batch's base-leaf page ids.
     leaf_ids: std.ArrayList(page.PageId) = .empty,
+    /// When true the planner has determined this scan's row ORDER is not relied
+    /// upon (no `ORDER BY` satisfied by it), so each look-ahead batch may be
+    /// sorted into primary-key order before the base-row fetches. Sorted PKs turn
+    /// the per-row base lookups into a near-sequential leaf walk and let the
+    /// leaf-reuse cursor (below) skip most root descents. Left false for scans
+    /// whose ascending value order feeds an ORDER BY (reordering would corrupt it).
+    may_reorder: bool = false,
+    /// Base-table leaf-reuse cursor, installed on the first refill when
+    /// `may_reorder` is set. With PKs sorted per batch, most fetches stay on the
+    /// current leaf; `LeafReuseSearcher.get` re-descends only when a key leaves
+    /// the leaf's range, so it is correct for any key order. `prev_base_searcher`
+    /// restores the executor's prior cursor (nested scans); both are torn down in
+    /// `deinit`.
+    base_cursor: ?BPlusTree.LeafReuseSearcher = null,
+    prev_base_searcher: ?*BPlusTree.LeafReuseSearcher = null,
+    cursor_ready: bool = false,
 
     /// Refill `pk_batch` with up to `prefetch_batch` PKs from the bounded range
-    /// cursor (range order preserved), then prefetch their base leaves. Returns
-    /// false when the range is exhausted and no new keys were gathered.
+    /// cursor, then prefetch their base leaves. When `may_reorder` is set the PKs
+    /// are sorted into primary-key order first (so the prefetch coalesces and the
+    /// leaf-reuse cursor hits); otherwise range order is preserved. Returns false
+    /// when the range is exhausted and no new keys were gathered.
     fn refillBatch(self: *IndexRangeScanIterator) !bool {
+        // Install the base-table leaf-reuse cursor once, lazily, so it is only
+        // taken for reorderable scans (the planner sets may_reorder after init).
+        if (self.may_reorder and !self.cursor_ready) {
+            self.base_cursor = self.table_tree.leafReuseSearcher();
+            self.prev_base_searcher = self.exec.base_searcher;
+            self.exec.base_searcher = &self.base_cursor.?;
+            self.cursor_ready = true;
+        }
         for (self.pk_batch.items) |pk| self.allocator.free(pk);
         self.pk_batch.clearRetainingCapacity();
         self.pk_cursor = 0;
@@ -1574,6 +1606,13 @@ pub const IndexRangeScanIterator = struct {
             try self.pk_batch.append(self.allocator, pk);
         }
         if (self.pk_batch.items.len == 0) return false;
+        if (self.may_reorder and self.pk_batch.items.len > 1) {
+            std.mem.sort([]const u8, self.pk_batch.items, {}, struct {
+                fn lt(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.lt);
+        }
         if (self.prefetch_batch > 1 and self.pk_batch.items.len > 1) {
             prefetchBaseLeaves(self.table_tree, self.pk_batch.items, &self.leaf_ids, self.allocator);
         }
@@ -1653,6 +1692,10 @@ pub const IndexRangeScanIterator = struct {
                     const s: *IndexRangeScanIterator = @alignCast(@ptrCast(ctx));
                     if (s.current_row_json) |row_json| {
                         s.exec.freeTableRow(row_json);
+                    }
+                    if (s.base_cursor) |*bc| {
+                        s.exec.base_searcher = s.prev_base_searcher;
+                        bc.deinit();
                     }
                     for (s.pk_batch.items) |pk| s.allocator.free(pk);
                     s.pk_batch.deinit(s.allocator);
