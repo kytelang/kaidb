@@ -1071,9 +1071,16 @@ pub const Parser = struct {
                 self.eat();
                 const index_tok = try self.expect(.IDENTIFIER);
                 const index_name = self.sliceText(index_tok);
-                _ = try self.expect(.ON);
-                const table_tok = try self.expect(.IDENTIFIER);
-                const table_name = self.sliceText(table_tok);
+                // The owning table is optional: `DROP INDEX name ON table` (MySQL)
+                // and bare `DROP INDEX name` (PostgreSQL / SQLite) are both accepted.
+                // The index name is globally unique, so `dropIndex` ignores the table
+                // anyway; requiring `ON table` needlessly rejected standard SQL.
+                var table_name: []const u8 = "";
+                if (self.current().type == .ON) {
+                    self.eat();
+                    const table_tok = try self.expect(.IDENTIFIER);
+                    table_name = self.sliceText(table_tok);
+                }
                 return .{ .drop_index = .{ .index_name = index_name, .table_name = table_name } };
             },
             .USER => {
