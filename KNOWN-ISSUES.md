@@ -47,11 +47,24 @@ remains:
 
 ## Storage / engine robustness
 
-5. **DROP page-freeing is not WAL-logged.** `dropTable` now reclaims the base + index
-   tree pages (commit `1fc8ecb`, `Database.freeTreePages`), but the frees are not
-   logged. A crash mid-drop leaks the not-yet-freed pages (the pager persists its free
-   list only at a checkpoint). This degrades to wasted space, never corruption, but
-   logging it would make reclamation crash-durable.
+5. **Free-list crash-durability: FIXED (bounded to one checkpoint).** Previously the
+   pager free list was written into the page-0 header *only at a clean* `Database.close`,
+   so any crash lost the whole in-memory free list, leaking every page freed since the
+   last clean shutdown (B+Tree merges, deletes and `DROP` reclamation all feed it), not
+   just DROP frees. `Database.checkpoint` now also rewrites the header's free-list head
+   (plus master root / lsn) before its flush, and the periodic bgwriter tick calls the
+   full `checkpoint` instead of a bare WAL checkpoint, so the free list becomes durable
+   every ~2 s. The rewrite is safe because it runs under the exclusive `rw_lock`, which
+   excludes every writer and hence every page allocation, so `persistFreeList` cannot
+   overwrite a page that a concurrent writer has just reallocated; the following
+   `flushAllPages` issues one `sync`, so the header and the chain pages it points at are
+   made durable together. Recovery's `loadFreeList` remains checksum-guarded, so a torn
+   or stale chain still truncates to a benign leak, never a live page. The frees are
+   still not individually WAL-logged (a crash between checkpoints leaks only that
+   window's frees), which is the accepted residual: it degrades to wasted space, never
+   corruption. Validated: `crash_test.sh` and `crash_test_midwrite.sh` both PASS (data
+   durable, clean recovery), the free-page-list unit test passes, and a 300-row load
+   spanning several bgwriter ticks shows no deadlock from the tick now taking `rw_lock`.
 
 6. **Undo (MVCC version) pages are not reclaimed by DROP.** `freeTreePages` walks the
    base and secondary-index trees; undo-log pages holding prior row versions are a

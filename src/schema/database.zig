@@ -796,11 +796,39 @@ pub const Database = struct {
     ///
     /// Held under [`Database.rw_lock`] exclusively so no writer can dirty pages
     /// between the flush and the WAL checkpoint. A no-op when there is no WAL.
+    ///
+    /// Before the flush it also persists the pager free list into the page-0
+    /// header. The free list is otherwise written to the header only at a clean
+    /// [`Database.close`], so a crash lost every page freed since the last clean
+    /// shutdown (B+Tree merges, deletes and `DROP` reclamation all feed it). That
+    /// only ever leaked space (recovery's [`Pager.loadFreeList`] is checksum
+    /// guarded, so a torn or stale chain truncates to a leak, never hands out a
+    /// live page), but persisting it here bounds the leak window to one checkpoint.
+    /// This is why the rewrite is safe under the exclusive `rw_lock`:
+    /// [`Pager.persistFreeList`] writes a link into each freed page, and the lock
+    /// excludes every writer, hence every page allocation, so no page in the
+    /// snapshot can be handed out and overwritten while we are writing its chain
+    /// link. The following `flushAllPages` issues a single `sync`, so the header
+    /// and the chain pages it points at are made durable together.
     pub fn checkpoint(self: *Database) !void {
         self.rw_lock.lock(self.pool.pager.io);
         defer self.rw_lock.unlock(self.pool.pager.io);
 
         if (self.wal) |w| {
+            {
+                const hf = try self.pool.fetchPage(0);
+                defer self.pool.unpinPage(0, true);
+                const hp = self.pool.pageOf(hf);
+                var hdr = readHeader(hp.data);
+                hdr.root_page_id = self.master_tree.root_page_id;
+                hdr.lsn = self.master_tree.lsn;
+                var scratch_buf: [PAGE_SIZE]u8 = undefined;
+                hdr.free_page_list_head = self.pool.pager.persistFreeList(&scratch_buf) catch |err| blk: {
+                    std.log.err("persistFreeList during checkpoint failed: {any}", .{err});
+                    break :blk hdr.free_page_list_head;
+                };
+                writeHeader(hp.data, &hdr);
+            }
             try self.pool.flushAllPages();
             try w.checkpoint();
             self.persistCommitState() catch |err| {
@@ -1119,15 +1147,18 @@ pub const Database = struct {
             // could fill the disk. Done every few ticks (~2s) rather than every
             // wake so we are not rotating a near-empty segment each 500 ms.
             if (self.wal) |w| {
+                _ = w;
                 if (cp_ticks % 4 == 0) {
-                    w.checkpoint() catch |err| {
+                    // Full checkpoint (not just `w.checkpoint()`): it truncates the
+                    // WAL, persists the committed-txn set so the dropped segments do
+                    // not take commit visibility with them, AND rewrites the page-0
+                    // header (free-list head + master root/lsn) so the pages freed
+                    // since the last one become durable. It takes `rw_lock`
+                    // exclusively, which is exactly the exclusion `persistFreeList`
+                    // needs, so no live writer can reallocate a page mid-persist.
+                    self.checkpoint() catch |err| {
                         if (err == error.Canceled) return;
-                        dblog.err("bgwriter wal checkpoint failed: {any}", .{err});
-                    };
-                    // Persist the committed-txn set so the segments just dropped by
-                    // the checkpoint do not take commit visibility with them.
-                    self.persistCommitState() catch |err| {
-                        dblog.err("bgwriter persistCommitState failed: {any}", .{err});
+                        dblog.err("bgwriter checkpoint failed: {any}", .{err});
                     };
                 }
                 cp_ticks += 1;
