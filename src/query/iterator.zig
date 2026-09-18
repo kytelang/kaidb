@@ -1626,7 +1626,15 @@ pub const IndexRangeScanIterator = struct {
                 }
             }.lt);
         }
-        if (self.prefetch_batch > 1 and self.pk_batch.items.len > 1) {
+        // Explicit base-leaf prefetch (a per-PK `collectLeafPageIds` descent to hint
+        // the OS) earns its cost only for SCATTERED base access. When the batch was
+        // sorted into clustered order (`may_reorder`), the base-row fetches walk the
+        // tree in ascending key order, so the kernel's own sequential read-ahead
+        // already stages those pages and the per-PK descent is pure overhead
+        // (measured ~2x on a warm wide secondary-index aggregate; no cold penalty
+        // that survived the VM noise). Keep the explicit prefetch only for the
+        // range-ordered (unsorted) path, where access really is random.
+        if (self.prefetch_batch > 1 and self.pk_batch.items.len > 1 and !self.may_reorder) {
             prefetchBaseLeaves(self.table_tree, self.pk_batch.items, &self.leaf_ids, self.allocator);
         }
         return true;
