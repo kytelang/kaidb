@@ -5,6 +5,34 @@ Grounded in the `benchmark/query-perf-compare` results and the storage engine, n
 a wish list. Query-perf items reference `benchmark/query-perf-compare/comparison.md`
 and the fix log in `benchmark/query-perf-compare/q11-18-perf-improve.md`.
 
+## Production readiness: see `prod-fitness.md` first
+
+**This file is a list of remaining *engineering* items, NOT a production-readiness
+verdict.** For that, read `prod-fitness.md` (a code-cited, red->green-tested subsystem
+audit). Its verdict: **fit for single-node production for the scoped read-heavy,
+mostly-in-RAM relational role, pending an on-hardware soak.** The production gates it
+lists are *closed and tested*, so do not read the items below as if they reopened them:
+
+- **Durability / crash recovery** - CLOSED (WAL-before-page + doublewrite + 3-phase redo;
+  `prod-fitness.md` 4.1). This session additionally made the free list crash-durable at
+  the periodic checkpoint (item 5 below).
+- **Auth / authz** - CLOSED, opt-in (`require_auth` fail-closes with SQLSTATE 28000,
+  TLS-gated password path, forced admin rotation; 4.3).
+- **Backup / restore** - CLOSED, cold + hot (`novadb backup`/`restore`, live
+  `BACKUP DATABASE TO`; 4.4).
+- **Point-in-time recovery** - CLOSED, LSN target (WAL archiving + `restore --target-lsn`;
+  5.B.3). Time-target selector is a follow-up.
+- **Observability** - CLOSED to the operability floor (`/healthz`, `/readyz`, `/metrics`
+  with a query-latency histogram, buffer-pool hit ratio, WAL/replication gauges; 4.7).
+- **Concurrency safety** - CLOSED (per-tree structure lock + default-on fuzzers; the one
+  known `PageStillPinned` merge race was root-caused and fixed with an always-on
+  regression test; 4.2). The residual concurrent-harness *replication-test* flake (item 11)
+  is a test-harness teardown race, not an engine-durability defect.
+
+"Mostly-in-RAM" describes the *performance* sweet spot (working set fits the buffer pool),
+NOT the durability model - the engine is fully durable on disk. The one genuine pre-flight
+step is the on-hardware **soak** (checklist at the end of this file).
+
 ## Scope note (correction)
 
 kaidb is **not** the Nova orchestrator's store any more. The orchestrator's
@@ -147,3 +175,53 @@ scans**, and the profiling says the lever there is **cutting base-row seeks** (a
 covering / included-column index so the projection is answered from the index alone,
 and/or a batched leaf-cursor base fetch) plus tightening the index/residual walk - not
 row-image reuse. Items 8-9 are intentional scope.
+
+## On-hardware soak checklist (the one pre-flight gate before "in prod")
+
+`prod-fitness.md` closes every production gate in-tree with tests. The single thing those
+tests cannot cover is a specific deployment's operational envelope on real hardware. Run
+this soak against the intended workload shape (row sizes, read/write mix, dataset-vs-RAM,
+follower present?) before flipping the switch. Treat any failure here as a launch blocker.
+
+Config the box the way it will actually run first: `require_auth` (or
+`require_tls_for_auth`) on, `admin` password rotated (`require_admin_password_change`),
+`synchronous_commit` set for the durability/latency trade you want, buffer pool sized for
+the box, `wal_archive_dir` set if you want PITR, `/metrics` scraped.
+
+1. **Sustained load, hours not minutes.** Drive the real read/write mix at target
+   concurrency for >= 2-4 h. Watch, via `/metrics`: query-latency p99
+   (`histogram_quantile` over `kaidb_query_duration_seconds`), buffer-pool hit ratio
+   (`1 - hits/fetches`), `kaidb_wal_bytes` (must plateau, not grow without bound), and
+   `kaidb_wal_checkpoint_lag_lsn` (must stay bounded - a rising value = a stalled
+   checkpointer). Confirm RSS is stable (no slow leak) and latency does not drift up.
+2. **kill-9 mid-write on the actual box, repeatedly.** Not just the test harness: hard-kill
+   the running server under write load, restart, and verify (a) it recovers without
+   crashing, (b) every acked commit is present, (c) recovery time is acceptable for your
+   dataset. The harness `tests/harness/crash_test.sh` / `crash_test_midwrite.sh` are the
+   pattern; run their spirit against the real data size. Do this >= 10 times.
+3. **Disk-full behaviour.** Fill the data/WAL volume under write load and confirm the
+   server fails writes cleanly (returns errors, stays up or restarts clean) rather than
+   corrupting. Then free space and confirm it resumes. This path is NOT covered by in-tree
+   tests and is the most likely real-world surprise.
+4. **Backup + restore drill on real data.** Take a hot `BACKUP DATABASE TO` under load,
+   restore it into a fresh dir, and diff query results against the source. If using PITR,
+   restore `--target-lsn` from snapshot + archived WAL and verify the point-in-time state.
+   Time the restore so you know your actual RTO.
+5. **Replication over a real network (if used).** Bring up a follower across the actual
+   network (not loopback), confirm `kaidb_replication_lag_frames` stays bounded under load,
+   then exercise `PROMOTE` / `DEMOTE TO FOLLOWER ON` and confirm the old leader is fenced
+   (writes rejected). Note the async-failover data-loss window (committed-but-unshipped) -
+   use sync replication / lag-gating if you need zero loss. See `promote-demote-design.md`.
+6. **Long-running-transaction behaviour.** Hold a long read transaction open under write
+   churn and confirm undo-page reclamation resumes once it ends (item 6 head-of-line), and
+   that MVCC version-chain walks do not degrade latency unacceptably (`prod-fitness.md` 5.A.7).
+7. **Connection governance under abuse.** Hit `max_connections`, slow/idle clients, and a
+   runaway query; confirm the per-query memory cap and deadline fire (`query_memory_limit_bytes`,
+   `deadline_ms`) and the accept loop stays responsive. Note the gaps in `prod-fitness.md`
+   4.6 (no idle-connection timeout, per-query not global memory cap) and decide if they
+   matter for your front door.
+
+Pass all seven against the real workload and box, and it is ready for the non-critical,
+single-node role. Anything that ships thousands of rows through a secondary index, needs
+horizontal scale, stores large blobs (> ~2 KiB values), or has a working set well beyond
+RAM is outside the scoped role - see `prod-fitness.md` sections 4.8 and 5.A.
