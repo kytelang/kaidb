@@ -251,6 +251,29 @@ PostgreSQL's advantage past `shared_buffers` is not clock-sweep or `posix_fadvis
 
 The one asymmetry no engine removes: sequential and batched-random misses pipeline; a single pointer-chasing descent (each index level's address depends on reading the previous level) cannot be prefetched and serialises. The goal is to make the sequential and batched cases fast, which is exactly what levers 1 to 4 do.
 
+### Measured breakdown and ruled-out levers (2026-09-18)
+
+A RAM-pressure profiling pass (2 GB VM, 128 MB pool, OS cache dropped between cold runs, `NOVADB_QPROF=1`) put concrete numbers on the wide secondary-index aggregate `avg(customer_id) WHERE total_due BETWEEN ...` over 10M rows (400,069 matched). The warm per-query phase split is:
+
+| Phase | Warm time | Share | What it is |
+|---|---|---|---|
+| `baseSeek` | ~530 ms | 73% | the clustered base-tree lookup per matched PK (descent + leaf binary search) |
+| `idxwalk + other` | ~170 ms | 24% | the secondary-index range walk, batch refill and PK sort |
+| `buildJson` | ~20 ms | ~3% | row materialisation into typed cells |
+| `project` | ~60 ms | | text-encode the output for the wire |
+
+The headline finding: **`baseSeek` is the whole gap, and materialisation is not a factor.** The `Cell` union already carries numerics inline (no per-row `itoa`/`dtoa`), so what was historically "per-row JSON" is ~3% and not worth optimising. Two landed changes are correct and reduce allocator pressure but, as the profile predicts, do not move the query time: borrowing the projection column-name array instead of copying it per row, and borrowing the inline row image straight from the pinned leaf instead of a per-row `dupe`+`free`.
+
+Within `baseSeek` itself, three descent- or copy-avoidance strategies were implemented, measured, and **reverted as net-negative or no-ops**, because the cost is the leaf work, not the descent framing:
+
+*   **Sibling-hop cursor** (follow `next_page_id` instead of re-descending when a key leaves the current leaf): *regressed* 533 → 678 ms. A root descent crabs through internal nodes that are already hot/cached (≈ one leaf read of real cost); a hop touches a full leaf page each, and with scattered matches (≈ 1 per leaf) the target is usually 1–2 leaves away, so hopping reads *more* leaf pages than a descent.
+*   **Adaptive hash index** (`key → leaf page id` cache, InnoDB-style, epoch/clear-invalidated, verify-on-probe): *regressed* warm 693 → 1038 ms and cold-populate to 3166 ms. The cache probe (a hash lookup over a large map with poor locality, plus its lock and a verify-fetch) costs as much as the cheap cached-internal descent it removes, while still doing the same leaf fetch. An AHI helps *repeated hot-key point lookups* (Zipfian OLTP), not a scan of hundreds of thousands of distinct keys — which is what this query is.
+*   **Borrowed value (no per-row `dupe`)**: correct and kept (removes ≈ 400k alloc/free pairs), but `baseSeek` was unchanged (531 vs 533), confirming the value copy was never the cost.
+
+What remains, in impact order, is therefore genuinely structural and matches levers 1–4 above plus the key encoding: **(a)** overlapped async base-row reads through the existing reactor for the cold/miss case; **(b)** a fixed-width integer primary-key encoding so the descent's `findChildPageId` and the leaf's `findCellByKey` compare machine words instead of decimal **text** across 16 KiB pages (this is also the correctness fix for general clustered range scans, and the cache-locality of the binary search is the dominant warm cost); **(c)** denser leaves so a given range spans fewer pages. The cheap wins are exhausted; closing the last ~3.5x to InnoDB requires one of these.
+
+The one change that *did* land as a real win this pass: skipping the redundant explicit per-PK base-leaf prefetch descent for already-sorted batches (the kernel's own read-ahead covers the now-sequential access), which cut this query's warm time from 1275 ms to ~690 ms (1.84x).
+
 ---
 
 ## 8. Capability Baseline: What kaidb Is and Can Do
