@@ -22,10 +22,17 @@ Recent wins already landed on branch `perf/q12-pk-range-scan`: Q12 clustered PK 
 remains:
 
 1. **Medium-selectivity range scans - Q4 / Q5 / Q8 / Q17 (~16-40 ms vs PostgreSQL
-   ~5-24 ms).** The clearest remaining query gap. The PK-sorted base-row fetch only
-   trimmed these; the dominant cost is per-row **decode / materialisation**, not the
-   index descent (`buildRowJson` in `src/query/query_executor.zig` allocates a `names`
-   and a `cells` array per row and dups every text cell). See item under "Allocation".
+   ~5-24 ms).** The clearest remaining query gap. **Profiled 2026-09-18** (`NOVADB_QPROF`,
+   300k rows, warm) to find where the time actually goes. For Q8 (`total_due` range,
+   10k rows) the ~16 ms scan splits as: **baseSeek ~46 %** (one random descent into the
+   clustered PK tree per qualifying row to fetch its base image), **idxwalk+other ~50 %**
+   (index range walk + residual-column decode), and **buildJson only ~4 %** (the per-row
+   `names`/`cells`/text-dup materialisation). Q4 is the same shape (~47 / ~49 / ~4). So
+   the dominant cost is the **per-row base-row seek and the index/residual decode**, not
+   materialisation. The real levers are therefore reducing base-row seeks (a covering /
+   included-column index that answers the projection from the index alone would drop
+   baseSeek toward zero; a batched leaf-cursor base fetch amortises the descents) and
+   tightening the index walk, not row-image reuse. See the corrected item 4.
 
 2. **`ORDER BY ... DESC` - Q3 / Q5: NOT a defect (earlier claim was wrong).** kaidb
    already serves these with a backward index walk (`IndexRangeScanDescIterator`, the
@@ -49,12 +56,16 @@ remains:
    single-column deep-OFFSET shape (Q18 is composite), so it is unmeasured and low
    priority.
 
-4. **Per-row allocation reuse (was "Fix 5", not started).** Every emitted row
-   allocates two arrays plus a dup per text cell and frees the prior row - a real cost
-   on any multi-thousand-row scan (this is what keeps Q4/Q5/Q8/Q17 behind PostgreSQL).
-   Reuse a row-image buffer across rows. Broad win, but riskier (ownership / ARC
-   interactions, MVCC borrow paths), so it was deliberately left for last. This is the
-   highest-value next perf item.
+4. **Per-row allocation reuse: NOT WORTH IT (measured, was mis-scoped as highest-value).**
+   The earlier claim that per-row allocation is "what keeps Q4/Q5/Q8/Q17 behind
+   PostgreSQL" is **falsified by profiling** (see item 1): the per-row materialisation
+   (`buildRowJson`: two arrays + a text-cell dup, freed by `freeTableRow`) is only
+   **~4 %** of scan time on exactly those queries. Reusing a row-image buffer across rows
+   would remove at most that ~4 %, while the refactor touches `freeTableRow` at 40 call
+   sites and `cloneTableRow` at 7 with real use-after-free / ARC surface (MVCC borrow
+   paths). The cost/risk ratio is bad, so this is **deliberately not being done**. The
+   time is in base-row seeks and index/residual decode (item 1), which is where any
+   further range-scan work should go.
 
 ## Storage / engine robustness
 
@@ -130,8 +141,9 @@ remains:
 
 ## Suggested order
 
-The highest-value next item is **(4) per-row allocation reuse** - it is the actual
-bottleneck on the range scans where PostgreSQL still wins, and it helps every scan.
-Then **(2) backward index scan** for the `ORDER BY DESC` queries, and **(3)** the
-single-column OFFSET pushdown. Items 5-7 are low-severity robustness; 8-9 are
-intentional scope.
+Items 3, 5 and 6 are done (see each). Item 2 was never a defect. Item 4 was measured
+and dropped (only ~4 % of scan). The remaining genuine query gap is **(1) the range
+scans**, and the profiling says the lever there is **cutting base-row seeks** (a
+covering / included-column index so the projection is answered from the index alone,
+and/or a batched leaf-cursor base fetch) plus tightening the index/residual walk - not
+row-image reuse. Items 8-9 are intentional scope.
