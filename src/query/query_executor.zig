@@ -6194,13 +6194,23 @@ pub const QueryExecutor = struct {
         // (schema-stable) name slices so ownership is uniform for freeTableRow:
         // the array is freed, the name bytes are not.
         const ncols = if (self.scan_needed_cols) |need| need.len else table.columns.len;
-        const names = try self.allocator.alloc([]const u8, ncols);
-        errdefer self.allocator.free(names);
-        if (self.scan_needed_cols) |need| {
-            for (need, 0..) |cn, i| names[i] = cn;
-        } else {
-            for (table.columns, 0..) |col, i| names[i] = col.name;
-        }
+        // When projection pushdown is active, `scan_needed_cols` already holds
+        // exactly this row's column names and stays stable for the whole scan, so
+        // BORROW it as `names` (owns_names=false) rather than allocating and copying
+        // an identical array per row. Retaining callers clone the row first and the
+        // clone owns its duplicated names. On the SELECT * path there is no such
+        // stable array, so allocate and own it as before.
+        var owns_names = true;
+        const names = blk: {
+            if (self.scan_needed_cols) |need| {
+                owns_names = false;
+                break :blk need;
+            }
+            const n = try self.allocator.alloc([]const u8, ncols);
+            for (table.columns, 0..) |col, i| n[i] = col.name;
+            break :blk n;
+        };
+        errdefer if (owns_names) self.allocator.free(names);
 
         const cells = try self.allocator.alloc(query_iter.Cell, ncols);
         errdefer self.allocator.free(cells);
@@ -6229,7 +6239,7 @@ pub const QueryExecutor = struct {
                 done = i + 1;
             }
         }
-        return .{ .names = names, .cells = cells };
+        return .{ .names = names, .cells = cells, .owns_names = owns_names };
     }
 
     /// Decode one column from the raw row into a typed [`query_iter.Cell`] without
@@ -6359,13 +6369,23 @@ pub const QueryExecutor = struct {
     /// column absent from the map becomes a NULL cell.
     fn tableRowFromCellMap(self: *QueryExecutor, table: Table, map: *const CatalogCellMap) !query_iter.TableRow {
         const ncols = if (self.scan_needed_cols) |need| need.len else table.columns.len;
-        const names = try self.allocator.alloc([]const u8, ncols);
-        errdefer self.allocator.free(names);
-        if (self.scan_needed_cols) |need| {
-            for (need, 0..) |cn, i| names[i] = cn;
-        } else {
-            for (table.columns, 0..) |col, i| names[i] = col.name;
-        }
+        // When projection pushdown is active, `scan_needed_cols` already holds
+        // exactly this row's column names and stays stable for the whole scan, so
+        // BORROW it as `names` (owns_names=false) rather than allocating and copying
+        // an identical array per row. Retaining callers clone the row first and the
+        // clone owns its duplicated names. On the SELECT * path there is no such
+        // stable array, so allocate and own it as before.
+        var owns_names = true;
+        const names = blk: {
+            if (self.scan_needed_cols) |need| {
+                owns_names = false;
+                break :blk need;
+            }
+            const n = try self.allocator.alloc([]const u8, ncols);
+            for (table.columns, 0..) |col, i| n[i] = col.name;
+            break :blk n;
+        };
+        errdefer if (owns_names) self.allocator.free(names);
         const cells = try self.allocator.alloc(query_iter.Cell, ncols);
         errdefer self.allocator.free(cells);
         var done: usize = 0;
@@ -6383,7 +6403,7 @@ pub const QueryExecutor = struct {
             };
             done = i + 1;
         }
-        return .{ .names = names, .cells = cells };
+        return .{ .names = names, .cells = cells, .owns_names = owns_names };
     }
 
     fn buildCatalogRows(self: *QueryExecutor, table_meta: Table, table_name: []const u8) ![]query_iter.TableRow {
@@ -6525,13 +6545,23 @@ pub const QueryExecutor = struct {
     /// key or JSON null becomes a NULL cell. `names` are borrowed schema slices.
     fn tableRowFromObject(self: *QueryExecutor, table: Table, obj: std.json.Value) !query_iter.TableRow {
         const ncols = if (self.scan_needed_cols) |need| need.len else table.columns.len;
-        const names = try self.allocator.alloc([]const u8, ncols);
-        errdefer self.allocator.free(names);
-        if (self.scan_needed_cols) |need| {
-            for (need, 0..) |cn, i| names[i] = cn;
-        } else {
-            for (table.columns, 0..) |col, i| names[i] = col.name;
-        }
+        // When projection pushdown is active, `scan_needed_cols` already holds
+        // exactly this row's column names and stays stable for the whole scan, so
+        // BORROW it as `names` (owns_names=false) rather than allocating and copying
+        // an identical array per row. Retaining callers clone the row first and the
+        // clone owns its duplicated names. On the SELECT * path there is no such
+        // stable array, so allocate and own it as before.
+        var owns_names = true;
+        const names = blk: {
+            if (self.scan_needed_cols) |need| {
+                owns_names = false;
+                break :blk need;
+            }
+            const n = try self.allocator.alloc([]const u8, ncols);
+            for (table.columns, 0..) |col, i| n[i] = col.name;
+            break :blk n;
+        };
+        errdefer if (owns_names) self.allocator.free(names);
         const cells = try self.allocator.alloc(query_iter.Cell, ncols);
         errdefer self.allocator.free(cells);
         var done: usize = 0;
@@ -6554,7 +6584,7 @@ pub const QueryExecutor = struct {
             };
             done = i + 1;
         }
-        return .{ .names = names, .cells = cells };
+        return .{ .names = names, .cells = cells, .owns_names = owns_names };
     }
 
     /// Reads `col_name` from the raw row as an `f64` for a numeric comparison, or

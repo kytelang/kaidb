@@ -238,6 +238,17 @@ pub const TableRow = struct {
     names: []const []const u8,
     cells: []const Cell,
     is_null: bool = false,
+    /// Whether this row owns its `names` backing array. Normally true: the row
+    /// builder allocates a fresh array and `freeTableRow` releases it. The scan
+    /// hot path sets it false when `names` BORROWS the executor's stable
+    /// projection-pushdown column set (`scan_needed_cols`), which already holds
+    /// exactly these names for the life of the scan, so re-allocating and copying
+    /// it per row is pure waste. A borrowed-names row is only ever consumed
+    /// transiently (folded into an aggregate, or streamed out) before the scan
+    /// advances; any path that RETAINS a row clones it first (`cloneTableRow`),
+    /// and a clone always owns its duplicated names. The name byte-slices inside
+    /// the array are schema-stable and never owned either way.
+    owns_names: bool = true,
 
     pub const null_row: TableRow = .{ .names = &.{}, .cells = &.{}, .is_null = true };
 
@@ -282,7 +293,7 @@ pub fn freeTableRow(a: std.mem.Allocator, tr: TableRow) void {
         else => {},
     };
     if (tr.cells.len > 0) a.free(tr.cells);
-    if (tr.names.len > 0) a.free(tr.names);
+    if (tr.owns_names and tr.names.len > 0) a.free(tr.names);
 }
 
 /// Deep-copies a [`TableRow`] so it can outlive the producer's page latch (used
