@@ -2,25 +2,28 @@
 
 ## What this is (and what it is NOT)
 
-**NovaDB** is an embedded **B+Tree storage engine with SQL and document surfaces**, written in **Zig**.
-Its intended, supported role is the **control-plane / config store for the Nova orchestrator**
-(`packages/nova-orchestrator`): small, bounded, low-churn data such as workload specs, leader leases,
-membership and manifests, reached over the binary wire protocol. In that role it is solid and verified
-(the orchestrator's live store/lease/reconcile tests pass against it, and it recovers correctly across a
-restart).
+**NovaDB (kaidb)** is a standalone **B+Tree storage engine with SQL and document surfaces**, written in
+**Zig**, reached over a binary wire protocol. It is benchmarked head-to-head against PostgreSQL and MySQL
+on the Q1..Q18 "orders" workload (see `benchmark/query-perf-compare/`).
 
-**It is NOT a general-purpose OLTP or document database at scale.** A 2026-08-30 benchmark (a MongoDB
+**It is NOT the Nova orchestrator's store.** The orchestrator's control-plane / config state is served by
+the internal blob-store (artifactd), not kaidb. Ignore any older text that frames kaidb's role as the
+"orchestrator control-plane / config store"; that is out of date.
+
+**It is also NOT a general-purpose OLTP or document database at scale.** A 2026-08-30 benchmark (a MongoDB
 `mongodb-perf-compare` port, 10M orders) made the limits concrete: the data footprint is bloated
 (~3x the logical size), the buffer pool and scan/read paths are not I/O-efficient once the working set
-exceeds the pool, index builds re-scan per index, and the planner scans where it should seek. Those are
-real "designed for in-RAM, small data" gaps, and closing them is a large systems project, not a patch.
-Treat NovaDB as the orchestrator's embedded store; do not size a general workload onto it. See
-`orders_benchmark.md` and `benchmark_report.md` for the honest numbers.
+exceeds the pool, index builds re-scan per index, and the planner scans where it should seek. Some of the
+per-query planner gaps have since been closed on the `perf/q12-pk-range-scan` branch (clustered PK range,
+GROUP BY + HAVING, deep OFFSET; see `benchmark/query-perf-compare/comparison.md` and `KNOWN-ISSUES.md`),
+but the broad "designed for in-RAM, small data" limits at 10M scale remain. Do not size a general workload
+onto it. See `orders_benchmark.md`, `benchmark_report.md` and `KNOWN-ISSUES.md` for the honest numbers and
+the open register.
 
-Recovery correctness for the store's own use was fixed on 2026-08-30 (bounded WAL via runtime
-checkpointing; committed-transaction set persisted at checkpoint and restored on open; collection B+Tree
-root persisted on split so a collection is fully reachable after restart). It is the storage engine behind
-the **Nova** language ecosystem (a *separate* project — Nova connects over the binary wire protocol).
+Recovery correctness was fixed on 2026-08-30 (bounded WAL via runtime checkpointing; committed-transaction
+set persisted at checkpoint and restored on open; collection B+Tree root persisted on split so a collection
+is fully reachable after restart). It is a *separate* project from the **Nova/kyte** language ecosystem,
+which connects to it over the binary wire protocol.
 
 Core systems:
 - **Slotted-page B+Tree** — variable-length records (cells) in two-way-growth pages (slot directory grows
