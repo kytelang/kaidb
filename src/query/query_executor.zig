@@ -2122,6 +2122,192 @@ pub const QueryExecutor = struct {
     /// this is the sole in-flight transaction (so the endpoint reflects a stable
     /// committed state). Returns null (fall back to the scanning aggregate)
     /// otherwise.
+    /// Numeric value of an integer/float literal expression, else null.
+    fn litValF64(e: *const ast.Expr) ?f64 {
+        return switch (e.*) {
+            .literal_int => |i| @floatFromInt(i),
+            .literal_float => |f| f,
+            else => null,
+        };
+    }
+
+    fn isColRefNamed(e: *const ast.Expr, col: []const u8) bool {
+        return e.* == .column_ref and std.mem.eql(u8, e.column_ref, col);
+    }
+
+    /// True when `e` is a conjunction (AND-tree) of plain range/equality
+    /// comparisons on `col` alone (`col BETWEEN a AND b`, `col < k`, `col = k`,
+    /// etc.), referencing no other column and no `<>`/OR/NOT/IN/LIKE/function. When
+    /// this holds, the predicate is entirely decidable from `col`'s value, so an
+    /// aggregate over `col` filtered by it can be answered from the index alone.
+    fn whereIsPlainRangeOn(e: *const ast.Expr, col: []const u8) bool {
+        switch (e.*) {
+            .between => |b| return !b.negated and isColRefNamed(b.operand, col) and
+                litValF64(b.lo) != null and litValF64(b.hi) != null,
+            .binary_op => |b| switch (b.op) {
+                .AND => return whereIsPlainRangeOn(b.left, col) and whereIsPlainRangeOn(b.right, col),
+                .EQ, .LT, .LTE, .GT, .GTE => return (isColRefNamed(b.left, col) and litValF64(b.right) != null) or
+                    (litValF64(b.left) != null and isColRefNamed(b.right, col)),
+                else => return false,
+            },
+            else => return false,
+        }
+    }
+
+    /// Evaluate a `whereIsPlainRangeOn(col)` predicate against a single numeric
+    /// value `v` of `col`. Precise (handles inclusive/exclusive bounds), so the
+    /// index-only scan can filter each decoded value exactly.
+    fn evalRangeOnValue(e: *const ast.Expr, col: []const u8, v: f64) bool {
+        switch (e.*) {
+            .between => |b| {
+                const lo = litValF64(b.lo) orelse return false;
+                const hi = litValF64(b.hi) orelse return false;
+                return v >= lo and v <= hi;
+            },
+            .binary_op => |b| {
+                if (b.op == .AND) return evalRangeOnValue(b.left, col, v) and evalRangeOnValue(b.right, col, v);
+                // Normalise to `v OP lit` (flip when the literal is on the left).
+                var op = b.op;
+                var lit: f64 = undefined;
+                if (isColRefNamed(b.left, col)) {
+                    lit = litValF64(b.right) orelse return false;
+                } else {
+                    lit = litValF64(b.left) orelse return false;
+                    op = switch (b.op) { .LT => .GT, .GT => .LT, .LTE => .GTE, .GTE => .LTE, else => b.op };
+                }
+                return switch (op) {
+                    .EQ => v == lit,
+                    .LT => v < lit,
+                    .LTE => v <= lit,
+                    .GT => v > lit,
+                    .GTE => v >= lit,
+                    else => false,
+                };
+            },
+            else => return false,
+        }
+    }
+
+    /// Index-only scalar aggregate: `SELECT agg(col), ... FROM t WHERE <range on col>`
+    /// with no GROUP BY / join / DISTINCT / HAVING, where every aggregate is over the
+    /// SAME column `col`, `col` leads a fixed-width index, and the WHERE is a plain
+    /// range/equality on `col` only. The aggregated value sits in the index key, so
+    /// the whole query is answered by an index-only range scan with NO base-row
+    /// fetch. This is PostgreSQL's index-only aggregate; it closes a large gap on
+    /// `SELECT avg(total_due) WHERE total_due BETWEEN ...` (measured ~197x on a
+    /// disk-bound VM: the base-row descents dominated an otherwise index-answerable
+    /// query). Aggregates needing a non-indexed column still fall through to the scan.
+    fn tryIndexOnlyScalarAgg(self: *QueryExecutor, sel: ast.SelectStmt) !?QueryResponse {
+        if (sel.joins.len != 0 or sel.group_by != null or sel.distinct or sel.having_expr != null) return null;
+        if (sel.projections.len == 0 or sel.limit != null or sel.offset != null) return null;
+        if (self.db.txn_manager.activeTxnCount(self.db.pool.pager.io) != 1) return null;
+        const we = sel.where_expr orelse return null;
+
+        // Every projection must be a non-distinct aggregate over the same column
+        // `col` (COUNT(*) is allowed alongside). Require at least one column
+        // aggregate; pure COUNT(*) is already served by `tryIndexOnlyCount`.
+        var vcol: ?[]const u8 = null;
+        for (sel.projections) |p| {
+            if (p.expr != .aggregate) return null;
+            const agg = p.expr.aggregate;
+            if (agg.distinct) return null;
+            switch (agg.argument) {
+                .star => {},
+                .column => |c| {
+                    if (vcol) |vc| {
+                        if (!std.mem.eql(u8, vc, c)) return null;
+                    } else vcol = c;
+                },
+                else => return null,
+            }
+        }
+        const col = vcol orelse return null;
+
+        const table_meta = for (self.db.catalog.tables.items) |t| {
+            if (std.mem.eql(u8, t.name, sel.table_name)) break t;
+        } else return null;
+        const ctype = colTypeByName(table_meta, col);
+        if (!isFixedWidthIndexEnc(ctype)) return null;
+        if (!whereIsPlainRangeOn(we, col)) return null;
+
+        const idx = for (self.db.catalog.indexes.items) |ix| {
+            if (ix.table_id == table_meta.id and ix.exact and ix.key_columns.len > 0 and
+                std.mem.eql(u8, ix.key_columns[0].name, col)) break ix;
+        } else return null;
+
+        const rb = (try self.getRangeForCol(we, col, ctype)) orelse return null;
+        defer self.allocator.free(rb.start_key);
+        defer if (rb.end_key) |e| self.allocator.free(e);
+
+        // Upper bound: index keys are `enc:pk`, and `enc_hi:pk` sorts AFTER the bare
+        // `enc_hi`, so extend the walk bound by the byte just above ':' (0x3b, ';')
+        // to include every entry whose encoded value equals `enc_hi`. The precise
+        // filter (`evalRangeOnValue`) then drops anything actually out of range.
+        var upper: ?[]u8 = null;
+        defer if (upper) |u| self.allocator.free(u);
+        if (rb.end_key) |e| {
+            const u = try self.allocator.alloc(u8, e.len + 1);
+            @memcpy(u[0..e.len], e);
+            u[e.len] = 0x3b;
+            upper = u;
+        }
+
+        const idx_tree = try self.db.getIndexTree(idx.name);
+        defer idx_tree.deinit();
+
+        var accs = try self.allocator.alloc(AggAcc, sel.projections.len);
+        defer self.allocator.free(accs);
+        for (accs) |*a| a.* = .{};
+
+        var it = try idx_tree.rangeScan(rb.start_key, if (upper) |u| @as([]const u8, u) else null);
+        defer it.deinit();
+        while (try it.next()) |cell| {
+            const c0 = std.mem.indexOfScalar(u8, cell.key, ':') orelse continue;
+            const v = decodeFixedEncF64(cell.key[0..c0], ctype) orelse continue;
+            if (!evalRangeOnValue(we, col, v)) continue;
+            for (sel.projections, 0..) |p, j| {
+                const agg = p.expr.aggregate;
+                const acc = &accs[j];
+                if (agg.kind == .COUNT) {
+                    acc.count += 1; // COUNT(*) and COUNT(col): col is the non-null indexed value
+                } else {
+                    acc.saw_value = true;
+                    acc.sum += v;
+                    acc.num_seen += 1;
+                    if (v != @trunc(v)) acc.all_int = false;
+                    if (!acc.have_num) {
+                        acc.min_num = v;
+                        acc.max_num = v;
+                        acc.have_num = true;
+                    } else {
+                        if (v < acc.min_num) acc.min_num = v;
+                        if (v > acc.max_num) acc.max_num = v;
+                    }
+                }
+            }
+        }
+
+        var columns = try self.allocator.alloc([]const u8, sel.projections.len);
+        var col_types = try self.allocator.alloc(ColumnType, sel.projections.len);
+        var cells = try self.allocator.alloc([]const u8, sel.projections.len);
+        for (sel.projections, 0..) |p, i| {
+            const agg = p.expr.aggregate;
+            columns[i] = try self.allocator.dupe(u8, p.alias orelse switch (agg.kind) {
+                .COUNT => "COUNT",
+                .SUM => "SUM",
+                .AVG => "AVG",
+                .MIN => "MIN",
+                .MAX => "MAX",
+            });
+            col_types[i] = self.projectionType(sel, p);
+            cells[i] = try self.formatAggregate(agg, accs[i]);
+        }
+        var rows = try self.allocator.alloc([]const []const u8, 1);
+        rows[0] = cells;
+        self.index_only_counts += 1;
+        return QueryResponse{ .columns = columns, .column_types = col_types, .rows = rows, .rows_affected = 0 };
+    }
+
     fn tryIndexMinMax(self: *QueryExecutor, sel: ast.SelectStmt) !?QueryResponse {
         if (sel.joins.len != 0 or sel.group_by != null or sel.having_expr != null or sel.distinct) return null;
         if (sel.where_expr != null or sel.projections.len == 0) return null;
@@ -3964,6 +4150,10 @@ pub const QueryExecutor = struct {
                 if (try self.tryLooseDistinct(sel)) |resp| return resp;
                 // GROUP BY g, AGG(v) answered index-only from a covering (g,v) index.
                 if (try self.tryIndexGroupAgg(sel)) |resp| return resp;
+                // Scalar AGG(col) WHERE <range on col> answered index-only (col is in
+                // the index key), no base-row descent. Closes the ~197x wide-range
+                // aggregate gap vs PostgreSQL measured on the disk-bound VM.
+                if (try self.tryIndexOnlyScalarAgg(sel)) |resp| return resp;
 
                 // Projection pushdown: for a simple single-table read, decode only
                 // the columns the plan actually reads. Saved/restored so nested or
