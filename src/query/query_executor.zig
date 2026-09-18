@@ -3202,6 +3202,29 @@ pub const QueryExecutor = struct {
                             else
                                 false;
                             range_scan.may_reorder = !served_asc;
+                            // MRR-style sort window: when the row order is free
+                            // (`may_reorder`), the iterator sorts each PK batch into
+                            // primary-key order so consecutive base-row fetches land on
+                            // the same clustered leaf and the leaf-reuse cursor hits.
+                            // That only pays off if the window is large enough for
+                            // sorted PKs to actually share leaves, so size it from the
+                            // LIMIT: an unbounded scan (aggregate / wide read) sorts a
+                            // large window; a tight LIMIT keeps the small default so it
+                            // never buffers/sorts far more PKs than it returns. Measured
+                            // on a disk-bound VM this took `avg(col) WHERE idxcol
+                            // BETWEEN ...` (secondary-index base fetch) from ~4.3 s toward
+                            // InnoDB's range, the clustered-engine reference.
+                            if (range_scan.may_reorder) {
+                                const MRR_WINDOW: usize = 262144;
+                                if (sel.offset == null) {
+                                    if (sel.limit) |lim| {
+                                        const want = @as(usize, lim) + 64;
+                                        if (want > range_scan.prefetch_batch) range_scan.prefetch_batch = @min(want, MRR_WINDOW);
+                                    } else {
+                                        range_scan.prefetch_batch = MRR_WINDOW;
+                                    }
+                                }
+                            }
                             // Push an OFFSET into the scan when it directly yields the
                             // final ORDER BY order (served_asc == this scan's ascending
                             // value order IS the requested order): the leading `offset`
