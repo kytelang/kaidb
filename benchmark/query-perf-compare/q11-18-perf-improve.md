@@ -55,8 +55,9 @@ Real targets: **Q12** (clustered PK range), the range-scan family **Q4/Q5/Q8/Q17
 All done fixes: 3-run stable, engine tests 119/120 (pre-existing mutual-TLS
 replication failure). GOTCHA (cost ~1h once): build the server
 `zig build -Doptimize=ReleaseFast` (plain `zig build` is Debug ~100x slower, a 1M
-load then looks like a hang), and start it on a FRESH `data/` dir (leaked-table
-bloat balloons `nova.db` to GBs). The `kaidb-cli` REPL infinite-loops on piped EOF.
+load then looks like a hang). DROP now reclaims pages (commit `1fc8ecb`), so the
+data dir no longer needs wiping between runs and `nova.db` stays flat. The
+`kaidb-cli` REPL infinite-loops on piped EOF.
 
 ## Fix 1 (highest impact, ~20x): Q12 clustered PK range = full scan -> seek + stop  [DONE]
 
