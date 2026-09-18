@@ -263,7 +263,14 @@ pub const Pager = struct {
         const len: usize = @intCast((last - first + 1) * PAGE_SIZE);
         switch (builtin.os.tag) {
             .linux => {
-                _ = std.os.linux.readahead(fd, off, len);
+                // `readahead(2)` is not exposed as a named wrapper in this Zig std,
+                // so issue the raw syscall: readahead(int fd, off64_t off, size_t len).
+                _ = std.os.linux.syscall3(
+                    .readahead,
+                    @as(usize, @intCast(fd)),
+                    @as(usize, @bitCast(off)),
+                    len,
+                );
             },
             .macos, .ios, .tvos, .watchos, .visionos => {
                 var ra = radvisory{ .ra_offset = off, .ra_count = @intCast(len) };
