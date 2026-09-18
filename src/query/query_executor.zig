@@ -1779,6 +1779,89 @@ pub const QueryExecutor = struct {
     /// before falling back to any table in the catalog with that column name.
     /// Returns null when unknown, in which case [`projectionType`] defaults to
     /// `TEXT`.
+    /// Strips a leading `qual.` from `name` when `qual` matches the table name or
+    /// its alias (case-insensitive), e.g. `a.id` -> `id` given alias `a`. Returns a
+    /// subslice of `name` (no allocation); unqualified or non-matching names are
+    /// returned unchanged, so `id` stays `id` and a stray `x.id` is left for the
+    /// normal (null -> NULL) resolution rather than silently rebound.
+    fn stripMatchingQualifier(name: []const u8, table: []const u8, alias: ?[]const u8) []const u8 {
+        const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return name;
+        const qual = name[0..dot];
+        if (std.ascii.eqlIgnoreCase(qual, table)) return name[dot + 1 ..];
+        if (alias) |a| if (std.ascii.eqlIgnoreCase(qual, a)) return name[dot + 1 ..];
+        return name;
+    }
+
+    /// Recursively strips matching table qualifiers from every `column_ref` in an
+    /// expression tree (WHERE/HAVING). Does not descend into subqueries: those have
+    /// their own FROM scope and are normalised when executed in their own right.
+    fn stripExprQualifiers(e: *ast.Expr, table: []const u8, alias: ?[]const u8) void {
+        switch (e.*) {
+            .column_ref => |c| e.* = .{ .column_ref = stripMatchingQualifier(c, table, alias) },
+            .binary_op => |b| {
+                stripExprQualifiers(b.left, table, alias);
+                stripExprQualifiers(b.right, table, alias);
+            },
+            .unary_not => |u| stripExprQualifiers(u, table, alias),
+            .is_null => |n| stripExprQualifiers(n.operand, table, alias),
+            .in_list => |il| {
+                stripExprQualifiers(il.operand, table, alias);
+                for (il.items) |it| stripExprQualifiers(it, table, alias);
+            },
+            .like => |l| {
+                stripExprQualifiers(l.operand, table, alias);
+                stripExprQualifiers(l.pattern, table, alias);
+            },
+            .between => |bt| {
+                stripExprQualifiers(bt.operand, table, alias);
+                stripExprQualifiers(bt.lo, table, alias);
+                stripExprQualifiers(bt.hi, table, alias);
+            },
+            .func_call => |f| for (f.args) |arg| stripExprQualifiers(arg, table, alias),
+            .case_expr => |ce| {
+                for (ce.whens) |w| {
+                    stripExprQualifiers(w.cond, table, alias);
+                    stripExprQualifiers(w.result, table, alias);
+                }
+                if (ce.else_result) |er| stripExprQualifiers(er, table, alias);
+            },
+            .in_subquery => |isq| stripExprQualifiers(isq.operand, table, alias),
+            else => {}, // literals, placeholder, subquery
+        }
+    }
+
+    /// Single-table qualifier normalisation (see the call site). No-op when the
+    /// query has joins; otherwise strips a `table.`/`alias.` prefix from every
+    /// column reference in the projections, WHERE, HAVING and ORDER BY so they
+    /// resolve against the row's bare column names.
+    fn normalizeSingleTableQualifiers(sel: ast.SelectStmt) void {
+        if (sel.joins.len != 0) return;
+        const t = sel.table_name;
+        const a = sel.table_alias;
+        for (sel.projections) |*p| {
+            switch (p.expr) {
+                .column => |c| p.expr = .{ .column = stripMatchingQualifier(c, t, a) },
+                .aggregate => |agg| switch (agg.argument) {
+                    .column => |c| {
+                        var na = agg;
+                        na.argument = .{ .column = stripMatchingQualifier(c, t, a) };
+                        p.expr = .{ .aggregate = na };
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+        }
+        if (sel.where_expr) |w| stripExprQualifiers(w, t, a);
+        if (sel.having_expr) |h| stripExprQualifiers(h, t, a);
+        if (sel.order_by) |obs| {
+            for (@constCast(obs)) |*o| o.column = stripMatchingQualifier(o.column, t, a);
+        }
+        if (sel.group_by) |gbs| {
+            for (@constCast(gbs)) |*g| g.* = stripMatchingQualifier(g.*, t, a);
+        }
+    }
+
     fn lookupColumnType(self: *QueryExecutor, sel: ast.SelectStmt, col_name: []const u8) ?ColumnType {
         const bare = if (std.mem.lastIndexOfScalar(u8, col_name, '.')) |dot| col_name[dot + 1 ..] else col_name;
         for (self.db.catalog.tables.items) |tbl| {
@@ -3753,6 +3836,14 @@ pub const QueryExecutor = struct {
                 var sel = sel_in;
                 sel.where_expr = try self.materializeSubqueries(sel_in.where_expr, sq_arena.allocator());
                 sel.having_expr = try self.materializeSubqueries(sel_in.having_expr, sq_arena.allocator());
+                // Strip a leading table qualifier that matches the driving table's
+                // name or its alias from every column reference, so `SELECT a.id
+                // FROM t a WHERE a.v = 25` resolves `a.id`/`a.v` to the bare `id`/`v`
+                // the row is keyed by (otherwise the value/WHERE paths match the full
+                // `a.id` against bare field names and yield NULL / drop the predicate).
+                // Gated to single-table selects; join-side qualifier resolution across
+                // a combined row is a separate path and is left untouched.
+                normalizeSingleTableQualifiers(sel);
 
                 // Index-only COUNT(*): answer from the index without scanning base
                 // rows when sound (see tryIndexOnlyCount). Falls through otherwise.

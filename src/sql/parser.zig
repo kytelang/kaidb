@@ -185,6 +185,23 @@ pub const Parser = struct {
         return self.source[tok.start..(tok.start + tok.len)];
     }
 
+    /// Consumes an optional table alias after a `FROM`/`JOIN` table reference:
+    /// `AS name` or the bare `name`. Every clause keyword (WHERE, JOIN, ON, ...)
+    /// has its own token type, so a bare `IDENTIFIER` in this position is
+    /// unambiguously an alias. Returns `null` when no alias is present.
+    fn parseOptionalAlias(self: *Parser) !?[]const u8 {
+        if (self.current().type == .AS) {
+            self.eat();
+            return self.sliceText(try self.expect(.IDENTIFIER));
+        }
+        if (self.current().type == .IDENTIFIER) {
+            const tok = self.current();
+            self.eat();
+            return self.sliceText(tok);
+        }
+        return null;
+    }
+
     /// Parses a full expression, the lowest-precedence entry point (`OR`).
     ///
     /// Top of the precedence cascade: parses an `AND`-expression, then folds any
@@ -756,6 +773,12 @@ pub const Parser = struct {
             const suffix = self.sliceText(suffix_tok);
             table_name = try std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{table_name, suffix});
         }
+        // Optional table alias: `FROM t AS a` or the bare `FROM t a`. Without this
+        // the alias token was left unconsumed and everything after it (a WHERE, a
+        // GROUP BY, ...) was silently dropped, so aliased single-table queries ran
+        // with no filter. Keywords have their own token types, so a bare IDENTIFIER
+        // here is unambiguously an alias.
+        const table_alias = try self.parseOptionalAlias();
 
         var joins = std.ArrayList(ast.JoinExpr).empty;
         while (true) {
@@ -788,11 +811,15 @@ pub const Parser = struct {
             if (join_type) |jt| {
                 const right_tok = try self.expect(.IDENTIFIER);
                 const right_table = self.sliceText(right_tok);
+                // Optional alias before ON (`JOIN orders o ON ...`); previously an
+                // alias here made the mandatory `expect(.ON)` fail with a parse error.
+                const right_alias = try self.parseOptionalAlias();
                 _ = try self.expect(.ON);
                 const on_expr = try self.parseExpr();
                 try joins.append(self.arena.allocator(), .{
                     .join_type = jt,
                     .right_table = right_table,
+                    .right_alias = right_alias,
                     .on_expr = on_expr,
                 });
             } else {
@@ -839,6 +866,15 @@ pub const Parser = struct {
             var order_cols = std.ArrayList(ast.OrderKey).empty;
             while (true) {
                 const col_tok = try self.expect(.IDENTIFIER);
+                // Allow a qualified `alias.col` / `table.col`; without this the `.col`
+                // suffix (and any following ASC/DESC) was dropped, so an aliased
+                // ORDER BY silently degraded to natural order.
+                var col_name = self.sliceText(col_tok);
+                if (self.current().type == .DOT) {
+                    self.eat();
+                    const suffix_tok = try self.expect(.IDENTIFIER);
+                    col_name = try std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ col_name, self.sliceText(suffix_tok) });
+                }
                 var desc = false;
                 if (self.current().type == .IDENTIFIER) {
                     const dir = self.sliceText(self.current());
@@ -849,7 +885,7 @@ pub const Parser = struct {
                         self.eat();
                     }
                 }
-                try order_cols.append(self.arena.allocator(), .{ .column = self.sliceText(col_tok), .desc = desc });
+                try order_cols.append(self.arena.allocator(), .{ .column = col_name, .desc = desc });
                 if (self.current().type != .COMMA) break;
                 self.eat();
             }
@@ -871,6 +907,7 @@ pub const Parser = struct {
 
         return .{ .select = ast.SelectStmt{
             .table_name = table_name,
+            .table_alias = table_alias,
             .joins = try joins.toOwnedSlice(self.arena.allocator()),
             .projections = try projections.toOwnedSlice(self.arena.allocator()),
             .where_expr = where_expr,

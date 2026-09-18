@@ -533,6 +533,11 @@ pub const JoinExpr = struct {
     join_type: JoinType,
     /// The table being joined in on the right side.
     right_table: []const u8,
+    /// The optional `[AS] alias` for the right table (e.g. `JOIN orders o`), or
+    /// `null`. Captured so a qualified reference like `o.total` can be resolved;
+    /// the executor's single-table normalisation currently uses only the base
+    /// table's alias, so join-side alias resolution remains a follow-up.
+    right_alias: ?[]const u8 = null,
     /// The `ON` predicate relating the two sides.
     on_expr: *Expr,
 };
@@ -555,6 +560,10 @@ pub const OrderKey = struct {
 pub const SelectStmt = struct {
     /// The driving table in the `FROM` clause.
     table_name: []const u8,
+    /// The optional `[AS] alias` on the driving table (e.g. `FROM orders o`), or
+    /// `null`. When present, a qualifier matching it (or `table_name`) on a column
+    /// reference is stripped by the executor's single-table normalisation.
+    table_alias: ?[]const u8 = null,
     /// Zero or more `JOIN` clauses applied left-to-right; empty by default. See
     /// [`JoinExpr`].
     joins: []JoinExpr = &.{},

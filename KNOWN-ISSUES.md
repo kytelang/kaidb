@@ -136,14 +136,20 @@ remains:
 
 ## Correctness / robustness found by the on-hardware soak (2026-09-18, see `soak-report.md`)
 
-12. **Table aliases are broken (SQL correctness, HIGH).** `SELECT a.id FROM t a` projects
-    NULL, and `WHERE a.v = 25` is silently not applied (returns unfiltered rows). Unqualified
-    columns work, so the Q1..Q18 benchmark (all unqualified) never caught it. Root cause:
-    `lookupColumnType` (`query_executor.zig:1783`) strips the `alias.`/`table.` qualifier for
-    the result type, but the value-extraction and WHERE-eval paths match the full `a.id`
-    string against the row's bare field names. Single-table is an unambiguous strip; a correct
-    fix must also bind aliases to tables for joins. Fix before presenting the SQL surface as
-    general-purpose.
+12. **Table aliases (single-table): FIXED.** `SELECT a.id FROM t a WHERE a.v = 25` used to
+    project NULL and silently drop the filter. Two root causes, both fixed: (a) the parser
+    never consumed the table alias (`FROM t a`) or a dotted `ORDER BY a.id`, so the alias
+    token and everything after it (the WHERE, the sort direction) were dropped as trailing
+    tokens; the parser now captures `[AS] alias` on the FROM table and each JOIN table
+    (`SelectStmt.table_alias`, `JoinExpr.right_alias`) and parses dotted ORDER BY columns.
+    (b) the executor matched the full `a.id` against the row's bare field names; a
+    single-table normalisation pass (`normalizeSingleTableQualifiers`) now strips a
+    `table.`/`alias.` prefix that matches the driving table from projections, WHERE, HAVING,
+    ORDER BY and GROUP BY. Verified: projection, WHERE, `AS`, aggregate arg, ORDER BY DESC,
+    GROUP BY all resolve; unqualified queries unchanged; a stray non-matching qualifier stays
+    NULL (not rebound). **Remaining:** join-side alias resolution across a combined row
+    (`a.id` vs `b.id`) is still a follow-up — the normalisation is gated to `joins.len == 0`,
+    and `right_alias` is captured but not yet used by the join executor.
 
 13. **Server crashes on disk-full instead of degrading gracefully (availability, not safety).**
     On ENOSPC a foreground write and the bgwriter hit `error.NoSpaceLeft` and the process
