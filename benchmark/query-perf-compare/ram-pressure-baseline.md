@@ -49,3 +49,38 @@ The >RAM penalty has two parts:
 **Conclusion:** on this hardware the dominant, measurable cost is fetch amplification, so
 **lever 4 is the higher-impact next implementation**; lever 1 remains the right lever for
 a true disk-bound deployment and should be validated on a >RAM rig.
+
+## Lever-4 investigation (2026-09-18): root cause pinned, fix blocked on a disk rig
+
+Instrumented the leaf-reuse cursor to decompose the ~48k fetches of one 10k-row range
+scan (64 MiB pool):
+- **Serve pass is already minimal.** The `LeafReuseSearcher` did 2,775 re-descends +
+  7,225 reuse hits (72% reuse) for 10k rows => ~8k base fetches. Working as intended.
+- **The amplification is the redundant PREFETCH descent.** `collectLeafPageIds` does a
+  fresh root-to-leaf descent PER PK (~10k) just to compute OS-readahead hints, on top of
+  the serve descent. `shouldPrefetch` fires whenever the pool hit ratio dips below 98%,
+  which a scattered secondary-index range scan trips even on a warm-ish pool. Those ~10k
+  redundant descents (each ~3 internal-node touches) are the bulk of the ~48k fetches.
+
+**Attempted fix (reverted):** make `collectLeafPageIds` reuse the leaf across the sorted
+batch (descend once per distinct leaf). Result at a 20k batch: fetch COUNT halved
+(48k -> 25k) but wall time DOUBLED (70 -> 132 ms), because reading each leaf page to learn
+its key range costs more than the internal-node-only descent it replaces, and most of the
+"saved" fetches were already cheap cached internal-node hits. Net-negative, reverted.
+
+**The real blocker.** On this box the OS page cache holds the whole ~1 GB file, so a pool
+miss is an OS-cache memcpy (microseconds), not a disk seek. The prefetch's entire purpose
+is to overlap real disk-seek latency, which is invisible here, so the small-pool test only
+exposes the prefetch's CPU overhead, not its I/O benefit. Any change that trims prefetch
+overhead helps THIS box but could hurt a genuinely disk-bound deployment, and vice versa.
+**Optimising the >RAM miss path correctly requires a true disk-bound rig** (a dataset
+larger than RAM on the target box, a RAM-constrained VM, or dropping the OS cache per
+query), so the fix is measured against real disk behaviour instead of OS-cache artefacts.
+
+**Candidate fixes to measure on such a rig, in order:**
+1. Parent-reuse in `collectLeafPageIds` (cache the last internal node and re-pick the
+   child; no leaf read) so the redundant descent costs ~1 internal touch, not ~3.
+2. Piggyback prefetch on the serve cursor (issue readahead for the next sorted PKs' leaves
+   as the `LeafReuseSearcher` advances) so there is no separate descent at all.
+3. A better prefetch gate (trigger on genuine eviction/thrash, not a raw hit-ratio
+   threshold) so the redundant work only runs when real disk I/O is being overlapped.
