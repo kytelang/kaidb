@@ -33,10 +33,21 @@ remains:
    and streams + breaks at LIMIT. Their remaining cost is per-row decode /
    materialisation, i.e. the same as item 1/4, not a missing backward scan.
 
-3. **OFFSET pushdown is only half-wired.** The Q18 fix pushes the offset into the
-   *composite* ordered index scan only. **Single-column ordered range scans still
-   buffer-and-discard** on a deep OFFSET - the same `skip_remaining` /
-   `scan_offset_pushed` mechanism needs wiring at that planner site too.
+3. **OFFSET pushdown on single-column ordered scans: WIRED (verified-skip).** The
+   single-column ascending range scan (`query_executor.zig` ~2830) now pushes the OFFSET
+   into the scan via `skip_remaining` + `scan_offset_pushed`, but only when the scan
+   directly yields the requested order (`served_asc`). The skipped rows are counted past
+   with a per-row visibility + residual check (`rowQualifies`, no JSON build /
+   materialise), so a deep OFFSET no longer builds and discards every skipped row.
+   Validated against an over-selecting residual (`v <> k`): the excluded row is correctly
+   *not* counted toward the offset. The **fetch-free** variant (`skip_no_fetch`, which
+   also avoids the base-row fetch, as on the composite Q18 path) is deliberately still
+   gated off here: unlike the composite site, this range can over-select and
+   `residual_expr` always carries the full WHERE, so a fetch-free skip would need a
+   single-column analogue of `whereCapturedByCompositeKey` to prove every in-range entry
+   qualifies. That check is the remaining work; no Q1..Q18 query exercises the fetch-free
+   single-column deep-OFFSET shape (Q18 is composite), so it is unmeasured and low
+   priority.
 
 4. **Per-row allocation reuse (was "Fix 5", not started).** Every emitted row
    allocates two arrays plus a dup per text cell and frees the prior row - a real cost
@@ -66,10 +77,17 @@ remains:
    durable, clean recovery), the free-page-list unit test passes, and a 300-row load
    spanning several bgwriter ticks shows no deadlock from the tick now taking `rw_lock`.
 
-6. **Undo (MVCC version) pages are not reclaimed by DROP.** `freeTreePages` walks the
-   base and secondary-index trees; undo-log pages holding prior row versions are a
-   separate reclamation path. Harmless for a load-once workload, but real for
-   update / delete-heavy churn.
+6. **Undo (MVCC version) pages and DROP: NOT a leak (earlier framing was wrong).**
+   Undo pages are a single *global append log* (`undo_log.undo_pages`), not per-table
+   trees, so there is nothing for `freeTreePages` to walk on a DROP. They are reclaimed
+   instead by `purgeStaleUndoPages` (called every bgwriter tick) on the MVCC visibility
+   watermark: a page is freed once its newest record's `xmin`/`xmax` is below the oldest
+   active transaction. A dropped table's undo records therefore age out exactly like any
+   other records, once no active transaction can still see them. The one real limitation
+   is that the purge is *prefix-only*: it frees the contiguous run of oldest reclaimable
+   pages and stops at the first page a live reader still needs (head-of-line blocking by
+   a long-running transaction). That is a pre-existing property of the append log, not a
+   DROP-specific gap, and it self-heals once the blocking transaction ends.
 
 7. **`kaidb-cli` REPL infinite-loop on piped/EOF stdin: FIXED.** The CLI was rewritten
    onto the pure binary wire protocol (`proto/protocol.zig`, no HTTP/JSON) with `-c`

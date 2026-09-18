@@ -2827,6 +2827,31 @@ pub const QueryExecutor = struct {
                             else
                                 false;
                             range_scan.may_reorder = !served_asc;
+                            // Push an OFFSET into the scan when it directly yields the
+                            // final ORDER BY order (served_asc == this scan's ascending
+                            // value order IS the requested order): the leading `offset`
+                            // rows are counted past with a per-row visibility+residual
+                            // check (rowQualifies, no JSON build/materialise) instead of
+                            // being built, buffered and discarded downstream. Mirrors the
+                            // composite ordered-scan site.
+                            //
+                            // The fetch-free variant (skip_no_fetch) is deliberately NOT
+                            // enabled here: unlike the composite site, this single-column
+                            // range can over-select (a residual like `col <> k` or `OR`
+                            // still on the same column is not expressed by the range
+                            // bounds), and `residual_expr` is always the full WHERE, so a
+                            // fetch-free skip would need a single-column analogue of
+                            // `whereCapturedByCompositeKey` to prove every in-range entry
+                            // qualifies. Until that check exists, the skip stays
+                            // verified-per-row (correct, avoids materialisation) rather
+                            // than fetch-free. No query in the Q1..Q18 suite exercises the
+                            // fetch-free single-column deep-OFFSET shape (Q18 is composite).
+                            if (served_asc) {
+                                if (sel.offset) |off| if (off > 0) {
+                                    range_scan.skip_remaining = off;
+                                    self.scan_offset_pushed = true;
+                                };
+                            }
                             base_iter = range_scan.iterator();
                         }
                         used_index = true;
