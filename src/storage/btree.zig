@@ -632,9 +632,20 @@ pub const BPlusTree = struct {
             }
         }
 
-        /// Owned value for `key`, or null if absent. Reuses the current leaf when
-        /// `key` is within its `[min,max]`; otherwise re-descends from the root.
-        pub fn get(self: *LeafReuseSearcher, key: []const u8, allocator: Allocator) !?[]const u8 {
+        /// A value read: `bytes` are the row image, `owned` says who frees them.
+        /// An inline value is BORROWED straight from the leaf page this cursor
+        /// still holds pinned + shared-latched (`owned = false`, no copy, no free);
+        /// an overflow value is reassembled into a fresh allocation (`owned =
+        /// true`). A borrowed slice is valid only until the next call that moves
+        /// this cursor's leaf (`getRef` / `get` / `releaseLeaf` / `deinit`), so the
+        /// caller must consume it before then.
+        pub const ValRef = struct { bytes: []const u8, owned: bool };
+
+        /// Resolve `key` to its value WITHOUT copying an inline value out of the
+        /// held leaf. See [`ValRef`] for the borrow contract. This removes the
+        /// per-row `dupe` + `free` that dominated the clustered base fetch when a
+        /// caller only reads the bytes and discards them within the same step.
+        pub fn getRef(self: *LeafReuseSearcher, key: []const u8, allocator: Allocator) !?ValRef {
             if (self.leaf) |f| {
                 const p = self.tree.pool.pageOf(f);
                 const n = p.headerPtr().num_cells;
@@ -651,9 +662,18 @@ pub const BPlusTree = struct {
             const cell = p.getCell(idx).?;
             if (cell.flags.value_overflow) {
                 const desc = overflow.OverflowDescriptor.decode(cell.value);
-                return try overflow.readChain(self.tree.pool, allocator, desc.first_page_id, desc.total_len);
+                return .{ .bytes = try overflow.readChain(self.tree.pool, allocator, desc.first_page_id, desc.total_len), .owned = true };
             }
-            return try allocator.dupe(u8, cell.value);
+            return .{ .bytes = cell.value, .owned = false };
+        }
+
+        /// Owned value for `key`, or null if absent. Delegates to [`getRef`] and
+        /// copies a borrowed inline value so the result is always caller-owned;
+        /// prefer [`getRef`] on the hot path when the bytes are consumed in place.
+        pub fn get(self: *LeafReuseSearcher, key: []const u8, allocator: Allocator) !?[]const u8 {
+            const r = (try self.getRef(key, allocator)) orelse return null;
+            if (r.owned) return r.bytes;
+            return try allocator.dupe(u8, r.bytes);
         }
     };
 

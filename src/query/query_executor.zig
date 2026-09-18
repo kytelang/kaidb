@@ -6739,12 +6739,22 @@ pub const QueryExecutor = struct {
         // Reuse the leaf cursor when one is active for THIS tree (equality index
         // scan, pk-ascending); otherwise a fresh root-to-leaf descent.
         if (self.qprof) self.qp_seek.start(self.db.pool.pager.io);
+        // Borrow the inline row image straight from the leaf-reuse cursor's held
+        // leaf (no per-row dupe/free) when one is active for THIS tree; the bytes
+        // stay valid through this call because the cursor keeps the leaf pinned
+        // until the next fetch. The fresh-descent fallback and overflow values
+        // return an owned copy, tracked by `val_owned`.
+        var val_owned = true;
         const val = blk: {
             if (self.base_searcher) |s| {
-                if (s.tree == table_tree) break :blk (try s.get(pk_val, self.allocator)) orelse {
-                    if (self.qprof) self.qp_seek.stop(self.db.pool.pager.io);
-                    return null;
-                };
+                if (s.tree == table_tree) {
+                    const r = (try s.getRef(pk_val, self.allocator)) orelse {
+                        if (self.qprof) self.qp_seek.stop(self.db.pool.pager.io);
+                        return null;
+                    };
+                    val_owned = r.owned;
+                    break :blk r.bytes;
+                }
             }
             break :blk (try table_tree.search(pk_val, self.allocator)) orelse {
                 if (self.qprof) self.qp_seek.stop(self.db.pool.pager.io);
@@ -6752,7 +6762,7 @@ pub const QueryExecutor = struct {
             };
         };
         if (self.qprof) self.qp_seek.stop(self.db.pool.pager.io);
-        defer self.allocator.free(val);
+        defer if (val_owned) self.allocator.free(val);
 
         if (val.len >= 36 and val[0] != '{') {
             const xmin = std.mem.readInt(u64, val[4..12], .little);
@@ -6785,13 +6795,18 @@ pub const QueryExecutor = struct {
     /// still fetches the stored value to check MVCC visibility and the residual,
     /// so it is a partial (not fetch-free) skip; the win is skipping buildRowJson.
     pub fn rowQualifies(self: *QueryExecutor, table: Table, table_tree: *BPlusTree, pk_val: []const u8, current_tx: u64, residual: ?*const ast.Expr, residual_cols: ?[]const []const u8) !bool {
+        var val_owned = true;
         const val = blk: {
             if (self.base_searcher) |s| {
-                if (s.tree == table_tree) break :blk (try s.get(pk_val, self.allocator)) orelse return false;
+                if (s.tree == table_tree) {
+                    const r = (try s.getRef(pk_val, self.allocator)) orelse return false;
+                    val_owned = r.owned;
+                    break :blk r.bytes;
+                }
             }
             break :blk (try table_tree.search(pk_val, self.allocator)) orelse return false;
         };
-        defer self.allocator.free(val);
+        defer if (val_owned) self.allocator.free(val);
 
         if (val.len >= 36 and val[0] != '{') {
             const xmin = std.mem.readInt(u64, val[4..12], .little);
