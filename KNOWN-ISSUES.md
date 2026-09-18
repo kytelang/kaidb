@@ -147,9 +147,13 @@ remains:
     `table.`/`alias.` prefix that matches the driving table from projections, WHERE, HAVING,
     ORDER BY and GROUP BY. Verified: projection, WHERE, `AS`, aggregate arg, ORDER BY DESC,
     GROUP BY all resolve; unqualified queries unchanged; a stray non-matching qualifier stays
-    NULL (not rebound). **Remaining:** join-side alias resolution across a combined row
-    (`a.id` vs `b.id`) is still a follow-up — the normalisation is gated to `joins.len == 0`,
-    and `right_alias` is captured but not yet used by the join executor.
+    NULL (not rebound). **Join-side aliases now also work** (`SELECT e.name, d.dname FROM emp e
+    JOIN dept d ON e.dept_id = d.id WHERE d.dname = 'eng'`): a second normalisation pass
+    (`normalizeJoinAliases`) maps each `alias.col` to its real `table.col` across projections,
+    ON, WHERE, HAVING, ORDER BY and GROUP BY, because the join executor resolves a combined row
+    by real table name (verified: real-name joins already worked, alias joins returned 0 rows).
+    Verified: aliased join, WHERE-on-alias in a join, real-name join (regression) and
+    single-table alias all correct; full `zig build test` passes.
 
 13. **Server crashes under sustained disk-full instead of degrading gracefully (availability,
     not safety) - scoped follow-up, deeper than first thought.** Investigated 2026-09-18 with

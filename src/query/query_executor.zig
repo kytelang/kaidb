@@ -1862,6 +1862,112 @@ pub const QueryExecutor = struct {
         }
     }
 
+    /// Rewrites an `alias.col` qualifier to `realtable.col` when `alias` is one of
+    /// this query's table aliases. The join executor resolves qualified columns in
+    /// a combined row by REAL table name (verified: `emp.name` works, `e.name` did
+    /// not), so for joins the qualifier must be preserved and mapped, not stripped.
+    /// Real table names and unqualified names pass through unchanged. Allocates the
+    /// rewritten name in `alloc`; on OOM it returns the original (which then simply
+    /// fails to resolve, i.e. the prior behaviour, never a crash).
+    fn rewriteAliasQualifier(alloc: Allocator, name: []const u8, aliases: []const ?[]const u8, tables: []const []const u8) []const u8 {
+        const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return name;
+        const qual = name[0..dot];
+        for (aliases, tables) |al, tbl| {
+            if (al) |a| {
+                if (std.ascii.eqlIgnoreCase(qual, a))
+                    return std.fmt.allocPrint(alloc, "{s}.{s}", .{ tbl, name[dot + 1 ..] }) catch name;
+            }
+        }
+        return name;
+    }
+
+    /// Recursively rewrites alias qualifiers in an expression tree (ON/WHERE/HAVING).
+    fn rewriteExprAliases(alloc: Allocator, e: *ast.Expr, aliases: []const ?[]const u8, tables: []const []const u8) void {
+        switch (e.*) {
+            .column_ref => |c| e.* = .{ .column_ref = rewriteAliasQualifier(alloc, c, aliases, tables) },
+            .binary_op => |b| {
+                rewriteExprAliases(alloc, b.left, aliases, tables);
+                rewriteExprAliases(alloc, b.right, aliases, tables);
+            },
+            .unary_not => |u| rewriteExprAliases(alloc, u, aliases, tables),
+            .is_null => |n| rewriteExprAliases(alloc, n.operand, aliases, tables),
+            .in_list => |il| {
+                rewriteExprAliases(alloc, il.operand, aliases, tables);
+                for (il.items) |it| rewriteExprAliases(alloc, it, aliases, tables);
+            },
+            .like => |l| {
+                rewriteExprAliases(alloc, l.operand, aliases, tables);
+                rewriteExprAliases(alloc, l.pattern, aliases, tables);
+            },
+            .between => |bt| {
+                rewriteExprAliases(alloc, bt.operand, aliases, tables);
+                rewriteExprAliases(alloc, bt.lo, aliases, tables);
+                rewriteExprAliases(alloc, bt.hi, aliases, tables);
+            },
+            .func_call => |f| for (f.args) |arg| rewriteExprAliases(alloc, arg, aliases, tables),
+            .case_expr => |ce| {
+                for (ce.whens) |w| {
+                    rewriteExprAliases(alloc, w.cond, aliases, tables);
+                    rewriteExprAliases(alloc, w.result, aliases, tables);
+                }
+                if (ce.else_result) |er| rewriteExprAliases(alloc, er, aliases, tables);
+            },
+            .in_subquery => |isq| rewriteExprAliases(alloc, isq.operand, aliases, tables),
+            else => {},
+        }
+    }
+
+    /// Join-query alias normalisation: maps `alias.col` to `realtable.col` across
+    /// projections, ON, WHERE, HAVING, ORDER BY and GROUP BY so aliased joins
+    /// resolve like their real-table-name equivalents. No-op for single-table
+    /// queries (handled by `normalizeSingleTableQualifiers`) and when no alias is
+    /// present. Bounded to 16 relations; extra joins simply keep prior behaviour.
+    fn normalizeJoinAliases(sel: ast.SelectStmt, alloc: Allocator) void {
+        if (sel.joins.len == 0) return;
+        var al_buf: [16]?[]const u8 = undefined;
+        var tb_buf: [16][]const u8 = undefined;
+        var n: usize = 0;
+        al_buf[n] = sel.table_alias;
+        tb_buf[n] = sel.table_name;
+        n += 1;
+        for (sel.joins) |j| {
+            if (n >= al_buf.len) break;
+            al_buf[n] = j.right_alias;
+            tb_buf[n] = j.right_table;
+            n += 1;
+        }
+        const aliases = al_buf[0..n];
+        const tables = tb_buf[0..n];
+        var any = false;
+        for (aliases) |a| {
+            if (a != null) any = true;
+        }
+        if (!any) return;
+        for (sel.projections) |*p| {
+            switch (p.expr) {
+                .column => |c| p.expr = .{ .column = rewriteAliasQualifier(alloc, c, aliases, tables) },
+                .aggregate => |agg| switch (agg.argument) {
+                    .column => |c| {
+                        var na = agg;
+                        na.argument = .{ .column = rewriteAliasQualifier(alloc, c, aliases, tables) };
+                        p.expr = .{ .aggregate = na };
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+        }
+        if (sel.where_expr) |w| rewriteExprAliases(alloc, w, aliases, tables);
+        if (sel.having_expr) |h| rewriteExprAliases(alloc, h, aliases, tables);
+        for (sel.joins) |j| rewriteExprAliases(alloc, j.on_expr, aliases, tables);
+        if (sel.order_by) |obs| {
+            for (@constCast(obs)) |*o| o.column = rewriteAliasQualifier(alloc, o.column, aliases, tables);
+        }
+        if (sel.group_by) |gbs| {
+            for (@constCast(gbs)) |*g| g.* = rewriteAliasQualifier(alloc, g.*, aliases, tables);
+        }
+    }
+
     fn lookupColumnType(self: *QueryExecutor, sel: ast.SelectStmt, col_name: []const u8) ?ColumnType {
         const bare = if (std.mem.lastIndexOfScalar(u8, col_name, '.')) |dot| col_name[dot + 1 ..] else col_name;
         for (self.db.catalog.tables.items) |tbl| {
@@ -3844,6 +3950,10 @@ pub const QueryExecutor = struct {
                 // Gated to single-table selects; join-side qualifier resolution across
                 // a combined row is a separate path and is left untouched.
                 normalizeSingleTableQualifiers(sel);
+                // Joins: map alias qualifiers (`e.col`) to the real table name
+                // (`emp.col`) the combined-row resolver understands. No-op without
+                // joins or aliases. Uses the subquery arena for the rewritten names.
+                normalizeJoinAliases(sel, sq_arena.allocator());
 
                 // Index-only COUNT(*): answer from the index without scanning base
                 // rows when sound (see tryIndexOnlyCount). Falls through otherwise.
