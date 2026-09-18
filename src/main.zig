@@ -529,6 +529,17 @@ pub fn main(init: std.process.Init) !void {
             defer allocator.free(dbf);
             const wdir = try std.fmt.allocPrint(allocator, "{s}/wal", .{base});
             defer allocator.free(wdir);
+            // Fail loudly if there is no database at <base>/nova.db. Otherwise
+            // `Database.open` would CREATE a fresh empty file (pager.zig FileNotFound
+            // -> createFile) and we would happily "back up" an empty database, with a
+            // success message, discovered only when a restore comes up empty. <base>
+            // must be the server's base_dir (the directory that directly contains
+            // nova.db + wal/, default '<deployment>/data'), NOT the deployment root
+            // that holds db.json.
+            if (Io.Dir.access(.cwd(), io, dbf, .{})) {} else |_| {
+                log.err("backup: no database found at {s}. Point <base_dir> at the directory that directly contains nova.db and wal/ (the server's base_dir, default '<deployment>/data'), not the deployment root.", .{dbf});
+                return error.FileNotFound;
+            }
             log.info("backing up {s} -> {s} ...", .{ base, dest });
             var db = try Database.open(allocator, io, dbf, 8192, wdir);
             defer db.close();

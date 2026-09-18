@@ -2517,6 +2517,35 @@ pub const Database = struct {
     pub fn exportSnapshot(self: *Database, dest_dir: []const u8) !void {
         const io = self.pool.pager.io;
         if (self.wal) |w| w.flush() catch {};
+
+        // Rewrite the page-0 header from the LIVE master tree before copying pages.
+        // The stored `root_page_id` / `lsn` / free-list head are only refreshed at a
+        // checkpoint or a clean close, so a snapshot taken between checkpoints would
+        // otherwise copy a STALE catalog root: the data pages are all present but the
+        // header points at an older catalog, so the restored database opens missing any
+        // table / rows created since the last checkpoint (recovery does not re-run when
+        // the checkpoint marker says the pages are already current). Same header-currency
+        // requirement as `checkpoint` / `durableFlush`. Safe here: the hot `BACKUP
+        // DATABASE TO` path holds the executor's exclusive `rw_lock` (so no writer can
+        // allocate a page while `persistFreeList` writes its chain), and the cold
+        // `novadb backup` CLI has its own single-threaded handle. Do NOT call
+        // `checkpoint()` here: it re-takes `rw_lock`, which the hot path already holds
+        // and which is not reentrant.
+        {
+            const hf = try self.pool.fetchPage(0);
+            defer self.pool.unpinPage(0, true);
+            const hp = self.pool.pageOf(hf);
+            var hdr = readHeader(hp.data);
+            hdr.root_page_id = self.master_tree.root_page_id;
+            hdr.lsn = self.master_tree.lsn;
+            var scratch_buf: [PAGE_SIZE]u8 = undefined;
+            hdr.free_page_list_head = self.pool.pager.persistFreeList(&scratch_buf) catch |err| blk: {
+                std.log.err("persistFreeList during exportSnapshot failed: {any}", .{err});
+                break :blk hdr.free_page_list_head;
+            };
+            writeHeader(hp.data, &hdr);
+        }
+
         try self.pool.flushAllPages();
         try self.pool.pager.file.sync(io);
 
