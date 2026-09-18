@@ -71,3 +71,40 @@ smaller base-descent amplification when the aggregate needs a NON-indexed column
 block-sorted base fetch), still open. Correctness verified against the base scan
 for count/sum/avg/min/max and inclusive/exclusive/equality bounds; full test gate
 green.
+
+## Three-way incl. MySQL/InnoDB (the clustered-engine reference)
+
+PostgreSQL is HEAP-organised (secondary index -> TID -> one heap read). InnoDB is
+CLUSTERED like kaidb (secondary index -> PK -> a second descent into the clustered PK
+index), so InnoDB is the architecturally-fair bar for the secondary-index base-fetch case.
+Same 2GB VM, all three with a 128 MiB cache, OS cache dropped for cold, MRR forced on for
+InnoDB. Times ms (cold | warm).
+
+After both fixes (index-only aggregate `5f9e06a` + MRR window `a71bc98`):
+
+| query | kaidb | InnoDB | PG |
+|---|--:|--:|--:|
+| point `id=500000` | **1 \| 0** | 44 \| 18 | 95 \| 23 |
+| `avg(total_due)` covering | **30 \| 10** | 99 \| 70 | 121 \| 35 |
+| emp=279 AND total_due range (Q17) | 61 \| 37 | **48 \| 21** | 109 \| 33 |
+| `avg(customer_id)` (clustered 2nd lookup) | 1298 \| 1275 | **204 \| 154** | 831 \| 71 |
+
+Reading it honestly:
+- **kaidb wins** the point lookup and the covering aggregate (the index-only-aggregate fix
+  makes it the fastest engine there).
+- **kaidb is competitive** on the narrow composite range (Q17).
+- **kaidb still trails InnoDB ~6-8x** on the WIDE secondary-index scan that needs a
+  non-indexed column (`avg(customer_id)`), though the MRR window closed it from ~19x.
+  This is the same clustered double-lookup InnoDB does, so it is an implementation gap,
+  not an architecture limit. The remaining residual is:
+  1. the redundant per-PK prefetch descent (`collectLeafPageIds`) - needs a parent-reuse
+     or piggyback-on-serve rewrite (a leaf-reading reuse was tried and reverted as
+     net-negative);
+  2. the decimal-TEXT clustered PK encoding (KNOWN-ISSUES #9) - wider keys mean fewer rows
+     per page and more page touches than InnoDB's compact integer keys;
+  3. per-row JSON materialisation.
+
+Net: kaidb matches or beats both engines on point/covering/narrow access even when
+disk-bound; the one place it still trails the clustered reference (InnoDB) is the wide
+secondary-index base-fetch, now ~6x (from ~19x) and bounded by three known, tractable
+implementation items rather than the clustered design itself.
