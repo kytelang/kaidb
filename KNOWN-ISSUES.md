@@ -134,6 +134,26 @@ remains:
    so it runs each `;`-terminated statement and exits cleanly. Interactive TTY mode
    remains for humans.
 
+## Correctness / robustness found by the on-hardware soak (2026-09-18, see `soak-report.md`)
+
+12. **Table aliases are broken (SQL correctness, HIGH).** `SELECT a.id FROM t a` projects
+    NULL, and `WHERE a.v = 25` is silently not applied (returns unfiltered rows). Unqualified
+    columns work, so the Q1..Q18 benchmark (all unqualified) never caught it. Root cause:
+    `lookupColumnType` (`query_executor.zig:1783`) strips the `alias.`/`table.` qualifier for
+    the result type, but the value-extraction and WHERE-eval paths match the full `a.id`
+    string against the row's bare field names. Single-table is an unambiguous strip; a correct
+    fix must also bind aliases to tables for joins. Fix before presenting the SQL surface as
+    general-purpose.
+
+13. **Server crashes on disk-full instead of degrading gracefully (availability, not safety).**
+    On ENOSPC a foreground write and the bgwriter hit `error.NoSpaceLeft` and the process
+    exits rather than returning a clean "disk full" error and staying up. **Durability is
+    unaffected** (soak item 3: committed data recovers exactly, torn tail WAL record discarded,
+    no corruption). Mitigation today: a process supervisor that auto-restarts + disk-space
+    monitoring. A graceful fix would thread ENOSPC out of the WAL-append / page-flush write
+    paths to the request handler (which already returns query errors) instead of unwinding to
+    process exit.
+
 ## Structural limits (larger, deliberate for now)
 
 8. **Not PG-class at OLTP/document scale.** A 10M-row benchmark exposed a bloated
