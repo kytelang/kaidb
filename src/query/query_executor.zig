@@ -6840,9 +6840,7 @@ pub const QueryExecutor = struct {
         }
 
         const new_fixed = try self.allocator.dupe(u8, fixed_buf);
-        errdefer self.allocator.free(new_fixed);
         const new_heap = try self.allocator.dupe(u8, heap_buf[0..heap_offset]);
-        errdefer self.allocator.free(new_heap);
 
         const new_version = schema.DecodedVersion{
             .xmin = self.currentWriteXid(),
@@ -6850,6 +6848,14 @@ pub const QueryExecutor = struct {
             .fixed = new_fixed,
             .heap = new_heap,
         };
+        // Free on every exit (success and error). NOTE: do NOT also add `errdefer`
+        // frees for new_fixed/new_heap - this `defer` already runs on the error
+        // path, so an errdefer would free them a second time. That double-free was
+        // benign under the Debug/GPA allocator but is undefined behaviour under the
+        // release `c_allocator`, and it is exactly what crashed the server (silently,
+        // no panic) when a downstream write failed - e.g. `updateRowMVCC` /
+        // `logWalRecordWithLsn` returning `error.NoSpaceLeft` on a full disk. It fires
+        // on ANY write error here, not just ENOSPC.
         defer {
             self.allocator.free(new_fixed);
             self.allocator.free(new_heap);

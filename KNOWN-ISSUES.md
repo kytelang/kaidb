@@ -155,28 +155,21 @@ remains:
     Verified: aliased join, WHERE-on-alias in a join, real-name join (regression) and
     single-table alias all correct; full `zig build test` passes.
 
-13. **Server crashes under sustained disk-full instead of degrading gracefully (availability,
-    not safety) - scoped follow-up, deeper than first thought.** Investigated 2026-09-18 with
-    a balloon-file rig (logs off the full volume). Findings:
-    - **Durability is unaffected** (soak item 3): committed data recovers exactly, the torn
-      tail WAL record is discarded, no corruption, writes resume after space is freed + restart.
-    - It is **build-dependent**. A **ReleaseSafe** server returns a clean `error_message`
-      (`error.WriteFailed` / `NoSpaceLeft`) to the client for the first over-limit write and
-      stays up; a **ReleaseFast** server crashes *immediately and silently* (no panic, no
-      trace) on the same write - a ReleaseFast-only undefined-behaviour on the ENOSPC error
-      path that ReleaseSafe's codegen handles. Pinning the exact site needs an ASAN/debugger
-      run (no `-Dasan` option is wired in `build.zig` yet).
-    - Even ReleaseSafe does **not** fully degrade: once the buffer pool is all-dirty against a
-      full disk, any op needing a free frame must evict a dirty page -> write -> ENOSPC, so
-      even a `COUNT(*)` read surfaces `error.WriteFailed`, and continued operation eventually
-      crashes the process too (just later than ReleaseFast).
-    A real fix is a write-path error-handling hardening pass: make every disk-write site (WAL
-    append, page flush, doublewrite, checkpoint, eviction) return errors cleanly without
-    leaving state that crashes the next op, decouple the read path from write-failure, and
-    close the ReleaseFast UB. That is a scoped mini-project, not a one-spot change. Mitigation
-    until then: disk-space monitoring with headroom (so the pool never fully dirties against a
-    full disk), a process supervisor for auto-restart (recovery is clean), and prefer a
-    **ReleaseSafe** server build for the longer graceful window.
+13. **Server crashed under disk-full: FIXED (root cause was a double-free, not the disk).**
+    A Debug build printed an error-return trace pointing at `writeNewVersion`
+    (`query_executor.zig`): the new row's `new_fixed` / `new_heap` buffers had BOTH an
+    `errdefer` free AND a `defer` free, so on ANY write error after the `defer` was registered
+    (e.g. `updateRowMVCC` / `logWalRecordWithLsn` returning `error.NoSpaceLeft` on a full disk)
+    both ran and double-freed the two buffers. That double-free was benign under Debug's
+    allocator but is undefined behaviour under the release `c_allocator` - which is exactly why
+    ReleaseFast crashed *silently* (no panic) while Debug/ReleaseSafe limped further. It fires
+    on any write error here, not just ENOSPC. Fix: dropped the two redundant `errdefer`s (the
+    `defer` already frees on both paths). Verified in ReleaseFast: disk-full now returns clean
+    `error_message`s, reads still succeed while full, the server stays up, and writes resume
+    after space is freed; `crash_test.sh` 3/3 and full `zig build test` pass. Durability was
+    never affected (committed data recovers exactly). Residual (separate, minor): a write that
+    returns an ENOSPC error may still leave a not-yet-durable row visible until eviction/restart
+    - a sustained-disk-full atomicity nicety, not a crash.
 
 ## Structural limits (larger, deliberate for now)
 
