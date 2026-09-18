@@ -3300,6 +3300,54 @@ pub const QueryExecutor = struct {
             }
         }
 
+        // Ordering-only index access: no WHERE predicate selected an index, but a
+        // single-key `ORDER BY <indexed col>` can be served by a FULL scan of that
+        // index in the ORDER BY direction. The index yields rows already ordered by
+        // the column (order-preserving keys), so downstream sees the scan as the
+        // final order (`scan_ordered_col` + `scan_order_is_desc`), skips the sort,
+        // and the streaming LIMIT break serves `ORDER BY col [DESC] LIMIT k` in O(k)
+        // base fetches instead of a full table scan plus a sort of every row. Only
+        // with no joins and a single ORDER key on this table's indexed column.
+        if (!used_index and !skip_index_scan and sel.joins.len == 0) {
+            if (sel.order_by) |ob| if (ob.len == 1) {
+                for (self.db.catalog.indexes.items) |idx| {
+                    if (idx.table_id == base_table_meta.id and idx.key_columns.len > 0 and
+                        std.mem.eql(u8, ob[0].column, idx.key_columns[0].name))
+                    {
+                        const idx_tree = try self.db.getIndexTree(idx.name);
+                        if (ob[0].desc) {
+                            const desc_scan = try query_iter.IndexRangeScanDescIterator.init(
+                                self.allocator, self, base_table_meta, base_table_tree, idx_tree, null, null, current_tx);
+                            desc_scan.residual = self.residual_expr;
+                            desc_scan.residual_cols = self.residual_cols;
+                            base_iter = desc_scan.iterator();
+                            self.scan_order_is_desc = true;
+                            self.desc_range_scans_built += 1;
+                        } else {
+                            // Unbounded ascending scan: "" is the lowest key, so the
+                            // cursor starts at the first index entry; no end bound.
+                            const asc_scan = try query_iter.IndexRangeScanIterator.init(
+                                self.allocator, self, base_table_meta, base_table_tree, idx_tree, "", null, current_tx);
+                            asc_scan.residual = self.residual_expr;
+                            asc_scan.residual_cols = self.residual_cols;
+                            // The ascending index order IS the requested final order, so
+                            // it must NOT be reordered for the clustered-fetch heuristic.
+                            asc_scan.may_reorder = false;
+                            if (sel.offset) |off| if (off > 0) {
+                                asc_scan.skip_remaining = off;
+                                self.scan_offset_pushed = true;
+                            };
+                            base_iter = asc_scan.iterator();
+                        }
+                        used_index = true;
+                        self.range_scans_built += 1;
+                        self.scan_ordered_col = idx.key_columns[0].name;
+                        break;
+                    }
+                }
+            };
+        }
+
         if (!used_index) {
             var start_key: ?[]const u8 = null;
             var stop_key: ?[]const u8 = null;
