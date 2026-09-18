@@ -121,9 +121,10 @@ medium-selectivity range scans (Q4/Q5/Q6/Q8/Q17).
   heap + B-tree path is simply tighter. The PK-sorted base-row fetch trimmed these only
   modestly (the per-row descent was not the dominant cost; decode/materialisation is).
   This is the clearest remaining gap.
-- **`ORDER BY ... DESC` (Q3, Q5):** kaidb scans ascending then reverses (so it cannot
-  stream), whereas MySQL/PG walk the index backwards. A backward index scan would
-  help here and let these stream.
+- **`ORDER BY ... DESC` (Q3, Q5):** kaidb already serves these with a backward index
+  scan (`IndexRangeScanDescIterator`) that streams and breaks at LIMIT, so the residual
+  gap is the same per-row decode / materialisation cost as the range scans above, not a
+  missing backward scan.
 
 ## Reproduce
 

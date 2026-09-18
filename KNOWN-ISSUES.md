@@ -27,10 +27,11 @@ remains:
    index descent (`buildRowJson` in `src/query/query_executor.zig` allocates a `names`
    and a `cells` array per row and dups every text cell). See item under "Allocation".
 
-2. **`ORDER BY ... DESC` - Q3 / Q5.** kaidb scans ascending then reverses, so it cannot
-   stream and MySQL/PostgreSQL win via a backward index walk. Needs a **backward index
-   scan**; it would also let these queries stream (break at LIMIT) instead of
-   buffering and reversing.
+2. **`ORDER BY ... DESC` - Q3 / Q5: NOT a defect (earlier claim was wrong).** kaidb
+   already serves these with a backward index walk (`IndexRangeScanDescIterator`, the
+   composite site at `query_executor.zig:2675` and the single-column site at `:2789`),
+   and streams + breaks at LIMIT. Their remaining cost is per-row decode /
+   materialisation, i.e. the same as item 1/4, not a missing backward scan.
 
 3. **OFFSET pushdown is only half-wired.** The Q18 fix pushes the offset into the
    *composite* ordered index scan only. **Single-column ordered range scans still
@@ -80,10 +81,19 @@ remains:
 
 ## Pre-existing test / stability items (not from this branch)
 
-10. **`replication P6: mutual TLS`** test fails (suite runs 119/120). A cert-path issue
-    in the TLS replication test, unrelated to the query engine.
+10. **`replication P6: mutual TLS`: FIXED (suite now 120/120).** The test loaded certs
+    from `testdata/repl/` that were never committed. Added a CA-signed server + client
+    and a rogue cert from a separate rogue CA (with SKI/AKI so the chain links), plus
+    `tests/harness/gen_repl_certs.sh` to regenerate. All 120 tests pass on a direct
+    (sequential) run of the test binary.
 
-11. Earlier triage flagged a residual **`PageStillPinned` fuzzer race** and a
+11. **Replication tests flake under the concurrent `zig build test` harness.** The
+    aggregated run intermittently reports a `failed command` amid async-ship /
+    reconnect warnings, but every test passes on a direct/sequential invocation of the
+    test binary (120/120) and with `-Dtest-filter`. This is a harness-concurrency race
+    in the replication tests (follower socket teardown timing), not a product defect;
+    it may be the same class as the earlier **`PageStillPinned` fuzzer race**. Prefer
+    the direct binary or a filter for a reliable pass/fail signal. A
     **document-store REOPEN HANG**; confirm whether these are still open before relying
     on the doc path or the concurrent fuzzer.
 
