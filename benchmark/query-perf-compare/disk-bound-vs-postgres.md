@@ -51,3 +51,23 @@ work. Most of that gap is a tractable covering-index planner miss (~197x), with 
 structural amplification (~6.6x) behind it. So "if the others also degrade, we are done"
 resolves to: they do NOT degrade the same, but the biggest fix is a planner change, not a
 new pager.
+
+## After the fix (index-only scalar aggregate, commit 5f9e06a)
+
+Re-measured on the same VM after adding `tryIndexOnlyScalarAgg` (answer
+`agg(col) WHERE <plain range on col>` from the index key, no base-row descent):
+
+| query | before | after | pg | note |
+|---|--:|--:|--:|---|
+| `avg(total_due)` warm (covering) | 4539 | **75** | 22 | ~60x faster; now ~3x of PG (both fast) |
+| range total_due 10k-50k `count+avg` cold | 4656 | **43** | 36 | tied with PG |
+| range total_due 10k-50k `count+avg` warm | 3982 | **10** | 13 | now BEATS PG |
+| `avg(customer_id)` (needs base row) | 3371 | 4121 | 207 | unchanged - separate amplification gap |
+
+The covering-index aggregate gap is closed: the wide `total_due` range aggregate
+is now tied-to-ahead of PostgreSQL even disk-bound. The remaining gap is the
+smaller base-descent amplification when the aggregate needs a NON-indexed column
+(`avg(customer_id)`), which is the lever-4 structural item (physical row locator /
+block-sorted base fetch), still open. Correctness verified against the base scan
+for count/sum/avg/min/max and inclusive/exclusive/equality bounds; full test gate
+green.
