@@ -2562,9 +2562,18 @@ pub const QueryExecutor = struct {
     /// transaction. Returns null (fall back to the hash GROUP BY) otherwise, or
     /// on any unsupported projection / type shape.
     fn tryIndexGroupAgg(self: *QueryExecutor, sel: ast.SelectStmt) !?QueryResponse {
-        if (sel.joins.len != 0 or sel.where_expr != null) return null;
+        if (sel.joins.len != 0) return null;
         const gb = sel.group_by orelse return null;
         if (gb.len != 1 or sel.projections.len == 0) return null;
+        // WHERE is allowed only when it is a plain range on the group column (the
+        // index lead), so the whole predicate is captured by the scanned index
+        // range and this fast path stays index-only (e.g.
+        // `WHERE g BETWEEN a AND b GROUP BY g`). Any other WHERE - a different
+        // column, an OR, a non-range - would need a base-row check, so fall back
+        // to the hash GROUP BY over the base scan.
+        if (sel.where_expr) |we| {
+            if (!whereIsPlainRangeOn(we, gb[0])) return null;
+        }
         if (self.db.txn_manager.activeTxnCount(self.db.pool.pager.io) != 1) return null;
 
         // HAVING is allowed on this fast path only when every aggregate it
@@ -2637,7 +2646,23 @@ pub const QueryExecutor = struct {
             groups.deinit(self.allocator);
         }
 
-        var it = try idx_tree.iterator();
+        // Scan only the index range the WHERE selects (a plain range on the group
+        // column, validated above); with no WHERE this is the whole index
+        // (`""`..null). Either way the walk stays index-only.
+        var scan_start: []const u8 = "";
+        var scan_end: ?[]const u8 = null;
+        var scan_bounds_owned = false;
+        if (sel.where_expr) |we| {
+            const rb = (try self.getRangeForCol(we, gcol, gtype)) orelse return null;
+            scan_start = rb.start_key;
+            scan_end = rb.end_key;
+            scan_bounds_owned = true;
+        }
+        defer if (scan_bounds_owned) {
+            self.allocator.free(scan_start);
+            if (scan_end) |e| self.allocator.free(e);
+        };
+        var it = try idx_tree.rangeScan(scan_start, scan_end);
         defer it.deinit();
         var cur: ?*Group = null;
         while (try it.next()) |cell| {

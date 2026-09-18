@@ -655,7 +655,11 @@ pub const BPlusTree = struct {
                 if (!in_range) self.releaseLeaf();
             }
             if (self.leaf == null) {
-                self.leaf = try self.tree.findLeafShared(key);
+                // The cursor holds the shared `structure_lock` for its whole life,
+                // so the tree shape is frozen: descend latch-free through the
+                // interior (findLeafOptimisticShared) instead of crabbing a shared
+                // latch down every internal node.
+                self.leaf = try self.tree.findLeafOptimisticShared(key);
             }
             const p = self.tree.pool.pageOf(self.leaf.?);
             const idx = p.findCellByKey(key) orelse return null;
@@ -1129,6 +1133,36 @@ try self.pool.discardPage(lid);
         }
         cur_frame.latch.lock(self.pool.pager.io);
         self.pool.beginWrite(cur_frame); // Phase 4: writable before any modify
+        return cur_frame;
+    }
+
+    /// Read-only twin of [`findLeafOptimistic`]: descends taking NO latches on
+    /// internal nodes, then latches only the final leaf SHARED (no `beginWrite`).
+    ///
+    /// The caller MUST already hold the SHARED `structure_lock` for the whole
+    /// operation (as [`LeafReuseSearcher`] does for its lifetime). That blocks
+    /// restructures, so the unlatched interior cannot be reshaped mid-descent;
+    /// concurrent in-place cell updates only take the LEAF exclusive latch, which
+    /// this still contends for. Returns the leaf latched-shared and pinned. This
+    /// drops the two per-internal-node latch atomics that [`findLeafShared`]'s
+    /// crabbing pays, which is pure overhead once the shape is already frozen.
+    fn findLeafOptimisticShared(self: *BPlusTree, key: []const u8) !*Frame {
+        var cur_id = self.root_page_id;
+        var cur_frame = try self.pool.fetchPage(cur_id);
+
+        var depth: u32 = 0;
+        while (self.pool.pageOf(cur_frame).headerPtr().page_type == .internal) {
+            depth += 1;
+            if (depth > MAX_TREE_DEPTH) {
+                self.pool.unpinPage(cur_id, false);
+                return BTreeError.TreeTooDeepOrCyclic;
+            }
+            const next_id = self.pool.pageOf(cur_frame).findChildPageId(key);
+            self.pool.unpinPage(cur_id, false);
+            cur_id = next_id;
+            cur_frame = try self.pool.fetchPage(cur_id);
+        }
+        cur_frame.latch.lockShared(self.pool.pager.io);
         return cur_frame;
     }
 
