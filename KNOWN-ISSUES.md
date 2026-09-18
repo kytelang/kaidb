@@ -151,14 +151,28 @@ remains:
     (`a.id` vs `b.id`) is still a follow-up — the normalisation is gated to `joins.len == 0`,
     and `right_alias` is captured but not yet used by the join executor.
 
-13. **Server crashes on disk-full instead of degrading gracefully (availability, not safety).**
-    On ENOSPC a foreground write and the bgwriter hit `error.NoSpaceLeft` and the process
-    exits rather than returning a clean "disk full" error and staying up. **Durability is
-    unaffected** (soak item 3: committed data recovers exactly, torn tail WAL record discarded,
-    no corruption). Mitigation today: a process supervisor that auto-restarts + disk-space
-    monitoring. A graceful fix would thread ENOSPC out of the WAL-append / page-flush write
-    paths to the request handler (which already returns query errors) instead of unwinding to
-    process exit.
+13. **Server crashes under sustained disk-full instead of degrading gracefully (availability,
+    not safety) - scoped follow-up, deeper than first thought.** Investigated 2026-09-18 with
+    a balloon-file rig (logs off the full volume). Findings:
+    - **Durability is unaffected** (soak item 3): committed data recovers exactly, the torn
+      tail WAL record is discarded, no corruption, writes resume after space is freed + restart.
+    - It is **build-dependent**. A **ReleaseSafe** server returns a clean `error_message`
+      (`error.WriteFailed` / `NoSpaceLeft`) to the client for the first over-limit write and
+      stays up; a **ReleaseFast** server crashes *immediately and silently* (no panic, no
+      trace) on the same write - a ReleaseFast-only undefined-behaviour on the ENOSPC error
+      path that ReleaseSafe's codegen handles. Pinning the exact site needs an ASAN/debugger
+      run (no `-Dasan` option is wired in `build.zig` yet).
+    - Even ReleaseSafe does **not** fully degrade: once the buffer pool is all-dirty against a
+      full disk, any op needing a free frame must evict a dirty page -> write -> ENOSPC, so
+      even a `COUNT(*)` read surfaces `error.WriteFailed`, and continued operation eventually
+      crashes the process too (just later than ReleaseFast).
+    A real fix is a write-path error-handling hardening pass: make every disk-write site (WAL
+    append, page flush, doublewrite, checkpoint, eviction) return errors cleanly without
+    leaving state that crashes the next op, decouple the read path from write-failure, and
+    close the ReleaseFast UB. That is a scoped mini-project, not a one-spot change. Mitigation
+    until then: disk-space monitoring with headroom (so the pool never fully dirties against a
+    full disk), a process supervisor for auto-restart (recovery is clean), and prefer a
+    **ReleaseSafe** server build for the longer graceful window.
 
 ## Structural limits (larger, deliberate for now)
 
