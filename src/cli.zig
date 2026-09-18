@@ -1,101 +1,218 @@
-//! Interactive REPL client for the NovaDB server (`novadb-cli`).
+//! CLI client for the NovaDB server (`kaidb-cli`).
 //!
-//! This is the human-facing SQL shell that ships alongside the `novadb`
-//! server binary. It is a thin, standalone client: it owns no storage, no
-//! B+Tree, and no catalog. All it does is open a socket to a running server,
-//! speak the binary wire protocol defined in `common/proto.zig`, and pretty
-//! print whatever comes back. Every query the user types is forwarded verbatim
-//! to the server, which parses and executes the SQL; the CLI never interprets
-//! SQL itself.
+//! A thin, standalone SQL client: it owns no storage and never interprets SQL.
+//! It opens a socket to a running server, speaks the **pure binary wire
+//! protocol** in `proto/protocol.zig` (the "NOVA"-magic framed protocol,
+//! MessageType `connect`/`query`/`query_resp`/`err`), and pretty-prints the
+//! binary result. There is NO HTTP and NO JSON anywhere on this path: results
+//! arrive as the split fixed/heap row encoding and are decoded field by field.
 //!
-//! Wire protocol and framing
-//! --------------------------
-//! Requests and responses are [`Packet`] values (see `common/proto.zig`). Each
-//! serialised packet is length-prefixed with a little-endian `u32` payload
-//! length, so the read path here is deliberately two-step: read the 4-byte
-//! length header, allocate `4 + payload_len` bytes, copy the header back in,
-//! then read exactly the remaining payload before handing the whole frame to
-//! [`Packet.deserialize`]. This matches how the server writes replies and is
-//! why a short read on the header is treated as "connection closed" rather than
-//! a protocol error.
+//! Modes
+//! -----
+//!   * `-c "SQL"`   run one statement, print it, exit (scripting / CI).
+//!   * piped stdin  read all input, split on `;`, run each statement in order
+//!                  (e.g. `kaidb-cli < script.sql`, `echo "SELECT 1" | kaidb-cli`).
+//!   * a TTY        interactive prompt: read a line, run it, until EOF or `exit`.
 //!
-//! A query is sent as an [`Operation`] `.Query` packet carrying the raw SQL and
-//! the current session token; the reply arrives as a `.Reply` packet whose
-//! `data` field is a JSON document (columns/rows for result sets,
-//! `rows_affected` for DML, or `error_message` for a server-side error). The
-//! JSON body is parsed with `std.json` and rendered as an ASCII box table by
-//! [`printTable`].
-//!
-//! Sessions and authentication
-//! ---------------------------
-//! Login is not a separate protocol message: it is an ordinary SQL statement
-//! whose result set is a single `session_token` column. The REPL special-cases
-//! that shape, when a reply has exactly one column named `session_token` and at
-//! least one row, it captures the token, stores it (freeing any previous one),
-//! prints "Login successful!", and thereafter attaches the token to every
-//! outgoing query. The token is heap-owned by this process and freed on exit.
-//!
-//! Transport
-//! ---------
-//! The connection is either plain TCP or TLS, chosen by config and overridable
-//! per-run with a `--tls` / `--no-tls` argument. When TLS is on, the client uses
-//! `insecure_skip_verify` (it does not validate the server certificate), which
-//! is acceptable for a local admin shell but is NOT a secure client for
-//! untrusted networks. In both cases the code funnels down to a single
-//! `*Io.Reader` / `*Io.Writer` pair so the request/response loop is transport
-//! agnostic.
-//!
-//! Error handling philosophy
-//! -------------------------
-//! The REPL is designed to survive bad input without dying: per-query failures
-//! (send failure, malformed JSON, server error) print a diagnostic and `continue`
-//! the loop, whereas failures that mean the connection is gone (a short read on
-//! the length header or payload) `break` out of the loop and end the session.
+//! Usage: `kaidb-cli [host[:port]] [--tls|--no-tls] [-u user] [-p pass]
+//!         [-d db] [-c "SQL"]`. Host/port/TLS default from `db.json`; auth
+//! defaults to `admin`/`admin` on database `default`.
 
 const std = @import("std");
-/// Shorthand for the standard library's I/O namespace (`std.Io`).
-///
-/// Used throughout for the reader/writer interfaces, `Io.Dir`, `Io.File`,
-/// `Io.Clock`, and `Io.net`, the async-capable I/O surface the server and CLI
-/// share.
 const Io = std.Io;
-/// The TLS library module, providing [`tls.Connection`] and the handshake
-/// entry point [`tls.clientFromStream`] used for encrypted transport.
 const tls = @import("tls");
-/// The server/client configuration record loaded from `db.json`, supplying the
-/// default host, port, and TLS settings before any command-line overrides.
 const Config = @import("common/config.zig").Config;
-/// The binary wire-protocol module: packet framing, serialisation, and the
-/// operation/reply types the CLI exchanges with the server.
-const proto = @import("common/proto.zig");
-/// A single length-prefixed protocol message. See [`proto`]; the CLI both
-/// serialises `.Query` packets and deserialises `.Reply` packets through it.
-const Packet = proto.Packet;
-/// The tagged union of protocol operations (`.Query`, `.Reply`, ...). Aliased
-/// for readability at the packet-construction sites.
-const Operation = proto.Operation;
+/// The pure binary wire protocol: "NOVA"-magic framing, message types, and the
+/// split fixed/heap row encoding the server emits for a result set.
+const proto = @import("proto/protocol.zig");
 
-/// Entry point: run the interactive REPL until the user exits or the connection
-/// drops.
+const MessageType = proto.MessageType;
+const MessageHeader = proto.MessageHeader;
+
+/// One decoded protocol frame: the message type and its owned payload bytes.
+const Frame = struct {
+    msg_type: u8,
+    payload: []u8,
+};
+
+/// Writes a 16-byte binary header (`magic`, `msg_type`, `flags=0`, `stream_id`,
+/// `payload_len`) followed by `payload`, then flushes. Little-endian on the
+/// wire, matching the server's host-endian encode on this (arm64/x86) ABI.
+fn writeFrame(writer: *Io.Writer, msg_type: MessageType, stream_id: u16, payload: []const u8) !void {
+    var hdr: [16]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], MessageHeader.MAGIC_VALUE, .little);
+    hdr[4] = @intFromEnum(msg_type);
+    hdr[5] = 0; // flags
+    std.mem.writeInt(u16, hdr[6..8], stream_id, .little);
+    std.mem.writeInt(u64, hdr[8..16], payload.len, .little);
+    try writer.writeAll(&hdr);
+    try writer.writeAll(payload);
+    try writer.flush();
+}
+
+/// Reads one frame: the 16-byte header (validated against the magic) and its
+/// payload. The payload is owned by `allocator`; the caller frees it.
+fn readFrame(reader: *Io.Reader, allocator: std.mem.Allocator) !Frame {
+    var hdr: [16]u8 = undefined;
+    try reader.readSliceAll(&hdr);
+    if (std.mem.readInt(u32, hdr[0..4], .little) != MessageHeader.MAGIC_VALUE) return error.InvalidMagic;
+    const msg_type = hdr[4];
+    const payload_len = std.mem.readInt(u64, hdr[8..16], .little);
+    const payload = try allocator.alloc(u8, @intCast(payload_len));
+    errdefer allocator.free(payload);
+    try reader.readSliceAll(payload);
+    return .{ .msg_type = msg_type, .payload = payload };
+}
+
+/// Little-endian cursor over a payload with bounds checks (short read → error).
+const Cursor = struct {
+    b: []const u8,
+    o: usize = 0,
+    fn u8v(self: *Cursor) !u8 {
+        if (self.o + 1 > self.b.len) return error.Truncated;
+        const v = self.b[self.o];
+        self.o += 1;
+        return v;
+    }
+    fn u16v(self: *Cursor) !u16 {
+        if (self.o + 2 > self.b.len) return error.Truncated;
+        const v = std.mem.readInt(u16, self.b[self.o..][0..2], .little);
+        self.o += 2;
+        return v;
+    }
+    fn u32v(self: *Cursor) !u32 {
+        if (self.o + 4 > self.b.len) return error.Truncated;
+        const v = std.mem.readInt(u32, self.b[self.o..][0..4], .little);
+        self.o += 4;
+        return v;
+    }
+    fn u64v(self: *Cursor) !u64 {
+        if (self.o + 8 > self.b.len) return error.Truncated;
+        const v = std.mem.readInt(u64, self.b[self.o..][0..8], .little);
+        self.o += 8;
+        return v;
+    }
+    fn bytes(self: *Cursor, n: usize) ![]const u8 {
+        if (self.o + n > self.b.len) return error.Truncated;
+        const s = self.b[self.o .. self.o + n];
+        self.o += n;
+        return s;
+    }
+};
+
+/// Prints an `err` frame's `[error_code u32][message_len u16][message]` body.
+fn printError(out: *Io.Writer, payload: []const u8) !void {
+    var c = Cursor{ .b = payload };
+    const code = c.u32v() catch 0;
+    const mlen = c.u16v() catch 0;
+    const msg = c.bytes(mlen) catch "";
+    try out.print("Error [{d}]: {s}\n", .{ code, msg });
+}
+
+/// Sends one SQL statement as a `query` frame and renders the reply.
 ///
-/// The flow is: load [`Config`] from the current directory, apply optional
-/// `host[:port]` and `--tls`/`--no-tls` overrides from argv, open a TCP (or TLS)
-/// stream to the server, then loop reading a line of SQL, sending it as a
-/// [`Packet`] `.Query`, and rendering the `.Reply`.
-///
-/// The single request/response iteration is the subtle part. It writes the
-/// serialised query and flushes, then reads the 4-byte little-endian length
-/// header, allocates the full `4 + payload_len` frame, copies the header back,
-/// and reads the payload before deserialising, see the file header for why the
-/// length prefix is reconstructed rather than skipped. A failure to read the
-/// header or payload means the peer is gone and ends the loop; a failure to
-/// send, parse JSON, or a server-reported error only skips the current line.
-///
-/// Login is detected structurally: a reply that is a single `session_token`
-/// column with rows captures the token into `session_token` (freeing the prior
-/// one) so subsequent queries authenticate. All heap allocations use the
-/// process arena or the general allocator and are freed via `defer`; the
-/// captured session token is freed on exit.
+/// Reads back either an `err` frame (printed as a diagnostic) or a `query_resp`
+/// frame, which is decoded field by field: a result-type byte, `rows_affected`,
+/// the column descriptors, then (if present) the row block in the split
+/// fixed/heap layout. A SELECT prints an ASCII table; a DML prints the affected
+/// row count. Returns false on a transport error so the caller can stop.
+fn runStatement(reader: *Io.Reader, writer: *Io.Writer, out: *Io.Writer, allocator: std.mem.Allocator, sql: []const u8) !bool {
+    // query payload: [tx_mode u8][sql_len u32][sql][param_count u16]
+    var qp = std.ArrayList(u8).empty;
+    defer qp.deinit(allocator);
+    try qp.append(allocator, 0); // tx_mode
+    var lenbuf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &lenbuf, @intCast(sql.len), .little);
+    try qp.appendSlice(allocator, &lenbuf);
+    try qp.appendSlice(allocator, sql);
+    try qp.appendSlice(allocator, &[_]u8{ 0, 0 }); // param_count u16 = 0
+
+    writeFrame(writer, .query, 1, qp.items) catch |err| {
+        try out.print("send failed: {}\n", .{err});
+        return false;
+    };
+
+    const frame = readFrame(reader, allocator) catch |err| {
+        try out.print("connection closed: {}\n", .{err});
+        return false;
+    };
+    defer allocator.free(frame.payload);
+
+    if (frame.msg_type == @intFromEnum(MessageType.err)) {
+        try printError(out, frame.payload);
+        return true;
+    }
+    if (frame.msg_type != @intFromEnum(MessageType.query_resp)) {
+        try out.print("unexpected reply type {d}\n", .{frame.msg_type});
+        return true;
+    }
+
+    var c = Cursor{ .b = frame.payload };
+    const result_type = try c.u8v(); // 0 = select, 1 = non-select
+    const rows_affected = try c.u64v();
+    const num_cols = try c.u16v();
+
+    var cols = try allocator.alloc([]const u8, num_cols);
+    defer allocator.free(cols);
+    var i: usize = 0;
+    while (i < num_cols) : (i += 1) {
+        const nlen = try c.u16v();
+        cols[i] = try c.bytes(nlen);
+        _ = try c.u8v(); // col_type (server describes every column as TEXT)
+        _ = try c.u32v(); // offset (unused by this reader)
+        _ = try c.u32v(); // width  (unused)
+    }
+
+    const has_rows = try c.u8v();
+    if (has_rows == 0 or result_type == 1) {
+        if (result_type == 1) {
+            try out.print("Query OK, {d} row(s) affected\n\n", .{rows_affected});
+        } else {
+            try printTable(out, cols, &[_][]const []const u8{});
+        }
+        return true;
+    }
+
+    const num_rows = try c.u32v();
+    var rows = try allocator.alloc([]const []const u8, num_rows);
+    defer {
+        for (rows) |r| allocator.free(r);
+        allocator.free(rows);
+    }
+    var r: usize = 0;
+    while (r < num_rows) : (r += 1) {
+        // Each row is self-delimiting: [fixed_len u32][fixed][heap_len u32][heap].
+        const fixed_len = try c.u32v();
+        const fixed = try c.bytes(fixed_len);
+        const heap_len = try c.u32v();
+        const heap = try c.bytes(heap_len);
+
+        var cells = try allocator.alloc([]const u8, num_cols);
+        var k: usize = 0;
+        while (k < num_cols) : (k += 1) {
+            if (k * 4 + 4 > fixed.len) {
+                cells[k] = "";
+                continue;
+            }
+            const off = std.mem.readInt(u32, fixed[k * 4 ..][0..4], .little);
+            if (off + 4 > heap.len) {
+                cells[k] = "";
+                continue;
+            }
+            const slen = std.mem.readInt(u32, heap[off..][0..4], .little);
+            if (off + 4 + slen > heap.len) {
+                cells[k] = "";
+                continue;
+            }
+            cells[k] = heap[off + 4 .. off + 4 + slen];
+        }
+        rows[r] = cells;
+    }
+
+    try printTable(out, cols, rows);
+    return true;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const io = init.io;
@@ -113,38 +230,48 @@ pub fn main(init: std.process.Init) !void {
     var host: []const u8 = config.address;
     var port: u16 = config.port;
     var tls_enabled: bool = config.tls.enabled;
+    var user: []const u8 = "admin";
+    var pass: []const u8 = "admin";
+    var db_name: []const u8 = "default";
+    var one_shot: ?[]const u8 = null;
 
-    if (args.len > 1) {
-        const arg = args[1];
-        if (std.mem.indexOf(u8, arg, ":")) |colon_idx| {
-            host = arg[0..colon_idx];
-            port = std.fmt.parseInt(u16, arg[colon_idx + 1 ..], 10) catch 3009;
-        } else {
-            host = arg;
-        }
-    }
-
-    if (args.len > 2) {
-        if (std.mem.eql(u8, args[2], "--tls")) {
+    // Parse: a bare `host[:port]` positional, plus flags. `-c/-u/-p/-d` take the
+    // next argument; `--tls/--no-tls` toggle transport.
+    var ai: usize = 1;
+    while (ai < args.len) : (ai += 1) {
+        const a = args[ai];
+        if (std.mem.eql(u8, a, "--tls")) {
             tls_enabled = true;
-        } else if (std.mem.eql(u8, args[2], "--no-tls")) {
+        } else if (std.mem.eql(u8, a, "--no-tls")) {
             tls_enabled = false;
+        } else if (std.mem.eql(u8, a, "-c")) {
+            ai += 1;
+            if (ai < args.len) one_shot = args[ai];
+        } else if (std.mem.eql(u8, a, "-u")) {
+            ai += 1;
+            if (ai < args.len) user = args[ai];
+        } else if (std.mem.eql(u8, a, "-p")) {
+            ai += 1;
+            if (ai < args.len) pass = args[ai];
+        } else if (std.mem.eql(u8, a, "-d")) {
+            ai += 1;
+            if (ai < args.len) db_name = args[ai];
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            // Unknown flag: ignore rather than abort a scripted run.
+        } else if (std.mem.indexOf(u8, a, ":")) |colon| {
+            host = a[0..colon];
+            port = std.fmt.parseInt(u16, a[colon + 1 ..], 10) catch port;
+        } else {
+            host = a;
         }
     }
 
-    const stdout_file = std.Io.File.stdout();
-    var stdout_buf: [1024]u8 = undefined;
+    var stdout_file = std.Io.File.stdout();
+    var stdout_buf: [4096]u8 = undefined;
     var stdout_w = stdout_file.writer(io, &stdout_buf);
-    const stdout = &stdout_w.interface;
+    const out = &stdout_w.interface;
 
-    const stdin_file = std.Io.File.stdin();
-    var stdin_buf: [4096]u8 = undefined;
-    var stdin_r = stdin_file.reader(io, &stdin_buf);
-    const stdin = &stdin_r.interface;
-
-    try stdout.writeAll("B+Tree Relational Database CLI REPL\n");
-    try stdout.writeAll("Type 'exit' or 'quit' to exit.\n\n");
-    try stdout_w.interface.flush();
+    const interactive = one_shot == null and (std.Io.File.stdin().isTty(io) catch false);
 
     const address = std.Io.net.IpAddress.parse(host, port) catch |err| {
         std.debug.print("Failed to parse address '{s}:{d}': {}\n", .{ host, port, err });
@@ -195,201 +322,137 @@ pub fn main(init: std.process.Init) !void {
         writer = &w_tcp.interface;
     }
 
-    var session_token: ?[]const u8 = null;
-    defer if (session_token) |tok| allocator.free(tok);
+    // Handshake: connect payload is
+    // [version u32][user_len u16][user][pass_len u16][pass][db_len u16][db].
+    {
+        var cp = std.ArrayList(u8).empty;
+        defer cp.deinit(allocator);
+        var b4: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b4, proto.PROTOCOL_VERSION, .little);
+        try cp.appendSlice(allocator, &b4);
+        try appendLenPrefixed(&cp, allocator, user);
+        try appendLenPrefixed(&cp, allocator, pass);
+        try appendLenPrefixed(&cp, allocator, db_name);
+        try writeFrame(writer, .connect, 1, cp.items);
 
-    while (true) {
-        try stdout.writeAll("nova> ");
-        try stdout_w.interface.flush();
-        const line = stdin.takeDelimiterExclusive('\n') catch |err| {
-            if (err == error.EndOfStream) break;
+        const frame = readFrame(reader, allocator) catch |err| {
+            std.debug.print("Failed to connect (handshake): {}\n", .{err});
             return err;
         };
-
-        const trimmed = std.mem.trim(u8, line, " \r\t");
-        if (trimmed.len == 0) continue;
-        if (std.mem.eql(u8, trimmed, "exit") or std.mem.eql(u8, trimmed, "quit")) break;
-
-        const query_pkt = Packet{
-            .op = .{
-                .Query = .{
-                    .sql = trimmed,
-                    .session_token = session_token,
-                },
-            },
-        };
-
-        query_pkt.serialize(writer) catch |err| {
-            std.debug.print("Failed to send query: {}\n", .{err});
-            continue;
-        };
-        writer.flush() catch |err| {
-            std.debug.print("Failed to flush connection: {}\n", .{err});
-            continue;
-        };
-
-        var len_bytes: [4]u8 = undefined;
-        reader.readSliceAll(&len_bytes) catch |err| {
-            std.debug.print("Connection closed by server: {}\n", .{err});
-            break;
-        };
-        const payload_len = std.mem.readInt(u32, &len_bytes, .little);
-        const buf = allocator.alloc(u8, 4 + payload_len) catch |err| {
-            std.debug.print("OOM allocating payload buffer: {}\n", .{err});
-            continue;
-        };
-        defer allocator.free(buf);
-        @memcpy(buf[0..4], &len_bytes);
-
-        reader.readSliceAll(buf[4..]) catch |err| {
-            std.debug.print("Failed to read response payload: {}\n", .{err});
-            break;
-        };
-
-        const resp_packet = Packet.deserialize(allocator, buf) catch |err| {
-            std.debug.print("Failed to deserialize response: {}\n", .{err});
-            continue;
-        };
-        defer Packet.free(allocator, resp_packet);
-
-        switch (resp_packet.op) {
-            .Reply => |reply| {
-                if (reply.status == .Error) {
-                    const err_str = reply.data orelse "Unknown Error";
-                    std.debug.print("Error: {s}\n", .{err_str});
-                    continue;
-                }
-                const body = reply.data orelse "{}";
-
-                const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch |err| {
-                    std.debug.print("Failed to parse JSON response: {} (Raw: {s})\n", .{ err, body });
-                    continue;
-                };
-                defer parsed.deinit();
-
-                if (parsed.value == .object) {
-                    const err_msg = parsed.value.object.get("error_message");
-                    if (err_msg != null and err_msg.? != .null) {
-                        std.debug.print("Error: {s}\n", .{err_msg.?.string});
-                    } else {
-                        const cols_val = parsed.value.object.get("columns");
-                        const rows_val = parsed.value.object.get("rows");
-
-                        if (cols_val != null and rows_val != null and cols_val.? == .array and rows_val.? == .array) {
-                            const cols = cols_val.?.array;
-                            const rows = rows_val.?.array;
-
-                            if (cols.items.len == 1 and std.mem.eql(u8, cols.items[0].string, "session_token") and rows.items.len > 0) {
-                                const token = rows.items[0].array.items[0].string;
-                                if (session_token) |tok| allocator.free(tok);
-                                session_token = try allocator.dupe(u8, token);
-                                try stdout.writeAll("Login successful!\n");
-                                try stdout_w.interface.flush();
-                                continue;
-                            }
-
-                            var col_slice = try allocator.alloc([]const u8, cols.items.len);
-                            defer allocator.free(col_slice);
-                            for (cols.items, 0..) |c, i| {
-                                col_slice[i] = c.string;
-                            }
-
-                            var row_slice = try allocator.alloc([]const []const u8, rows.items.len);
-                            defer allocator.free(row_slice);
-                            for (rows.items, 0..) |r, i| {
-                                var row_cells = try allocator.alloc([]const u8, r.array.items.len);
-                                for (r.array.items, 0..) |cell, j| {
-                                    row_cells[j] = cell.string;
-                                }
-                                row_slice[i] = row_cells;
-                            }
-                            defer {
-                                for (row_slice) |r| allocator.free(r);
-                            }
-
-                            printTable(col_slice, row_slice);
-                        } else {
-                            const rows_affected = parsed.value.object.get("rows_affected");
-                            const count = if (rows_affected) |ra| ra.integer else 0;
-                            std.debug.print("Query OK, {d} rows affected\n\n", .{count});
-                        }
-                    }
-                }
-            },
-            else => {
-                std.debug.print("Received unexpected operation response type\n", .{});
-            },
+        defer allocator.free(frame.payload);
+        if (frame.msg_type == @intFromEnum(MessageType.err)) {
+            try printError(out, frame.payload);
+            try out.flush();
+            return;
+        }
+        if (frame.msg_type != @intFromEnum(MessageType.connect_resp) or frame.payload.len < 1 or frame.payload[0] != 0) {
+            std.debug.print("Handshake rejected by server\n", .{});
+            return error.HandshakeFailed;
         }
     }
+
+    // One-shot: run the single statement and exit.
+    if (one_shot) |sql| {
+        _ = try runStatement(reader, writer, out, allocator, std.mem.trim(u8, sql, " \r\t\n;"));
+        writeFrame(writer, .close, 1, &[_]u8{}) catch {};
+        try out.flush();
+        return;
+    }
+
+    if (interactive) {
+        try out.writeAll("kaidb CLI (binary protocol). Type 'exit' or 'quit', or Ctrl-D.\n\n");
+        try out.flush();
+        var stdin_file = std.Io.File.stdin();
+        var stdin_buf: [8192]u8 = undefined;
+        var stdin_r = stdin_file.reader(io, &stdin_buf);
+        const stdin = &stdin_r.interface;
+        while (true) {
+            try out.writeAll("nova> ");
+            try out.flush();
+            const line = stdin.takeDelimiterExclusive('\n') catch |err| {
+                if (err == error.EndOfStream) break;
+                return err;
+            };
+            const t = std.mem.trim(u8, line, " \r\t;");
+            if (t.len == 0) continue;
+            if (std.mem.eql(u8, t, "exit") or std.mem.eql(u8, t, "quit")) break;
+            if (!try runStatement(reader, writer, out, allocator, t)) break;
+            try out.flush();
+        }
+    } else {
+        // Piped / redirected input: read it all, split into `;`-terminated
+        // statements, run each. Exits cleanly at EOF (no interactive prompt).
+        var stdin_file = std.Io.File.stdin();
+        var stdin_buf: [8192]u8 = undefined;
+        var stdin_r = stdin_file.reader(io, &stdin_buf);
+        const stdin = &stdin_r.interface;
+        // Read the whole input to EOF (allocRemaining handles EOF correctly,
+        // unlike a takeDelimiter loop which can block/spin on a closed pipe).
+        const input = stdin.allocRemaining(allocator, .unlimited) catch |err| blk: {
+            if (err == error.EndOfStream) break :blk try allocator.alloc(u8, 0);
+            return err;
+        };
+        defer allocator.free(input);
+        var it = std.mem.splitScalar(u8, input, ';');
+        while (it.next()) |stmt| {
+            const t = std.mem.trim(u8, stmt, " \r\t\n");
+            if (t.len == 0) continue;
+            if (!try runStatement(reader, writer, out, allocator, t)) break;
+        }
+    }
+
+    writeFrame(writer, .close, 1, &[_]u8{}) catch {};
+    try out.flush();
 }
 
-/// Render a result set as an ASCII box table on stderr, MySQL-CLI style.
-///
-/// Column widths are computed in a first pass as the maximum of the header
-/// length and every cell length in that column, so the table is aligned to the
-/// widest value. It then prints a `+---+` separator, the header row, another
-/// separator, one left-justified row per record, a closing separator, and a
-/// trailing "N rows in set" line.
-///
-/// Returns immediately (drawing nothing) if there are no columns. The width
-/// array is taken from `std.heap.page_allocator` rather than the caller's
-/// allocator because this is a fire-and-forget rendering helper with no
-/// allocator parameter; on allocation failure it silently returns rather than
-/// erroring, since failing to draw a table must not abort the REPL. Rendering
-/// goes through `std.debug.print` (stderr), matching the diagnostic output the
-/// rest of the loop uses. See [`printSeparator`] for the rule lines.
-fn printTable(columns: []const []const u8, rows: []const []const []const u8) void {
-    if (columns.len == 0) return;
+/// Appends a `u16` length-prefixed string (little-endian length) to `list`.
+fn appendLenPrefixed(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    var b2: [2]u8 = undefined;
+    std.mem.writeInt(u16, &b2, @intCast(s.len), .little);
+    try list.appendSlice(allocator, &b2);
+    try list.appendSlice(allocator, s);
+}
 
+/// Renders a result set as an ASCII box table (MySQL-CLI style) to `out`
+/// (stdout, so results are pipeable). Column widths are the max of the header
+/// and every cell in that column. Draws nothing for zero columns.
+fn printTable(out: *Io.Writer, columns: []const []const u8, rows: []const []const []const u8) !void {
+    if (columns.len == 0) {
+        try out.writeAll("(no columns)\n\n");
+        return;
+    }
     var widths = std.heap.page_allocator.alloc(usize, columns.len) catch return;
     defer std.heap.page_allocator.free(widths);
-    for (columns, 0..) |col, i| {
-        widths[i] = col.len;
-    }
+    for (columns, 0..) |col, i| widths[i] = col.len;
     for (rows) |row| {
         for (row, 0..) |cell, i| {
-            if (i < widths.len) {
-                widths[i] = @max(widths[i], cell.len);
-            }
+            if (i < widths.len) widths[i] = @max(widths[i], cell.len);
         }
     }
 
-    printSeparator(widths);
-    std.debug.print("|", .{});
-    for (columns, 0..) |col, i| {
-        std.debug.print(" {s:<[1]} |", .{ col, widths[i] });
-    }
-    std.debug.print("\n", .{});
-    printSeparator(widths);
-
+    try printSeparator(out, widths);
+    try out.writeAll("|");
+    for (columns, 0..) |col, i| try out.print(" {s:<[1]} |", .{ col, widths[i] });
+    try out.writeAll("\n");
+    try printSeparator(out, widths);
     for (rows) |row| {
-        std.debug.print("|", .{});
+        try out.writeAll("|");
         for (row, 0..) |cell, i| {
-            if (i < widths.len) {
-                std.debug.print(" {s:<[1]} |", .{ cell, widths[i] });
-            }
+            if (i < widths.len) try out.print(" {s:<[1]} |", .{ cell, widths[i] });
         }
-        std.debug.print("\n", .{});
+        try out.writeAll("\n");
     }
-    printSeparator(widths);
-    std.debug.print("{d} rows in set\n\n", .{rows.len});
+    try printSeparator(out, widths);
+    try out.print("{d} row(s) in set\n\n", .{rows.len});
 }
 
-/// Print a horizontal rule line (`+----+----+`) sized to the given column
-/// widths.
-///
-/// Each column contributes `width + 2` dashes (the extra two account for the
-/// single-space padding [`printTable`] puts on either side of every cell),
-/// bracketed by `+` characters. Written to stderr via `std.debug.print` to stay
-/// consistent with [`printTable`].
-fn printSeparator(widths: []const usize) void {
-    std.debug.print("+", .{});
+/// Prints a `+----+----+` rule sized to `widths` (each column `width + 2`).
+fn printSeparator(out: *Io.Writer, widths: []const usize) !void {
+    try out.writeAll("+");
     for (widths) |w| {
         var j: usize = 0;
-        while (j < w + 2) : (j += 1) {
-            std.debug.print("-", .{});
-        }
-        std.debug.print("+", .{});
+        while (j < w + 2) : (j += 1) try out.writeAll("-");
+        try out.writeAll("+");
     }
-    std.debug.print("\n", .{});
+    try out.writeAll("\n");
 }

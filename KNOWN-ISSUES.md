@@ -57,9 +57,11 @@ remains:
    separate reclamation path. Harmless for a load-once workload, but real for
    update / delete-heavy churn.
 
-7. **`kaidb-cli` REPL infinite-loops on piped / EOF stdin** (emits an unbounded stream
-   of `nova>` prompts). It cannot be driven by piping a script; needs an EOF check in
-   the REPL loop (`src/cli.zig`). Minor, but it blocks scripted use of the CLI.
+7. **`kaidb-cli` REPL infinite-loop on piped/EOF stdin: FIXED.** The CLI was rewritten
+   onto the pure binary wire protocol (`proto/protocol.zig`, no HTTP/JSON) with `-c`
+   one-shot and piped-batch modes; piped input is read with `allocRemaining` (EOF-safe)
+   so it runs each `;`-terminated statement and exits cleanly. Interactive TTY mode
+   remains for humans.
 
 ## Structural limits (larger, deliberate for now)
 
