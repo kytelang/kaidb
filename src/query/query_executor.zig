@@ -2154,6 +2154,82 @@ pub const QueryExecutor = struct {
         }
     }
 
+    /// Extract the numeric lower/upper bounds a `whereIsPlainRangeOn(col)`
+    /// predicate places on `col` (ignoring inclusivity, which does not matter for
+    /// a selectivity estimate). Recurses through ANDs; leaves a bound null when
+    /// the predicate is open on that side.
+    fn rangeNumericBounds(e: *const ast.Expr, col: []const u8, lo: *?f64, hi: *?f64) void {
+        switch (e.*) {
+            .between => |b| if (isColRefNamed(b.operand, col)) {
+                if (litValF64(b.lo)) |v| lo.* = v;
+                if (litValF64(b.hi)) |v| hi.* = v;
+            },
+            .binary_op => |b| switch (b.op) {
+                .AND => {
+                    rangeNumericBounds(b.left, col, lo, hi);
+                    rangeNumericBounds(b.right, col, lo, hi);
+                },
+                .GT, .GTE => {
+                    if (isColRefNamed(b.left, col)) {
+                        if (litValF64(b.right)) |v| lo.* = v;
+                    } else if (isColRefNamed(b.right, col)) {
+                        if (litValF64(b.left)) |v| hi.* = v;
+                    }
+                },
+                .LT, .LTE => {
+                    if (isColRefNamed(b.left, col)) {
+                        if (litValF64(b.right)) |v| hi.* = v;
+                    } else if (isColRefNamed(b.right, col)) {
+                        if (litValF64(b.left)) |v| lo.* = v;
+                    }
+                },
+                .EQ => {
+                    const v = if (isColRefNamed(b.left, col)) litValF64(b.right) else if (isColRefNamed(b.right, col)) litValF64(b.left) else null;
+                    if (v) |x| {
+                        lo.* = x;
+                        hi.* = x;
+                    }
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    /// Estimate the fraction of rows a plain range on `col` matches, from the
+    /// index's value span (its first/last encoded key) under a uniform-distribution
+    /// assumption (the same estimate PostgreSQL falls back to without a histogram).
+    /// Decodes min/max straight from the index key endpoints (no base fetch), so it
+    /// is O(one descent each). Returns null when it cannot estimate (non-fixed-width
+    /// column, empty index, degenerate span), leaving the planner's default choice.
+    fn estimateRangeFraction(we: *const ast.Expr, col: []const u8, ctype: ColumnType, idx_tree: *BPlusTree) !?f64 {
+        if (!isFixedWidthIndexEnc(ctype)) return null;
+
+        var it_lo = try idx_tree.rangeScan("", null);
+        defer it_lo.deinit();
+        const cmin = while (try it_lo.next()) |cell| {
+            const colon = std.mem.indexOfScalar(u8, cell.key, ':') orelse continue;
+            break decodeFixedEncF64(cell.key[0..colon], ctype) orelse continue;
+        } else return null;
+
+        var it_hi = try idx_tree.rangeScanDesc(null, null);
+        defer it_hi.deinit();
+        const cmax = while (try it_hi.next()) |cell| {
+            const colon = std.mem.indexOfScalar(u8, cell.key, ':') orelse continue;
+            break decodeFixedEncF64(cell.key[0..colon], ctype) orelse continue;
+        } else return null;
+
+        if (cmax <= cmin) return null; // single-valued or degenerate: no useful estimate
+
+        var lo: ?f64 = null;
+        var hi: ?f64 = null;
+        rangeNumericBounds(we, col, &lo, &hi);
+        const rlo = @max(lo orelse cmin, cmin);
+        const rhi = @min(hi orelse cmax, cmax);
+        if (rhi <= rlo) return 0;
+        return (rhi - rlo) / (cmax - cmin);
+    }
+
     /// Evaluate a `whereIsPlainRangeOn(col)` predicate against a single numeric
     /// value `v` of `col`. Precise (handles inclusive/exclusive bounds), so the
     /// index-only scan can filter each decoded value exactly.
@@ -3309,6 +3385,28 @@ pub const QueryExecutor = struct {
                         defer self.allocator.free(rb.start_key);
                         defer if (rb.end_key) |ek| self.allocator.free(ek);
                         const idx_tree = try self.db.getIndexTree(idx.name);
+
+                        // Selectivity-aware plan choice: for an UNORDERED, UNLIMITED
+                        // read (the aggregate / full-materialise shape), when the
+                        // range matches a large fraction of the table the index +
+                        // clustered base fetch reads most base leaves ANYWAY, plus
+                        // the index walk and a per-PK descent. A full clustered scan
+                        // reads those leaves once, sequentially, with none of that
+                        // overhead - the switch PostgreSQL makes above ~a quarter
+                        // selectivity. Skip the index and fall through to the full
+                        // table scan (the always-on FilterIterator re-applies the
+                        // WHERE, so the result is identical). Ordered/limited queries
+                        // keep the index (it supplies order / an early LIMIT break),
+                        // and a non-plain range keeps it too.
+                        if (sel.order_by == null and sel.limit == null and
+                            whereIsPlainRangeOn(sel.where_expr.?, idx.key_columns[0].name))
+                        {
+                            const est = try estimateRangeFraction(sel.where_expr.?, idx.key_columns[0].name, colTypeByName(base_table_meta, idx.key_columns[0].name), idx_tree);
+                            if (est) |frac| if (frac > 0.30) {
+                                idx_tree.deinit();
+                                continue;
+                            };
+                        }
 
                         // A single-key `ORDER BY <this column> DESC` is served by a
                         // BACKWARD range scan: the top of the range is emitted first,
