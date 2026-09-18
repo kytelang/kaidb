@@ -2308,6 +2308,139 @@ pub const QueryExecutor = struct {
         return QueryResponse{ .columns = columns, .column_types = col_types, .rows = rows, .rows_affected = 0 };
     }
 
+    /// Index-only scalar aggregate over a COVERING composite index: serves
+    /// `SELECT agg(v) [, COUNT(*)] FROM t WHERE f BETWEEN a AND b` (a plain range
+    /// on `f`, aggregates over a different column `v`) entirely from an EXACT
+    /// composite index that leads with the FILTER column `f` and carries the
+    /// aggregated column `v` as its second key column. Both are read straight from
+    /// the index key (`enc(f):enc(v):pk`), so the clustered base tree is never
+    /// touched - this is the covering-index answer to the wide secondary-index
+    /// base fetch (Q3), the same trick a DBA adds a covering index for on any
+    /// clustered engine. Falls back (returns null) when no such index exists or
+    /// the shape is unsupported; `tryIndexOnlyScalarAgg` still handles the case
+    /// where the filter and aggregate are the same column.
+    ///
+    /// Soundness gate matches the sibling fast paths: sole in-flight transaction,
+    /// no join/group/distinct/having/limit/offset. Correct because a plain range
+    /// on the lead is one contiguous ascending run in the index, so the scan can
+    /// stop the moment it leaves the range.
+    fn tryIndexOnlyScalarAggComposite(self: *QueryExecutor, sel: ast.SelectStmt) !?QueryResponse {
+        if (sel.joins.len != 0 or sel.group_by != null or sel.distinct or sel.having_expr != null) return null;
+        if (sel.projections.len == 0 or sel.limit != null or sel.offset != null) return null;
+        if (self.db.txn_manager.activeTxnCount(self.db.pool.pager.io) != 1) return null;
+        const we = sel.where_expr orelse return null;
+
+        // All projections must be non-distinct aggregates sharing one value column
+        // `vc` (COUNT(*) allowed alongside); require at least one column aggregate.
+        var vcol: ?[]const u8 = null;
+        for (sel.projections) |p| {
+            if (p.expr != .aggregate) return null;
+            const agg = p.expr.aggregate;
+            if (agg.distinct) return null;
+            switch (agg.argument) {
+                .star => {},
+                .column => |c| {
+                    if (vcol) |v| {
+                        if (!std.mem.eql(u8, v, c)) return null;
+                    } else vcol = c;
+                },
+                else => return null,
+            }
+        }
+        const vc = vcol orelse return null;
+
+        const table_meta = for (self.db.catalog.tables.items) |t| {
+            if (std.mem.eql(u8, t.name, sel.table_name)) break t;
+        } else return null;
+        const vtype = colTypeByName(table_meta, vc);
+        if (!isFixedWidthIndexEnc(vtype)) return null;
+
+        // An EXACT composite index (f, v) whose LEAD f (!= v) the WHERE ranges on.
+        const idx = for (self.db.catalog.indexes.items) |ix| {
+            if (ix.table_id != table_meta.id) continue;
+            if (!ix.exact) continue;
+            if (ix.key_columns.len < 2) continue;
+            if (!std.mem.eql(u8, ix.key_columns[1].name, vc)) continue;
+            if (std.mem.eql(u8, ix.key_columns[0].name, vc)) continue;
+            if (!whereIsPlainRangeOn(we, ix.key_columns[0].name)) continue;
+            break ix;
+        } else return null;
+        const fcol = idx.key_columns[0].name;
+        const ftype = colTypeByName(table_meta, fcol);
+        if (!isFixedWidthIndexEnc(ftype)) return null;
+
+        const rb = (try self.getRangeForCol(we, fcol, ftype)) orelse return null;
+        defer self.allocator.free(rb.start_key);
+        defer if (rb.end_key) |e| self.allocator.free(e);
+
+        const idx_tree = try self.db.getIndexTree(idx.name);
+        defer idx_tree.deinit();
+
+        var accs = try self.allocator.alloc(AggAcc, sel.projections.len);
+        defer self.allocator.free(accs);
+        for (accs) |*a| a.* = .{};
+
+        // Scan from the lower bound; a plain range is one contiguous ascending run
+        // on the lead, so stop as soon as we leave it (after having entered it).
+        var it = try idx_tree.rangeScan(rb.start_key, null);
+        defer it.deinit();
+        var seen_in_range = false;
+        while (try it.next()) |cell| {
+            const key = cell.key;
+            const c0 = std.mem.indexOfScalar(u8, key, ':') orelse continue;
+            const fval = decodeFixedEncF64(key[0..c0], ftype) orelse continue;
+            if (!evalRangeOnValue(we, fcol, fval)) {
+                if (seen_in_range) break; // passed the upper end of the range
+                continue; // still below an exclusive lower bound
+            }
+            seen_in_range = true;
+            // Decode the aggregated value from the SECOND key field.
+            const rest = key[c0 + 1 ..];
+            const c1 = std.mem.indexOfScalar(u8, rest, ':') orelse continue;
+            const v = decodeFixedEncF64(rest[0..c1], vtype) orelse continue;
+            for (sel.projections, 0..) |p, j| {
+                const agg = p.expr.aggregate;
+                const acc = &accs[j];
+                if (agg.kind == .COUNT) {
+                    acc.count += 1;
+                } else {
+                    acc.saw_value = true;
+                    acc.sum += v;
+                    acc.num_seen += 1;
+                    if (v != @trunc(v)) acc.all_int = false;
+                    if (!acc.have_num) {
+                        acc.min_num = v;
+                        acc.max_num = v;
+                        acc.have_num = true;
+                    } else {
+                        if (v < acc.min_num) acc.min_num = v;
+                        if (v > acc.max_num) acc.max_num = v;
+                    }
+                }
+            }
+        }
+
+        var columns = try self.allocator.alloc([]const u8, sel.projections.len);
+        var col_types = try self.allocator.alloc(ColumnType, sel.projections.len);
+        var cells = try self.allocator.alloc([]const u8, sel.projections.len);
+        for (sel.projections, 0..) |p, i| {
+            const agg = p.expr.aggregate;
+            columns[i] = try self.allocator.dupe(u8, p.alias orelse switch (agg.kind) {
+                .COUNT => "COUNT",
+                .SUM => "SUM",
+                .AVG => "AVG",
+                .MIN => "MIN",
+                .MAX => "MAX",
+            });
+            col_types[i] = self.projectionType(sel, p);
+            cells[i] = try self.formatAggregate(agg, accs[i]);
+        }
+        var rows = try self.allocator.alloc([]const []const u8, 1);
+        rows[0] = cells;
+        self.index_only_counts += 1;
+        return QueryResponse{ .columns = columns, .column_types = col_types, .rows = rows, .rows_affected = 0 };
+    }
+
     fn tryIndexMinMax(self: *QueryExecutor, sel: ast.SelectStmt) !?QueryResponse {
         if (sel.joins.len != 0 or sel.group_by != null or sel.having_expr != null or sel.distinct) return null;
         if (sel.where_expr != null or sel.projections.len == 0) return null;
@@ -4250,6 +4383,11 @@ pub const QueryExecutor = struct {
                 // the index key), no base-row descent. Closes the ~197x wide-range
                 // aggregate gap vs PostgreSQL measured on the disk-bound VM.
                 if (try self.tryIndexOnlyScalarAgg(sel)) |resp| return resp;
+                // Scalar AGG(v) WHERE <range on f> answered index-only from a
+                // COVERING composite (f, v) index (v decoded from the second key
+                // field), no clustered base-row descent - the covering-index answer
+                // to the wide secondary-index base fetch.
+                if (try self.tryIndexOnlyScalarAggComposite(sel)) |resp| return resp;
 
                 // Projection pushdown: for a simple single-table read, decode only
                 // the columns the plan actually reads. Saved/restored so nested or
