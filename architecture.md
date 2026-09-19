@@ -296,25 +296,3 @@ Because the leaf fetch is irreducible by descent tricks, the levers that actuall
 *   **(c)** denser leaves, so a given range spans fewer pages.
 
 The one cheap win the cost model does allow, and which is implemented, is the sorted-batch case: when a look-ahead batch is already in clustered order the base fetches are sequential, so the kernel's own read-ahead covers them and the explicit per-PK prefetch descent is skipped as redundant (section 4).
-
----
-
-## 8. Capability Baseline: What kaidb Is and Can Do
-
-This is the authoritative statement of current capability, verified against the code and the test/benchmark suites, and it is deliberately neither over- nor under-stated.
-
-### What kaidb is
-
-A **standalone, disk-based, index-organised (clustered) B+Tree storage engine** with SQL and document surfaces, reached over a binary wire protocol, written in Zig. It is fully durable: write-ahead logging, doublewrite torn-write protection, crash recovery, cold and hot backup, and point-in-time recovery to an LSN. It is **not** an in-memory database; data lives on disk and is paged in on demand through a bounded, auto-sized buffer pool.
-
-### Verified capabilities (each has a red-to-green test or a measured benchmark)
-
-*   **Durability under failure.** Committed data survives hard kill (`kill -9`), torn mid-write, and disk-full (ENOSPC), and recovers exactly with no corruption. The tail torn WAL record is correctly discarded.
-*   **Concurrency.** Per-tree structure lock plus per-frame latches plus a per-table group lock give multi-writer safety; a default-on concurrency fuzzer guards it. The `:3009` binary data-plane handled 80 concurrent clients and a deliberately runaway self-join without OOM or crash.
-*   **MVCC.** Snapshot isolation with inline latest version plus an undo chain; READ COMMITTED, REPEATABLE READ and SERIALIZABLE (SSI) isolation.
-*   **SQL surface.** Point, range, `IN`, index-only count, MIN/MAX endpoints, grouped aggregates with HAVING, DISTINCT, ORDER BY (forward and backward index scans), deep OFFSET pushed into the ordered scan, table aliases (single-table and joins), covering indexes, nested-loop and hash joins.
-*   **Operability.** `require_auth` / TLS-gated password path / forced admin rotation; `/healthz`, `/readyz`, and a Prometheus `/metrics` with a query-latency histogram, buffer-pool hit ratio, WAL-size and checkpoint-lag gauges, and replication lag; backup/restore/PITR CLI; primary/follower replication with quorum confirmation and `PROMOTE`/`DEMOTE` role transition (validated live over loopback).
-
-### The honest scope boundary, and why it is a roadmap and not a wall
-
-The one regime that has not been re-measured with the current build is a working set that substantially **exceeds the buffer pool**. The concern there is specific and bounded: the random secondary-index descent (section 6) turns cached page touches into random disk seeks, and kaidb does not yet have the streaming-async-I/O, I/O-combining, and bulk-scan-ring machinery that keeps PostgreSQL fast in that regime (section 7). None of those require a redesign, and the highest-impact one (async overlapped reads) reuses the reactor kaidb already has. So "general-purpose at scale" is an engineering roadmap (section 7, levers 1 to 4), not a structural limit.
