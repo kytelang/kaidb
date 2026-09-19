@@ -12,10 +12,8 @@ merged.nova
 .DS_Store
 
 # runtime data + test scratch
-data/*.db
-data/*.wal
+/data/
+test_*
 *.novadb
 *.wal
-test_wal_recovery/
-test_wal_docwire7/
 testdata/*.db

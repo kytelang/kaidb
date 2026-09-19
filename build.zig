@@ -35,8 +35,14 @@ pub fn build(b: *std.Build) void {
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
+    // Tests write scratch databases (test_*.db and test_wal_*/ directories) into
+    // the working directory; sweep them once both test binaries have finished so a
+    // `zig build test` leaves no stray folders behind. Runs last (depends on the
+    // test runs); best-effort so a clean tree does not fail the build.
+    const clean_scratch = b.addSystemCommand(&.{ "sh", "-c", "rm -rf test_* 2>/dev/null || true" });
+    clean_scratch.step.dependOn(&run_mod_tests.step);
+    clean_scratch.step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&clean_scratch.step);
 
     const cross_step = b.step("cross", "Cross-compile NovaDB for all supported OS/arch targets");
     const CrossTarget = struct { triple: []const u8, server: bool };

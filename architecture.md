@@ -322,4 +322,4 @@ The one regime that has not been re-measured with the current build is a working
 
 ### Deliberate non-goals (today)
 
-Horizontal sharding (scale is instances behind a proxy), large out-of-line blobs beyond the overflow cutoff (about 2 KiB inline), and automatic HA failover policy (the engine provides the `PROMOTE`/`DEMOTE` mechanism; fencing an un-notified old leader is the orchestrator's job). See `KNOWN-ISSUES.md` for the live register and `prod-fitness.md` for the production-readiness audit.
+Horizontal sharding (scale is instances behind a proxy), large out-of-line blobs beyond the overflow cutoff (about 2 KiB inline), and automatic HA failover policy (the engine provides the `PROMOTE`/`DEMOTE` mechanism; fencing an un-notified old leader is the orchestrator's job). See `discards/KNOWN-ISSUES.md` for the live register and `discards/prod-fitness.md` for the production-readiness audit.
