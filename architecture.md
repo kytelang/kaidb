@@ -9,8 +9,8 @@ This document serves as the comprehensive architectural reference specification 
 Every B+Tree node (leaf and internal), plus every overflow and undo page, is one fixed-size `PAGE_SIZE` block laid out as a *slotted page*, so variable-length records (cells) coexist with an ordered directory without moving payloads on each insert. `page.zig` owns this byte-level format; `btree.zig` drives tree structure, splitting, locking, the pool and the WAL on top of it.
 
 A page grows from *both ends toward the middle*:
-*   **Slot directory** — a densely packed array of fixed-size `CellPtr` entries, one per live cell, kept in **key order**. It begins immediately after the header (offset `@sizeOf(PageHeader)`) and grows toward higher offsets.
-*   **Cell payloads** — each cell's `key` bytes followed by its `value` bytes, stored *unordered*. They begin at the top of the page (`PAGE_SIZE`) and grow toward lower offsets.
+*   **Slot directory**: a densely packed array of fixed-size `CellPtr` entries, one per live cell, kept in **key order**. It begins immediately after the header (offset `@sizeOf(PageHeader)`) and grows toward higher offsets.
+*   **Cell payloads**: each cell's `key` bytes followed by its `value` bytes, stored *unordered*. They begin at the top of the page (`PAGE_SIZE`) and grow toward lower offsets.
 
 ```
  0                                                          PAGE_SIZE
@@ -63,9 +63,9 @@ The `PagePool` is split into `num_instances` independent shards (16 for a normal
 ### Tree Descent Latching
 Concurrent access to one `BPlusTree` is protected by two independent locks: a per-tree `structure_lock` (next subsection) and per-frame latches taken during the root-to-leaf descent. Three descent routines implement the latching, chosen by the operation:
 
-*   **Reads — `findLeafShared`.** Point lookups and range-scan positioning crab down with **shared** latches: the child is latched before the parent is released, so the path can never be observed half-modified.
-*   **Restructures — `findLeafExclusive`.** A split or merge descends with the identical crabbing but **exclusive** latches. It still releases the parent as soon as the child is latched; it does *not* hold the chain up an "unsafe" path. The guarantee that no other writer restructures the tree concurrently comes from the exclusive `structure_lock`, not from holding latches.
-*   **In-place write fast path — `findLeafOptimistic`.** A non-splitting insert, non-merging delete, or in-place update takes **no latches on internal nodes at all** (betting the leaf will not need restructuring) and latches only the leaf at the end. This is safe because it runs under a shared `structure_lock`, which freezes the internal levels (see below). The leaf-reuse scan cursor uses the read-only twin `findLeafOptimisticShared`.
+*   **Reads (`findLeafShared`).** Point lookups and range-scan positioning crab down with **shared** latches: the child is latched before the parent is released, so the path can never be observed half-modified.
+*   **Restructures (`findLeafExclusive`).** A split or merge descends with the identical crabbing but **exclusive** latches. It still releases the parent as soon as the child is latched; it does *not* hold the chain up an "unsafe" path. The guarantee that no other writer restructures the tree concurrently comes from the exclusive `structure_lock`, not from holding latches.
+*   **In-place write fast path (`findLeafOptimistic`).** A non-splitting insert, non-merging delete, or in-place update takes **no latches on internal nodes at all** (betting the leaf will not need restructuring) and latches only the leaf at the end. This is safe because it runs under a shared `structure_lock`, which freezes the internal levels (see below). The leaf-reuse scan cursor uses the read-only twin `findLeafOptimisticShared`.
 
 Every descended page is pinned in the pool for the duration of the access and unpinned exactly once on every path; `MAX_TREE_DEPTH` bounds the descent so a corrupted parent pointer fails cleanly instead of looping.
 
@@ -209,7 +209,7 @@ kaidb is **index-organised (clustered)**: a user table *is* its primary-key B+Tr
 *   **Primary-key point or range lookup: the row is in the leaf you already reached.** There is no separate "fetch the row" step. A heap-organised engine like PostgreSQL, by contrast, descends its index to a tuple id and then does a *second, unrelated* random read of the heap page. So for PK-driven access the clustered design does strictly less I/O.
 *   **Secondary-index lookup: this is where the clustered design pays.** A secondary index stores `(indexed-value, primary-key)`; resolving each match to its row requires descending the base PK tree (`fetchVisibleFilteredJson`). For scattered (non-correlated) matches, each is a fresh root-to-leaf descent, i.e. O(tree height) page touches. The prefetch and leaf-cursor reuse in section 4 amortise the *sequential/correlated* case; the *random* case is the open lever (section 7).
 *   **Key encoding.** Secondary-index keys are encoded as order-preserving, delimiter-safe fixed tokens (`encodeIndexValueAlloc` in `src/schema/types.zig`), so index range scans are true ordered seeks. The clustered base primary key, however, is currently stored as decimal **text**, so its physical order is lexical, not numeric. This is why the fast clustered-PK range path (`pkClusteredWindow`) is gated to same-digit-width, non-negative bounds, where lexical order equals numeric order. A fixed-width big-endian integer PK encoding would make clustered range scans general; it is an on-disk format change and is deliberately deferred.
-*   **Page density.** The denser the pages -- fewer bytes per row, so more rows per leaf -- the more of the dataset fits the pool and the shorter the tree, so a given query takes fewer misses. Density is therefore a first-order lever, and the storage-format choices (compact cell layout, order-preserving keys) target it directly.
+*   **Page density.** The denser the pages (fewer bytes per row, so more rows per leaf), the more of the dataset fits the pool and the shorter the tree, so a given query takes fewer misses. Density is therefore a first-order lever, and the storage-format choices (compact cell layout, order-preserving keys) target it directly.
 
 ### Recommended practice: cover wide secondary-index reads with a composite index
 
@@ -223,7 +223,7 @@ CREATE INDEX ix_td ON ord (total_due);
 CREATE INDEX ix_td_cust ON ord (total_due, customer_id);
 ```
 
-With the covering index the read is answered index-only: kaidb reads the aggregated or projected value straight from the composite key and never touches the clustered base tree. The planner selects this path automatically -- the index-only fast paths (`tryIndexOnlyCount`, `tryIndexMinMax`, `tryIndexGroupAgg`, `tryIndexOnlyScalarAgg`, `tryIndexOnlyScalarAggComposite`) are tried before the general scan -- so it covers scalar aggregates (`avg`/`sum`/`min`/`max`/`count` over a trailing column filtered on the lead), `GROUP BY` on an indexed column, and projections of the covered columns, with no hint required.
+With the covering index the read is answered index-only: kaidb reads the aggregated or projected value straight from the composite key and never touches the clustered base tree. The planner selects this path automatically: the index-only fast paths (`tryIndexOnlyCount`, `tryIndexMinMax`, `tryIndexGroupAgg`, `tryIndexOnlyScalarAgg`, `tryIndexOnlyScalarAggComposite`) are tried before the general scan, so it covers scalar aggregates (`avg`/`sum`/`min`/`max`/`count` over a trailing column filtered on the lead), `GROUP BY` on an indexed column, and projections of the covered columns, with no hint required.
 
 Rules of thumb:
 
@@ -278,7 +278,7 @@ For the wide secondary-index read (filter on an indexed column, return or aggreg
 
 The structural conclusion is that **the base seek is the whole gap, and row materialisation is not a factor.** The `Cell` union carries numerics inline (no per-row `itoa`/`dtoa`), so there is no "per-row JSON" cost to remove; borrowing the column-name array and the inline row image rather than copying them per row lowers allocator pressure but cannot move a query whose time is elsewhere.
 
-Crucially the base-seek cost is the **leaf work** — fetching the 16 KiB base leaf and binary-searching it — not the framing of the descent. The descent crabs through internal nodes that stay hot in the pool, so it is nearly free. That is why the obvious descent-avoidance ideas do not help a scattered scan:
+Crucially the base-seek cost is the **leaf work** (fetching the 16 KiB base leaf and binary-searching it), not the framing of the descent. The descent crabs through internal nodes that stay hot in the pool, so it is nearly free. That is why the obvious descent-avoidance ideas do not help a scattered scan:
 
 *   A **sibling-hop cursor** (follow `next_page_id` instead of re-descending on a leaf change) touches a full leaf page per hop; with scattered matches (roughly one per leaf) the target is a leaf or two away, so hopping reads *more* leaves than a cached-internal descent, not fewer.
 *   An **adaptive hash index** (`key -> leaf` cache) still has to fetch and search the same leaf on a hit, so its probe cost is pure overhead here; it pays off only for *repeated hot-key point lookups* (Zipfian OLTP), not a scan of many distinct keys.
