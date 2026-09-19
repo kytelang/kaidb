@@ -2,7 +2,7 @@
 //!
 //! A thin, standalone SQL client: it owns no storage and never interprets SQL.
 //! It opens a socket to a running server, speaks the **pure binary wire
-//! protocol** in `proto/protocol.zig` (the "NOVA"-magic framed protocol,
+//! protocol** in `proto/protocol.zig` (the magic-framed binary protocol,
 //! MessageType `connect`/`query`/`query_resp`/`err`), and pretty-prints the
 //! binary result. There is NO HTTP and NO JSON anywhere on this path: results
 //! arrive as the split fixed/heap row encoding and are decoded field by field.
@@ -22,7 +22,7 @@ const std = @import("std");
 const Io = std.Io;
 const tls = @import("tls");
 const Config = @import("common/config.zig").Config;
-/// The pure binary wire protocol: "NOVA"-magic framing, message types, and the
+/// The pure binary wire protocol: magic-tag framing, message types, and the
 /// split fixed/heap row encoding the server emits for a result set.
 const proto = @import("proto/protocol.zig");
 

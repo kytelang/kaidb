@@ -854,7 +854,7 @@ pub const Database = struct {
     /// Everything below `committed_below` is committed unless it appears in the
     /// abort list, so only the recent committed window is written - the whole point
     /// of the watermark (see [`TransactionManager.advanceWatermark`]).
-    const COMMIT_STATE_MAGIC: u64 = 0x4E4F5641_434D5431; // "NOVACMT1"
+    const COMMIT_STATE_MAGIC: u64 = 0x4E4F5641_434D5431; // commit-state sidecar format tag (fixed on-disk value)
     fn persistCommitState(self: *Database) !void {
         const w = self.wal orelse return;
         const io = self.pool.pager.io;
@@ -971,7 +971,7 @@ pub const Database = struct {
     /// that identify a collection index, and the page id of its persisted B+Tree
     /// root at the last clean shutdown.
 
-    const INDEX_ROOTS_MAGIC: u64 = 0x4E4F5641_49445831; // "NOVAIDX1"
+    const INDEX_ROOTS_MAGIC: u64 = 0x4E4F5641_49445831; // index-roots format tag (fixed on-disk value)
 
 
 

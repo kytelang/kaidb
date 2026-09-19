@@ -65,7 +65,7 @@ fn envInt(name: string, dflt: int): int {
     return parseIntOr(env.get(name), dflt);
 }
 
-// A tiny deterministic LCG (same shape as the nova YCSB generator) so a run is
+// A tiny deterministic LCG (same shape as the kaidb YCSB generator) so a run is
 // reproducible and every engine sees identical data.
 pub class Rand {
     pub state: long,

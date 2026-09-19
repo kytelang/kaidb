@@ -1,7 +1,7 @@
 //! Binary wire-protocol primitives shared by the kaidb server and its driver.
 //!
 //! This module defines the on-the-wire encoding that a client (Kyte's
-//! `packages/nova-kaidb` driver) and the `btree` server speak to each other.
+//! `packages/kyte-kaidb` driver) and the `btree` server speak to each other.
 //! It is deliberately a low-level, POD-oriented layer: the framing types are
 //! `extern struct`s laid out with a fixed C ABI so both ends can memcpy them
 //! directly to and from a socket buffer, and the read/write helpers do nothing
@@ -12,7 +12,7 @@
 //! ## Message framing
 //!
 //! Every message on the wire is a fixed-size [`MessageHeader`] followed by
-//! `payload_len` bytes of body. The header carries a magic tag ("NOVA" as a
+//! `payload_len` bytes of body. The header carries a magic tag (a
 //! little-endian [`MessageHeader.MAGIC_VALUE`]) so a receiver can cheaply reject
 //! garbage or a desynchronised stream, a [`MessageType`] discriminant naming the
 //! body's shape, a `stream_id` so several logical requests can be multiplexed
@@ -136,7 +136,7 @@ pub const MessageHeader = extern struct {
     /// knows how much to read before the next header.
     payload_len: u64,
 
-    /// The magic tag, ASCII "NOVA" as a little-endian `u32` (`0x4e4f5641`).
+    /// The magic tag, a fixed little-endian `u32` (`0x4e4f5641`).
     pub const MAGIC_VALUE: u32 = 0x4e4f5641;
 
     /// Builds a header with the magic tag set and `flags` cleared.

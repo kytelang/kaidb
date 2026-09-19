@@ -181,7 +181,7 @@ pub const Oid = u32;
 /// The fixed set of built-in type OIDs kaidb advertises in row descriptions and parameter lists.
 ///
 /// These are kaidb's own small, dense numbering (not PostgreSQL's system-catalog
-/// OIDs); the driver maps them to Nova types. Referenced as `oid.int8` etc. from
+/// OIDs); the driver maps them to Kyte types. Referenced as `oid.int8` etc. from
 /// [`FieldDesc.type_oid`] and [`decodeParse`].
 pub const oid = struct {
     /// Boolean.

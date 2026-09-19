@@ -679,6 +679,44 @@ pub fn main(init: std.process.Init) !void {
     const db_file_path = try std.fmt.allocPrint(allocator, "{s}/kaidb.db", .{config.base_dir});
     defer allocator.free(db_file_path);
 
+    // One-time upgrade for a data directory written by an older build that used a
+    // different primary-file name. If the current name is absent but exactly one
+    // other `.db` file is present in `base_dir`, adopt it by renaming in place so an
+    // existing database opens seamlessly with no manual migration step. The legacy
+    // file is found by extension, not by a hard-coded name, and the WAL directory is
+    // shared, so recovery proceeds normally against the adopted file.
+    if (Io.Dir.access(.cwd(), io, db_file_path, .{})) {} else |_| {
+        if (Io.Dir.openDir(.cwd(), io, config.base_dir, .{ .iterate = true })) |dir_const| {
+            var d = dir_const;
+            defer d.close(io);
+            var it = d.iterate();
+            var legacy: ?[]u8 = null;
+            var count: usize = 0;
+            while (it.next(io) catch null) |entry| {
+                if (entry.kind != .file) continue;
+                if (!std.mem.endsWith(u8, entry.name, ".db")) continue;
+                if (std.mem.eql(u8, entry.name, "kaidb.db")) continue;
+                if (std.mem.eql(u8, entry.name, "snapshot.db")) continue;
+                count += 1;
+                if (legacy) |old| allocator.free(old);
+                legacy = allocator.dupe(u8, entry.name) catch null;
+            }
+            if (count == 1) {
+                if (legacy) |name| {
+                    if (std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.base_dir, name })) |old_path| {
+                        defer allocator.free(old_path);
+                        if (Io.Dir.rename(.cwd(), old_path, .cwd(), db_file_path, io)) {
+                            log.info("upgraded data directory: adopted existing database '{s}' as kaidb.db", .{name});
+                        } else |err| {
+                            log.warn("could not adopt existing database '{s}' as kaidb.db: {any}", .{ name, err });
+                        }
+                    } else |_| {}
+                }
+            }
+            if (legacy) |old| allocator.free(old);
+        } else |_| {}
+    }
+
     const wal_dir = if (config.durability.enabled)
         try std.fmt.allocPrint(allocator, "{s}/wal", .{config.base_dir})
     else

@@ -6,7 +6,7 @@
 **Zig**, reached over a binary wire protocol. It is benchmarked head-to-head against PostgreSQL and MySQL
 on the Q1..Q18 "orders" workload (see `benchmark/query-perf-compare/`).
 
-**It is NOT the Nova orchestrator's store.** The orchestrator's control-plane / config state is served by
+**It is NOT the Kyte orchestrator's store.** The orchestrator's control-plane / config state is served by
 the internal blob-store (artifactd), not kaidb. Ignore any older text that frames kaidb's role as the
 "orchestrator control-plane / config store"; that is out of date.
 
@@ -21,7 +21,7 @@ onto it. See `architecture.md` for the honest numbers and the open register.
 
 Recovery correctness was fixed on 2026-08-30 (bounded WAL via runtime checkpointing; committed-transaction
 set persisted at checkpoint and restored on open; collection B+Tree root persisted on split so a collection
-is fully reachable after restart). It is a *separate* project from the **Nova/kyte** language ecosystem,
+is fully reachable after restart). It is a *separate* project from the **Kyte** language ecosystem,
 which connects to it over the binary wire protocol.
 
 Core systems:
@@ -100,7 +100,7 @@ milliseconds, not a `timeval`; TCP_NODELAY/SO_KEEPALIVE via `ws2_32`).
 - Read `architecture.md` FIRST for any storage/execution/transaction change — it specifies the invariants.
 - Zig version: matches the toolchain in `build.zig.zon`.
 
-## Relationship to Nova
+## Relationship to Kyte
 
-Nova (the `lang` repo) talks to kaidb via its **binary protocol** through `packages/nova-kaidb`
-(the Nova driver). kaidb is intentionally independent — build and version it separately.
+Kyte (the `lang` repo) talks to kaidb via its **binary protocol** through `packages/kyte-kaidb`
+(the Kyte driver). kaidb is intentionally independent — build and version it separately.

@@ -96,7 +96,7 @@ const LogRecord = @import("../common/common.zig").LogRecord;
 const OpKind = @import("../common/common.zig").OpKind;
 /// The live database a follower applies received records into via `applyStream`.
 const Database = @import("../schema.zig").Database;
-/// The pure-Nova/Zig TLS stack used for the optional mutual-TLS transport.
+/// The pure-Kyte/Zig TLS stack used for the optional mutual-TLS transport.
 const tls = @import("tls");
 
 /// Scoped logger; all replication diagnostics carry the `.replication` scope so

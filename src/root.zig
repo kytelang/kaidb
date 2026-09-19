@@ -10,7 +10,7 @@
 //! `proto/protocol.zig`). Nothing else in the storage/query/durability stack is
 //! surfaced here; those are pulled in directly by their own modules. Keeping the
 //! re-exports thin is deliberate: the wire types are the stable seam that Kyte's
-//! `nova-kaidb` driver talks to, so they get a single, discoverable home.
+//! `kyte-kaidb` driver talks to, so they get a single, discoverable home.
 //!
 //! Second, and by line-count overwhelmingly, this file is the engine's **end-to-end
 //! integration test bench**. Rather than unit-test each subsystem in isolation, these
@@ -1520,7 +1520,7 @@ test "database crash recovery" {
 /// value encode/decode) from `common/proto.zig`.
 ///
 /// This is the byte-level contract between kaidb and any client, most importantly
-/// Kyte's `nova-kaidb` driver. It is re-exported here so a library consumer can
+/// Kyte's `kyte-kaidb` driver. It is re-exported here so a library consumer can
 /// reach the frame types without depending on the internal module path. See
 /// [`proto`] for the higher-level message protocol layered on top of these frames.
 pub const wire_proto = @import("common/proto.zig");
