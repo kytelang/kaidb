@@ -192,7 +192,7 @@ A crash mid-write can leave a page half-updated ("torn"). The flush paths use a 
 
 A secondary-index scan yields primary keys, and each PK must be resolved to its row by descending the clustered base tree. Two mechanisms keep that from being one full root-to-leaf descent plus one blocking read per row:
 
-*   **Adaptive base-leaf prefetch** (`iterator.zig`): the index scan gathers a look-ahead batch of up to 256 matching PKs, resolves them to their base-table leaf page IDs, and issues OS readahead (`pager.prefetchPages`, using Linux `readahead()` / the BSD `F_RDADVISE` equivalent) so those base pages are being fetched by the kernel before the scan consumes them. It is adaptive: it runs only while the cumulative pool hit ratio shows the base pages are actually missing (a cold or disk-bound scan), and disables itself when the working set is warm, so a hot scan pays nothing for the prefetch machinery.
+*   **Adaptive base-leaf prefetch** (`iterator.zig`): the index scan gathers a look-ahead batch of matching PKs (`DEFAULT_PREFETCH_BATCH = 256`, grown to an MRR window of up to `262144` when the scan order is free, so an unbounded aggregate sorts a large window and a tight `LIMIT` keeps the small default), resolves them to their base-table leaf page IDs, and issues OS readahead (`pager.prefetchPages`, using Linux `readahead()` / the BSD `F_RDADVISE` equivalent) so those base pages are being fetched by the kernel before the scan consumes them. It is adaptive on two axes. First, the explicit per-PK prefetch descent runs only for the *scattered* (range-ordered) path: when a batch is sorted into clustered primary-key order (`may_reorder`), the base fetches walk the tree in ascending key order and the kernel's own sequential read-ahead already stages those pages, so the explicit descent is skipped as pure overhead (measured ~1.8x on the warm wide aggregate). Second, on the range-ordered path it is gated on the cumulative pool hit ratio, so it runs only while the base pages are actually missing (a cold or disk-bound scan) and a warm scan pays nothing for the prefetch machinery.
 *   **Base-leaf cursor reuse** (`LeafReuseSearcher`): the scan keeps a base-table leaf cursor across fetches, so consecutive PKs that land on the same base leaf are answered without re-descending the tree. For a range of nearby PKs this collapses the per-row descent to a single leaf walk.
 
 Both are real, shipped optimisations. What is not yet present is genuinely asynchronous, overlapped I/O (the reads after the readahead hint are still synchronous `pread`s) and vectored `preadv` that combines physically adjacent pages into one syscall. Those are the frontier items in section 7.
@@ -273,7 +273,7 @@ The one asymmetry no engine removes: sequential and batched-random misses pipeli
 
 ### Measured breakdown and ruled-out levers (2026-09-18)
 
-A RAM-pressure profiling pass (2 GB VM, 128 MB pool, OS cache dropped between cold runs, `NOVADB_QPROF=1`) put concrete numbers on the wide secondary-index aggregate `avg(customer_id) WHERE total_due BETWEEN ...` over 10M rows (400,069 matched). The warm per-query phase split is:
+A RAM-pressure profiling pass (2 GB VM, 128 MB pool, OS cache dropped between cold runs, `NOVADB_QPROF=1`) put concrete numbers on the wide secondary-index aggregate `avg(customer_id) WHERE total_due BETWEEN ...` over 1M rows (400,069 matched, about 40% of the table). The warm per-query phase split is:
 
 | Phase | Warm time | Share | What it is |
 |---|---|---|---|
