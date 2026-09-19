@@ -1,11 +1,18 @@
 name: release
 
-# Build kaidb for every supported OS/arch and publish them on a GitHub Release.
+# Build and publish the kaidb release bundles on a GitHub Release. One tag ships THREE things:
 #
-# Fires when a version tag `vX.Y.Z` is pushed, or manually via the Actions tab
-# (workflow_dispatch) with a tag name. Zig cross-compiles every target from a
-# single Linux runner (the project's `zig build cross` step), so there is no
-# per-OS runner matrix to keep in sync.
+#   1. kaidb        -- the database server               (pure Zig, cross-compiled)
+#   2. kai          -- the kaidb command-line client     (pure Zig, cross-compiled)
+#   3. kde          -- Kyte Data Explorer, the desktop DB GUI (a Kyte app; built per OS)
+#
+# kaidb + kai are pure Zig, so a single Linux runner cross-compiles every OS/arch in one shot
+# (`zig build cross`). kde is a Kyte web/desktop app: it needs the Kyte toolchain, its five database
+# driver packages (resolved from their git URLs), and a native webview linked in, so it is built on a
+# per-OS matrix (macOS arm64, Linux x86_64, Windows x86_64) and cannot be cross-compiled from one host.
+#
+# Fires when a version tag `vX.Y.Z` is pushed, or manually via the Actions tab (workflow_dispatch) with
+# a tag name. A manual run still builds everything; it only publishes a Release when run from a tag.
 
 on:
   push:
@@ -18,25 +25,17 @@ on:
         required: true
         type: string
 
-# The job creates a Release and uploads assets, so it needs write access to the
-# repository contents.
+# The release job creates a Release and uploads assets, so it needs write access to repository contents.
 permissions:
   contents: write
 
 jobs:
-  release:
+  # Resolve the release tag ONCE so every downstream job (and the matrix legs of `kde`) agree on it.
+  meta:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # Pin the toolchain to the version the repo builds with
-      # (build.zig.zon `minimum_zig_version`). Bump both together.
-      - name: Set up Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-
       - name: Resolve release tag
         id: tag
         run: |
@@ -46,22 +45,36 @@ jobs:
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
-      # Cross-compile every supported OS/arch. The `cross` step in build.zig
-      # builds each target ReleaseSafe (it sets the mode itself, so there is no
-      # -Doptimize flag to pass) and stamps it into zig-out/cross/<triple>/:
+  # ---- kaidb + kai: pure-Zig, cross-compiled for every OS/arch from one Linux runner ----------------
+  kaidb:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pin the toolchain to the version the repo builds with (build.zig.zon `minimum_zig_version`).
+      # Bump both together.
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # Cross-compile every supported OS/arch. The `cross` step in build.zig builds each target
+      # ReleaseSafe (it sets the mode itself, so there is no -Doptimize flag to pass) and stamps it into
+      # zig-out/cross/<triple>/:
       #   aarch64-macos, x86_64-macos, x86_64-linux-gnu, aarch64-linux-gnu,
       #   x86_64-windows, aarch64-windows.
       - name: Cross-compile all targets
         run: zig build cross
 
-      # One archive per target: .zip for Windows, .tar.gz elsewhere. Each archive
-      # carries whatever binaries that target produced (server `kaidb` and/or
-      # the `kaidb-cli`, `.exe` on Windows) plus LICENSE/README when present.
+      # One archive per target: .zip for Windows, .tar.gz elsewhere. Each archive carries whatever
+      # binaries that target produced (server `kaidb` and the `kai` client, `.exe` on Windows) plus
+      # LICENSE/README when present.
       - name: Package artifacts
-        id: package
         run: |
           set -euo pipefail
-          TAG="${{ steps.tag.outputs.tag }}"
+          TAG="${{ needs.meta.outputs.tag }}"
           OUT="dist"
           mkdir -p "$OUT"
           shopt -s nullglob
@@ -81,14 +94,201 @@ jobs:
               tar -C "$(dirname "$stage")" -czf "$OUT/$base.tar.gz" "$(basename "$stage")"
             fi
           done
-          ( cd "$OUT" && sha256sum * > SHA256SUMS.txt )
-          echo "--- artifacts ---"; ls -la "$OUT"
+          echo "--- kaidb/kai artifacts ---"; ls -la "$OUT"
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kaidb-server-cli
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+  # ---- kde (Kyte Data Explorer): built per OS because it is a Kyte app with a native webview --------
+  # Each leg builds the Kyte toolchain from source (installs it into ~/.kyte, same as the kyte repo's own
+  # release does), then `kyte build --release` compiles kyte-studio into a `kde` binary. The five driver
+  # packages it imports (kaidb, postgres, mysql, mssql, mongodb) resolve from their public git URLs in
+  # kyte-studio/project.json, so no vendored `packages/` directory is needed. The language server
+  # (kynalyzer) is skipped: the explorer does not need it (KYTE_ARCHIVE_SKIP_KYNALYZER=1).
+  kde:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14        # Apple Silicon
+            os: macos
+            arch: arm64
+          - runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+          - runner: windows-latest
+            os: windows
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    env:
+      KYTE_ARCHIVE_SKIP_KYNALYZER: "1"
+    steps:
+      # The Kyte compiler source (built here) and the explorer app source (compiled by it).
+      - name: Check out the Kyte toolchain source
+        uses: actions/checkout@v4
+        with:
+          repository: kytelang/kyte
+          path: lang
+          token: ${{ secrets.KYTE_TOKEN || github.token }}
+      - name: Check out kyte-studio (the explorer app)
+        uses: actions/checkout@v4
+        with:
+          repository: kytelang/kyte-studio
+          path: kyte-studio
+          token: ${{ secrets.KYTE_TOKEN || github.token }}
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # ---- Per-OS LLVM (+ webview backing libs on Linux). These steps mirror the kyte repo's own
+      #      release workflow, which is the known-good recipe for building the compiler on each runner.
+      - name: Install LLVM 21 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm@21 || brew install llvm
+          PREFIX="$(brew --prefix llvm@21 2>/dev/null || brew --prefix llvm)"
+          echo "KYTE_LLVM_PREFIX=$PREFIX" >> "$GITHUB_ENV"
+          "$PREFIX/bin/llvm-config" --version
+
+      - name: Install LLVM 21 + WebKit2GTK (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+          sudo apt-get install -y llvm-21-dev libzstd-dev zlib1g-dev libxml2-dev liblzma-dev libgtk-3-dev
+          # webview desktop backing (WebKit2GTK): the install step builds libwebview.a against these,
+          # and `kyte build` links the explorer against it. 4.1 on 24.04, falling back to 4.0.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev || sudo apt-get install -y libwebkit2gtk-4.0-dev
+          echo "KYTE_LLVM_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+          /usr/lib/llvm-21/bin/llvm-config --version
+          # apt's LLVM does not bundle libstdc++.so/libgcc_s.so; expose them under the names the static
+          # link expects and point KYTE_LLVM_STDCXX_DIR at them.
+          mkdir -p "$HOME/stdcxx"
+          ln -sf "$(g++ -print-file-name=libstdc++.so)" "$HOME/stdcxx/libstdc++.so"
+          ln -sf "$(gcc -print-file-name=libgcc_s.so.1)" "$HOME/stdcxx/libgcc_s.so"
+          echo "KYTE_LLVM_STDCXX_DIR=$HOME/stdcxx" >> "$GITHUB_ENV"
+
+      - name: Install LLVM (dynamic LLVM-C, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          function Find-Prefix {
+            if (Test-Path "C:/Program Files/LLVM/lib/LLVM-C.lib") { return "C:/Program Files/LLVM" }
+            $clang = Get-Command clang.exe -ErrorAction SilentlyContinue
+            if ($clang) {
+              $p = Split-Path (Split-Path $clang.Source)
+              if (Test-Path "$p/lib/LLVM-C.lib") { return $p }
+            }
+            return $null
+          }
+          $prefix = Find-Prefix
+          if (-not $prefix) {
+            choco install llvm --no-progress -y
+            $prefix = Find-Prefix
+            if (-not $prefix) { $prefix = "C:/Program Files/LLVM" }
+          }
+          echo "KYTE_LLVM_PREFIX=$prefix" >> $env:GITHUB_ENV
+          $lib = "$prefix/lib/LLVM-C.lib"; $dll = "$prefix/bin/LLVM-C.dll"
+          if (-not (Test-Path $lib)) { Write-Error "LLVM-C.lib not found at $lib"; exit 1 }
+          if (-not (Test-Path $dll)) { Write-Error "LLVM-C.dll not found at $dll"; exit 1 }
+          Write-Host "LLVM prefix=$prefix (LLVM-C.lib + LLVM-C.dll present)"
+
+      # ---- Build the Kyte toolchain (installs into ~/.kyte: bin + lib + std + deps/webview). It must be
+      #      ReleaseFast: a Debug kyte's leak gate exits 1 on every `kyte build`, which would fail below.
+      - name: Build Kyte toolchain (macOS/Linux, static LLVM)
+        if: runner.os != 'Windows'
+        working-directory: lang
+        run: zig build archive -Doptimize=ReleaseFast -Dcpu=baseline -Dstatic-llvm=true
+
+      - name: Build Kyte toolchain (Windows, dynamic LLVM-C)
+        if: runner.os == 'Windows'
+        working-directory: lang
+        shell: pwsh
+        run: |
+          zig build archive -Doptimize=ReleaseFast -Dcpu=baseline
+          # kyte.exe links LLVM-C.dll dynamically, so it must sit beside the installed compiler for
+          # `kyte build` to run. (deps/webview for the explorer's webview link is staged by the install.)
+          $dll = Join-Path $env:KYTE_LLVM_PREFIX "bin/LLVM-C.dll"
+          Copy-Item $dll (Join-Path $env:USERPROFILE ".kyte/bin")
+
+      # ---- Compile the explorer. Driver packages resolve from the git URLs in project.json into
+      #      ~/.kyte/cache; on Windows, `kyte build` also copies WebView2Loader.dll beside kde.exe.
+      - name: Build kde (Kyte Data Explorer)
+        working-directory: kyte-studio
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.kyte/bin:$PATH"
+          command -v kyte >/dev/null || { echo "kyte not found in ~/.kyte/bin (archive install did not run?)"; exit 1; }
+          kyte version || true
+          kyte build --release
+          ls -la build/release/bin
+
+      # ---- Package: the kde binary + the assets it serves at runtime (wwwroot/ static files, app.yaml).
+      - name: Package kde (macOS/Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.meta.outputs.tag }}"
+          base="kde-${TAG}-${{ matrix.os }}-${{ matrix.arch }}"
+          stage="$(mktemp -d)/$base"
+          mkdir -p "$stage"
+          cp kyte-studio/build/release/bin/* "$stage"/
+          cp -r kyte-studio/wwwroot "$stage"/wwwroot
+          [ -f kyte-studio/app.yaml ] && cp kyte-studio/app.yaml "$stage"/ || true
+          mkdir -p dist
+          tar -C "$(dirname "$stage")" -czf "dist/${base}.tar.gz" "$base"
+          ls -la dist
+
+      - name: Package kde (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.meta.outputs.tag }}"
+          $base = "kde-$tag-${{ matrix.os }}-${{ matrix.arch }}"
+          $stage = Join-Path $env:RUNNER_TEMP $base
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item kyte-studio/build/release/bin/* $stage -Recurse
+          Copy-Item kyte-studio/wwwroot $stage/wwwroot -Recurse
+          if (Test-Path kyte-studio/app.yaml) { Copy-Item kyte-studio/app.yaml $stage }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path $stage -DestinationPath "dist/$base.zip"
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kde-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+  # ---- Collect every artifact, add a checksum manifest, and publish (only on a real version tag). -----
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [ meta, kaidb, kde ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: staged }
+      - name: Collect + checksums
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find staged -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist/ \;
+          ( cd dist && sha256sum * > SHA256SUMS.txt )
+          echo "--- release assets ---"; ls -la dist
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: kaidb ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: kaidb ${{ needs.meta.outputs.tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

@@ -123,7 +123,7 @@ fn buildKaidb(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     });
 
     const cli_exe = b.addExecutable(.{
-        .name = "kaidb-cli",
+        .name = "kai",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/cli.zig"),
             .target = target,
