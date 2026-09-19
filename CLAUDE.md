@@ -15,10 +15,9 @@ the internal blob-store (artifactd), not kaidb. Ignore any older text that frame
 (~3x the logical size), the buffer pool and scan/read paths are not I/O-efficient once the working set
 exceeds the pool, index builds re-scan per index, and the planner scans where it should seek. Some of the
 per-query planner gaps have since been closed on the `perf/q12-pk-range-scan` branch (clustered PK range,
-GROUP BY + HAVING, deep OFFSET; see `discards/benchmark/query-perf-compare/comparison.md` and `discards/KNOWN-ISSUES.md`),
+GROUP BY + HAVING, deep OFFSET; see `architecture.md`),
 but the broad "designed for in-RAM, small data" limits at 10M scale remain. Do not size a general workload
-onto it. See `discards/orders_benchmark.md`, `discards/benchmark_report.md` and `discards/KNOWN-ISSUES.md` for the honest numbers and
-the open register.
+onto it. See `architecture.md` for the honest numbers and the open register.
 
 Recovery correctness was fixed on 2026-08-30 (bounded WAL via runtime checkpointing; committed-transaction
 set persisted at checkpoint and restored on open; collection B+Tree root persisted on split so a collection
@@ -86,7 +85,6 @@ milliseconds, not a `timeval`; TCP_NODELAY/SO_KEEPALIVE via `ws2_32`).
 - `schema/` — `database.zig`, catalog/schema.
 - `src/main.zig`, `src/cli.zig`, `src/root.zig` — entry + CLI.
 - `architecture.md` — the authoritative design spec (page layout, B+Tree, concurrency protocols).
-- `btree_readiness_plan.md`, `btree_network_design.md`, `discards/benchmark_report.md` — planning/perf docs.
 
 ## Key facts / gotchas
 

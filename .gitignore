@@ -1,13 +1,13 @@
 # build + cache artifacts
 .zig-cache/
 zig-out/
+zig-pkg/
 **/.zig-cache/
 **/zig-out/
 *.o
 *.a
 
 # generated / scratch
-merged.nova
 *.log
 .DS_Store
 
