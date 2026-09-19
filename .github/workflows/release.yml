@@ -138,7 +138,7 @@ jobs:
       - name: Check out kyte-studio (the explorer app)
         uses: actions/checkout@v4
         with:
-          repository: kytelang/kyte-studio
+          repository: kytelang/kyte-data-explorer
           path: kyte-studio
           token: ${{ secrets.KYTE_TOKEN || github.token }}
 
