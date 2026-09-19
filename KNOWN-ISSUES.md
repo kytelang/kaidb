@@ -44,6 +44,19 @@ MySQL on the Q1..Q18 orders workload.
 
 ## Query performance (measured gaps)
 
+> **Guidance for wide secondary-index reads: add a covering composite index.** A query
+> that filters on one indexed column but returns or aggregates *another* pays the
+> clustered double-lookup (one base-tree descent per matched row). The recommended fix,
+> the same one used on any clustered engine (InnoDB, SQLite), is a covering composite
+> index that carries every column the query needs, so it is answered index-only. As of
+> 2026-09-19 the planner selects this path automatically for scalar aggregates, `GROUP BY`,
+> and covered projections. Example: `avg(customer_id) WHERE total_due BETWEEN a AND b` runs
+> ~800 ms on `INDEX(total_due)` but **~11 ms on `INDEX(total_due, customer_id)`** (index-only,
+> ahead of PostgreSQL and InnoDB). Without a covering index kaidb stays correct and, for
+> high-selectivity ranges, its planner already switches to a single sequential clustered
+> scan. See `architecture.md` section 6, "Recommended practice: cover wide secondary-index
+> reads with a composite index".
+
 Recent wins already landed on branch `perf/q12-pk-range-scan`: Q12 clustered PK range
 228->10 ms (`98d81c6`), Q16 GROUP BY+HAVING 262->12 ms (`8e44c82`), Q18 deep OFFSET
 185->1 ms (`52e0b39`), and a modest base-row-fetch improvement (`304b35f`). What

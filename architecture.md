@@ -217,6 +217,26 @@ kaidb is **index-organised (clustered)**: a user table *is* its primary-key B+Tr
 *   **Key encoding.** Secondary-index keys are encoded as order-preserving, delimiter-safe fixed tokens (`encodeIndexValueAlloc` / `index_key.zig`), so index range scans are true ordered seeks. The clustered base primary key, however, is currently stored as decimal **text**, so its physical order is lexical, not numeric. This is why the fast clustered-PK range path is gated to same-width, non-negative bounds (where lexical order equals numeric order). A fixed-width big-endian integer PK encoding would make clustered range scans general; it is an on-disk format change and is deliberately deferred.
 *   **Page density.** A 2026-09 footprint pass took a 1M-row load from about 15 GB to about 993 MB on disk. Density matters directly here: the denser the pages, the more of the dataset fits the pool and the fewer misses a given query takes.
 
+### Recommended practice: cover wide secondary-index reads with a composite index
+
+For a query that filters on a secondary-index column but returns or aggregates *another* column, the clustered design must descend the base tree once per matched row (the double-lookup above). On the RAM-pressure benchmark, `SELECT count(*), avg(customer_id) FROM ord WHERE total_due BETWEEN a AND b` (about 40% of the table) runs at ~365 ms as a scan and ~800 ms via the plain `total_due` index, versus ~150 ms on InnoDB. **The fix is the same one a DBA reaches for on any clustered engine (InnoDB and SQLite included): a covering composite index** that carries every column the query needs, so it is answered index-only with no base-row descent at all.
+
+```sql
+-- Instead of relying on a single-column index that forces the double-lookup:
+CREATE INDEX ix_td ON ord (total_due);
+
+-- Add the aggregated / projected column to the index so the query is covered:
+CREATE INDEX ix_td_cust ON ord (total_due, customer_id);
+```
+
+With the covering index the same query runs **index-only at ~11 ms** (ahead of PostgreSQL and InnoDB on this shape), because kaidb reads the aggregated value straight from the index key and never touches the clustered base tree. This applies to scalar aggregates (`avg`/`sum`/`min`/`max`/`count` over a trailing column filtered on the lead), `GROUP BY` on an indexed column, and projections of the covered columns. The planner selects the covering path automatically when a suitable composite index exists; no hint is needed.
+
+Rules of thumb:
+
+*   Put the **filter column first** and the **selected/aggregated columns after it** in the composite index. The order-preserving key encoding then serves the range on the lead and carries the trailing values for free.
+*   This is the standard trade: a covering index costs extra write amplification and disk, so add it for the read patterns that matter, not universally.
+*   Without a covering index, kaidb still runs correctly and, for high-selectivity ranges, its cost-based planner already switches from the index to a single sequential clustered scan (the cheaper plan). The covering index is the way to turn such a read from "scan the table" into "read only the index".
+
 ---
 
 ## 7. Cache-Miss Handling: kaidb vs SQLite vs PostgreSQL
