@@ -6,38 +6,35 @@ This document serves as the comprehensive architectural reference specification 
 
 ## 1. Core Slotted Page Layout & Space Management
 
-Leaf and internal database pages utilize a slotted-page architecture to store variable-length records (cells) dynamically. Space within a page is managed using a two-way growth model:
-*   **Slot Directory**: Grows *downward* from the page header end.
-*   **Cell Payloads**: Grow *upward* from the page bottom.
+Every B+Tree node (leaf and internal), plus every overflow and undo page, is one fixed-size `PAGE_SIZE` block laid out as a *slotted page*, so variable-length records (cells) coexist with an ordered directory without moving payloads on each insert. `page.zig` owns this byte-level format; `btree.zig` drives tree structure, splitting, locking, the pool and the WAL on top of it.
+
+A page grows from *both ends toward the middle*:
+*   **Slot directory** — a densely packed array of fixed-size `CellPtr` entries, one per live cell, kept in **key order**. It begins immediately after the header (offset `@sizeOf(PageHeader)`) and grows toward higher offsets.
+*   **Cell payloads** — each cell's `key` bytes followed by its `value` bytes, stored *unordered*. They begin at the top of the page (`PAGE_SIZE`) and grow toward lower offsets.
 
 ```
-+-------------------------------------------------------------+
-| PageHeader (24 bytes)                                       |
-+-------------------------------------------------------------+
-| Slot 0 (Offset, Size) | Slot 1 | Slot 2 ...                 |
-| ---------> Grows Downwards                                  |
-+-------------------------------------------------------------+
-|                      <--- Free Space --->                   |
-+-------------------------------------------------------------+
-|                                 ... | Cell 2 | Cell 1 | Cell 0 |
-|                                       Grows Upwards <------ |
-+-------------------------------------------------------------+
+ 0                                                          PAGE_SIZE
+ +--------------+-------------------+..........+---------------------+
+ |  PageHeader  |  CellPtr[0..n) ->  | free gap | <- cell payloads    |
+ |  (fixed)     |  slot directory   |          |    key || value     |
+ +--------------+-------------------+..........+---------------------+
+ ^              ^                   ^          ^
+ 0     sizeOf(PageHeader)   free_space_start  free_space_end
 ```
 
-### Contiguous Slot Pointer Shifting
-On record deletion:
-1.  The slot entry corresponding to the target record is removed from the directory.
-2.  All subsequent slots are shifted left by 1 entry size (4 bytes) to ensure that the slot directory remains strictly contiguous and indexable without holes.
-3.  The cell payload space is marked as fragmented free space.
+The `PageHeader` (an `extern struct` at offset 0) carries the `checksum`, `page_type`, `num_cells`, the two free-gap boundaries (`free_space_start` = the byte where the directory ends and the gap begins; `free_space_end` = the offset of the lowest payload), the tree links (`parent_page_id`, the `next_page_id` leaf-sibling chain, `leftmost_child_id`), and `page_lsn` for recovery. Each `CellPtr` slot is `{ offset, key_size, value_size, flags }`. The free space is the gap `[free_space_start, free_space_end)`; a cell fits only if that gap can hold its payload **plus one more `CellPtr`**.
+
+Because the directory is ordered but the payloads are not, inserting a cell in the middle shifts only the small fixed-size `CellPtr` entries, never the variable payload bytes.
+
+### Deletion
+Deleting a cell removes its `CellPtr` from the directory and shifts the following slots down so the directory stays densely packed and index-addressable with no holes. The cell's payload bytes are simply left as dead space; they are not reclaimed until a compaction runs.
 
 ### Zero-Heap In-Place Compaction
-When free space is fragmented and cannot fit a new insertion despite having sufficient cumulative free bytes, the page performs an in-place compaction:
-*   **Zero Heap Allocation**: Compaction operates purely within the page's raw memory byte array to prevent allocator overhead or runtime fragmentation.
-*   **Compaction Algorithm**:
-    1.  A temporary array of slot indices sorted by their payload offsets is constructed.
-    2.  Starting from the bottom of the page (`PAGE_SIZE`), payloads are copied/shifted downwards, packing them contiguously.
-    3.  Offsets in the slot directory are updated to reflect the new contiguous locations.
-    4.  `free_space_start` (denoting the start of the payload space) is adjusted upwards to maximize contiguous free bytes.
+When the free gap cannot fit an insertion despite sufficient *cumulative* free bytes (payload space fragmented by earlier deletions), `SlottedPage.compact` reclaims it entirely within the page's own byte array, with no allocator (the routine sorts into a fixed stack array, so it adds no heap allocation or runtime fragmentation):
+1.  Directory indices are sorted by their payload offset, highest first.
+2.  Walking that order, each payload is slid up against the top of the page (`PAGE_SIZE`) and packed contiguously, using `copyBackwards` so a payload not yet moved is never overwritten.
+3.  Each moved cell's `CellPtr.offset` is rewritten to its new location.
+4.  `free_space_end` is lowered to the new lowest payload and `free_space_start` is set to `@sizeOf(PageHeader) + num_cells * @sizeOf(CellPtr)`, maximising the contiguous free gap.
 
 ---
 
