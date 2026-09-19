@@ -317,8 +317,4 @@ A **standalone, disk-based, index-organised (clustered) B+Tree storage engine** 
 
 ### The honest scope boundary, and why it is a roadmap and not a wall
 
-The one regime that has not been re-measured with the current build is a working set that substantially **exceeds the buffer pool**. The concern there is specific and bounded: the random secondary-index descent (section 6) turns cached page touches into random disk seeks, and kaidb does not yet have the streaming-async-I/O, I/O-combining, and bulk-scan-ring machinery that keeps PostgreSQL fast in that regime (section 7). None of those require a redesign, and the highest-impact one (async overlapped reads) reuses the reactor kaidb already has. So "general-purpose at scale" is an engineering roadmap (section 7, levers 1 to 4), not a structural limit. The correct next step is to quantify the current gap with a small-pool, working-set-exceeds-cache benchmark, then implement lever 1.
-
-### Deliberate non-goals (today)
-
-Horizontal sharding (scale is instances behind a proxy), large out-of-line blobs beyond the overflow cutoff (about 2 KiB inline), and automatic HA failover policy (the engine provides the `PROMOTE`/`DEMOTE` mechanism; fencing an un-notified old leader is the orchestrator's job).
+The one regime that has not been re-measured with the current build is a working set that substantially **exceeds the buffer pool**. The concern there is specific and bounded: the random secondary-index descent (section 6) turns cached page touches into random disk seeks, and kaidb does not yet have the streaming-async-I/O, I/O-combining, and bulk-scan-ring machinery that keeps PostgreSQL fast in that regime (section 7). None of those require a redesign, and the highest-impact one (async overlapped reads) reuses the reactor kaidb already has. So "general-purpose at scale" is an engineering roadmap (section 7, levers 1 to 4), not a structural limit.
