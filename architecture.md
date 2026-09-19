@@ -271,28 +271,31 @@ PostgreSQL's advantage past `shared_buffers` is not clock-sweep or `posix_fadvis
 
 The one asymmetry no engine removes: sequential and batched-random misses pipeline; a single pointer-chasing descent (each index level's address depends on reading the previous level) cannot be prefetched and serialises. The goal is to make the sequential and batched cases fast, which is exactly what levers 1 to 4 do.
 
-### Measured breakdown and ruled-out levers (2026-09-18)
+### Where the base-fetch cost goes
 
-A RAM-pressure profiling pass (2 GB VM, 128 MB pool, OS cache dropped between cold runs, `NOVADB_QPROF=1`) put concrete numbers on the wide secondary-index aggregate `avg(customer_id) WHERE total_due BETWEEN ...` over 1M rows (400,069 matched, about 40% of the table). The warm per-query phase split is:
+For the wide secondary-index read (filter on an indexed column, return or aggregate a different one), the work decomposes into four phases; the proportions are the architectural point:
 
-| Phase | Warm time | Share | What it is |
-|---|---|---|---|
-| `baseSeek` | ~530 ms | 73% | the clustered base-tree lookup per matched PK (descent + leaf binary search) |
-| `idxwalk + other` | ~170 ms | 24% | the secondary-index range walk, batch refill and PK sort |
-| `buildJson` | ~20 ms | ~3% | row materialisation into typed cells |
-| `project` | ~60 ms | | text-encode the output for the wire |
+| Phase | Relative cost | What it is |
+|---|---|---|
+| base seek | dominant (~¾) | the clustered base-tree lookup per matched PK: descent + leaf binary search |
+| index walk | secondary (~¼) | the secondary-index range walk, batch refill and PK sort |
+| materialisation | negligible | decoding the row into typed cells |
+| projection | small | encoding the output for the wire |
 
-The headline finding: **`baseSeek` is the whole gap, and materialisation is not a factor.** The `Cell` union already carries numerics inline (no per-row `itoa`/`dtoa`), so what was historically "per-row JSON" is ~3% and not worth optimising. Two landed changes are correct and reduce allocator pressure but, as the profile predicts, do not move the query time: borrowing the projection column-name array instead of copying it per row, and borrowing the inline row image straight from the pinned leaf instead of a per-row `dupe`+`free`.
+The structural conclusion is that **the base seek is the whole gap, and row materialisation is not a factor.** The `Cell` union carries numerics inline (no per-row `itoa`/`dtoa`), so there is no "per-row JSON" cost to remove; borrowing the column-name array and the inline row image rather than copying them per row lowers allocator pressure but cannot move a query whose time is elsewhere.
 
-Within `baseSeek` itself, three descent- or copy-avoidance strategies were implemented, measured, and **reverted as net-negative or no-ops**, because the cost is the leaf work, not the descent framing:
+Crucially the base-seek cost is the **leaf work** — fetching the 16 KiB base leaf and binary-searching it — not the framing of the descent. The descent crabs through internal nodes that stay hot in the pool, so it is nearly free. That is why the obvious descent-avoidance ideas do not help a scattered scan:
 
-*   **Sibling-hop cursor** (follow `next_page_id` instead of re-descending when a key leaves the current leaf): *regressed* 533 → 678 ms. A root descent crabs through internal nodes that are already hot/cached (≈ one leaf read of real cost); a hop touches a full leaf page each, and with scattered matches (≈ 1 per leaf) the target is usually 1–2 leaves away, so hopping reads *more* leaf pages than a descent.
-*   **Adaptive hash index** (`key → leaf page id` cache, InnoDB-style, epoch/clear-invalidated, verify-on-probe): *regressed* warm 693 → 1038 ms and cold-populate to 3166 ms. The cache probe (a hash lookup over a large map with poor locality, plus its lock and a verify-fetch) costs as much as the cheap cached-internal descent it removes, while still doing the same leaf fetch. An AHI helps *repeated hot-key point lookups* (Zipfian OLTP), not a scan of hundreds of thousands of distinct keys — which is what this query is.
-*   **Borrowed value (no per-row `dupe`)**: correct and kept (removes ≈ 400k alloc/free pairs), but `baseSeek` was unchanged (531 vs 533), confirming the value copy was never the cost.
+*   A **sibling-hop cursor** (follow `next_page_id` instead of re-descending on a leaf change) touches a full leaf page per hop; with scattered matches (roughly one per leaf) the target is a leaf or two away, so hopping reads *more* leaves than a cached-internal descent, not fewer.
+*   An **adaptive hash index** (`key -> leaf` cache) still has to fetch and search the same leaf on a hit, so its probe cost is pure overhead here; it pays off only for *repeated hot-key point lookups* (Zipfian OLTP), not a scan of many distinct keys.
 
-What remains, in impact order, is therefore genuinely structural and matches levers 1–4 above plus the key encoding: **(a)** overlapped async base-row reads through the existing reactor for the cold/miss case; **(b)** a fixed-width integer primary-key encoding so the descent's `findChildPageId` and the leaf's `findCellByKey` compare machine words instead of decimal **text** across 16 KiB pages (this is also the correctness fix for general clustered range scans, and the cache-locality of the binary search is the dominant warm cost); **(c)** denser leaves so a given range spans fewer pages. The cheap wins are exhausted; closing the last ~3.5x to InnoDB requires one of these.
+Because the leaf fetch is irreducible by descent tricks, the levers that actually close the gap are structural and match levers 1 to 4 above plus the key encoding:
 
-The one change that *did* land as a real win this pass: skipping the redundant explicit per-PK base-leaf prefetch descent for already-sorted batches (the kernel's own read-ahead covers the now-sequential access), which cut this query's warm time from 1275 ms to ~690 ms (1.84x).
+*   **(a)** overlapped async base-row reads through the reactor, for the cold / miss case;
+*   **(b)** a fixed-width integer primary key, so `findChildPageId` and `findCellByKey` compare machine words instead of decimal **text** across 16 KiB pages (also the correctness fix for general clustered range scans, and the binary search's cache behaviour is the dominant warm cost);
+*   **(c)** denser leaves, so a given range spans fewer pages.
+
+The one cheap win the cost model does allow, and which is implemented, is the sorted-batch case: when a look-ahead batch is already in clustered order the base fetches are sequential, so the kernel's own read-ahead covers them and the explicit per-PK prefetch descent is skipped as redundant (section 4).
 
 ---
 
