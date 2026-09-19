@@ -40,46 +40,43 @@ When the free gap cannot fit an insertion despite sufficient *cumulative* free b
 
 ## 2. Segmented Buffer Pool & Latch Crabbing
 
-To achieve high concurrency and maximize throughput, the buffer pool cache and locking layers are fully decentralized.
+To achieve high concurrency and maximize throughput, the buffer pool cache and the tree's locking layer are both decentralized.
 
 ### Segmented PagePool
-The `PagePool` is segmented into $N$ independent instances (`num_instances`, configured from the pool size; the pool holds at least `MIN_POOL_SIZE = 64` frames).
-*   **Hashing**: A page request for `page_id` is mapped to an instance index via:
-    $$\text{instance\_idx} = \text{page\_id} \pmod N$$
-*   **Lock Isolation**: Each instance has its own `rw_lock`, hash table (`page_table`), free list and CLOCK hand. A cache hit takes the lock **shared** (readers concurrent); only a miss/eviction takes it exclusively. Thread contention is localized to $1/N$ of the database page space. See section 4 for the full miss path and the CLOCK eviction policy.
+The `PagePool` is split into `num_instances` independent shards (16 for a normal pool, 4 for a tiny one; the pool must hold at least `MIN_POOL_SIZE = 64` frames). Each frame is owned by exactly one shard.
+*   **Hashing**: a page request for `page_id` is routed to a shard by `page_id % num_instances`.
+*   **Lock isolation**: each shard has its OWN `rw_lock`, `page_table` (resident-page hash map), free list and CLOCK hand. A cache hit takes the shard's `rw_lock` **shared** (many hits proceed concurrently, each just bumping the frame's pin count); only a miss/eviction takes it **exclusively**. Contention on a fetch is therefore localized to one shard. See section 4 for the full miss path and the CLOCK eviction policy.
 
 ```
                    [page_id]
                        |
-                 (page_id % N)
+              (page_id % num_instances)
                        |
         +--------------+--------------+
         |                             |
-  [Instance 0]                  [Instance 1] ...
-  - local mutex                 - local mutex
-  - page_table (hash map)       - page_table (hash map)
-  - local free_list             - local free_list
+   [Shard 0]                     [Shard 1] ...
+   - rw_lock                     - rw_lock
+   - page_table (hash map)       - page_table (hash map)
+   - free list + CLOCK hand      - free list + CLOCK hand
 ```
 
-### Page-Level Latch Crabbing Protocol
-B+Tree traversals use the latch crabbing protocol to ensure safe, deadlock-free concurrent tree mutations:
-1.  **Read Operations (Scans/Lookups)**:
-    *   Acquire a **Shared Lock** on the root page.
-    *   Pin the child page and acquire a **Shared Lock** on it.
-    *   Release the lock on the parent page ("crab" down).
-2.  **Write Operations (Inserts/Updates/Deletes)**:
-    *   Acquire an **Exclusive Lock** on the parent page.
-    *   Pin and acquire an **Exclusive Lock** on the child page.
-    *   If the child page is "safe" (will not split or merge/underflow), release the lock on the parent page. Otherwise, hold the lock chain until split/merge operations are completed.
+### Tree Descent Latching
+Concurrent access to one `BPlusTree` is protected by two independent locks: a per-tree `structure_lock` (next subsection) and per-frame latches taken during the root-to-leaf descent. Three descent routines implement the latching, chosen by the operation:
+
+*   **Reads — `findLeafShared`.** Point lookups and range-scan positioning crab down with **shared** latches: the child is latched before the parent is released, so the path can never be observed half-modified.
+*   **Restructures — `findLeafExclusive`.** A split or merge descends with the identical crabbing but **exclusive** latches. It still releases the parent as soon as the child is latched; it does *not* hold the chain up an "unsafe" path. The guarantee that no other writer restructures the tree concurrently comes from the exclusive `structure_lock`, not from holding latches.
+*   **In-place write fast path — `findLeafOptimistic`.** A non-splitting insert, non-merging delete, or in-place update takes **no latches on internal nodes at all** (betting the leaf will not need restructuring) and latches only the leaf at the end. This is safe because it runs under a shared `structure_lock`, which freezes the internal levels (see below). The leaf-reuse scan cursor uses the read-only twin `findLeafOptimisticShared`.
+
+Every descended page is pinned in the pool for the duration of the access and unpinned exactly once on every path; `MAX_TREE_DEPTH` bounds the descent so a corrupted parent pointer fails cleanly instead of looping.
 
 ### Per-Tree Structure Lock (multi-writer concurrency)
 
 Page latches alone are not sufficient to let several writers mutate the same tree at once, because a structure-modifying operation (SMO: a split or a merge/borrow) touches pages that are not on the single root-to-leaf path it was reached by (newly allocated siblings, re-parented children, discarded pages). To make concurrent single-tree writes safe without rewriting every SMO to latch its full working set, each `BPlusTree` carries one `structure_lock` (a reader/writer lock), and operations are classified:
 
-*   **In-place operations (structure_lock held SHARED):** a lookup, a range scan, an in-place update, an insert into a leaf that has room, and a delete from a leaf that will not underflow. Internal nodes are mutated only by SMOs, so while any writer holds the structure lock shared the internal levels are immutable. The descent therefore reads internal nodes with only a pin (no page latch) and takes a single **leaf** latch (exclusive for a write, shared for a read). Writers on different leaves proceed fully in parallel; writers on the same leaf serialise on that leaf's latch.
+*   **In-place operations (structure_lock held SHARED):** a point lookup, a range scan, an in-place update, an insert into a leaf that has room, and a delete from a leaf that will not underflow. Internal nodes are mutated only by SMOs, so while any operation holds the structure lock shared the internal levels are immutable. Reads still crab the internal nodes with shared latches (`findLeafShared`); the in-place *write* fast path exploits that immutability to descend with **no internal latch at all** (`findLeafOptimistic`), taking only the **leaf** latch (exclusive). Writers on different leaves proceed fully in parallel; writers on the same leaf serialise on that leaf's latch.
 *   **Structure-modifying operations (structure_lock held EXCLUSIVE):** any split, any merge/borrow, and any insert or delete of an overflowed value (which allocates or frees pages). The exclusive lock drains all in-place holders first, so the SMO runs alone and the existing single-writer split/merge code (and the per-tree scratch arena it uses) is safe unchanged.
 
-A write first attempts the in-place fast path under the shared lock; if the target leaf would split or underflow it releases everything, re-acquires the structure lock exclusively, and re-descends (another writer may have already made room, in which case no SMO is needed). The fast path holds the shared lock plus at most one leaf latch and never couples two page latches, and the slow path holds no page latch while it waits for the exclusive lock, so the protocol is deadlock-free. DDL remains gated by the database-wide exclusive lock a level above.
+A write first attempts the in-place fast path under the shared lock; if the target leaf would split or underflow it releases everything, re-acquires the structure lock exclusively, and re-descends via `findLeafExclusive` (another writer may have already made room, in which case no SMO is needed). The fast path holds the shared lock plus at most one leaf latch and never couples two page latches, and the slow path holds no page latch while it waits for the exclusive lock, so the protocol is deadlock-free. DDL remains gated by the database-wide exclusive lock a level above.
 
 ### Per-Table Access Lock (executor level)
 
@@ -103,35 +100,35 @@ To prevent deadlocks and latch state corruption:
 Multi-Version Concurrency Control (MVCC) is decoupled to optimize index performance and reduce write amplification in leaf pages.
 
 ### Inline Latest Version Storage
-B+Tree leaf cells store *only the single latest version* of a row inline. This latest version includes:
-*   `xmin`: Transaction ID that created this version.
-*   `xmax`: Transaction ID that deleted/modified this version (0 if active).
-*   `roll_ptr`: A 64-bit roll pointer pointing to the previous version's entry in the Undo Log.
+B+Tree leaf cells store *only the single latest version* of a row inline. The encoded value is a fixed 32-byte version header followed by the row image:
+*   `xmin` (u64): transaction id that created this version.
+*   `xmax` (u64): transaction id that deleted/superseded this version (0 if live).
+*   `roll_ptr` (u64): roll pointer to the previous version's record in the undo log (0 if none).
+*   `fixed_len` (u32) / `heap_len` (u32): byte lengths of the two payload regions that follow.
 
 ```
 B+Tree Leaf Cell Value:
-+-------------------------------------------------------+
-| xmin (u64) | xmax (u64) | roll_ptr (u64) | fixed/heap |
-+-------------------------------------------------------+
-      |
-      +---> Points to previous version in Undo Log (if any)
++--------------------------------------------------------------------------------------+
+| xmin:u64 | xmax:u64 | roll_ptr:u64 | fixed_len:u32 | heap_len:u32 | fixed | heap      |
++--------------------------------------------------------------------------------------+
+                            |
+                            +--->  previous version in the undo log (if any)
 ```
 
 ### Undo Log Record Layout
-Older versions are archived in a sequential, append-only segment of undo pages managed by the `UndoLog`. Each Undo Record contains:
-*   `xmin`: Original creator transaction ID.
-*   `xmax`: Transaction ID that superseded/deleted this version.
-*   `roll_ptr`: Roll pointer pointing to the next previous version in the chain (0 if tail).
-*   `fixed_len`/`heap_len` + raw payload bytes.
+Older versions are archived in a sequential, append-only run of undo pages managed by the `UndoLog`. Each record is `[UndoRecordHeader][fixed bytes][heap bytes]` laid out contiguously, where the header carries:
+*   `xmin`: original creator transaction id.
+*   `xmax`: transaction id that superseded/deleted this version.
+*   `roll_ptr`: roll pointer to the next-older version in the chain (0 at the tail).
+*   `fixed_len` / `heap_len`: lengths of the fixed-width and heap payload regions that follow.
 
-A roll pointer is structured as:
-$$\text{roll\_ptr} = (\text{page\_id} \ll 16) \mid \text{offset}$$
+A roll pointer is a `u64` locating one record: the page id in the high bits and the byte offset within that page in the low 16 bits, i.e. `(page_id << 16) | offset`.
 
 ### Historical Row Version Reconstruction
-When reading a row (scans and lookups) under a transaction snapshot with ID `current_tx`:
+When reading a row (scans and lookups) under a transaction snapshot with id `current_tx`:
 1.  The reader inspects the inline version in the B+Tree cell.
-2.  If the inline version is visible (`isVisible(current_tx, xmin, xmax)`), it is returned.
-3.  If not visible, the reader follows `roll_ptr` to the Undo Log and traverses the historical chain backward until a visible version is found or the chain terminates (`roll_ptr = 0`).
+2.  If that version passes the visibility test against `current_tx` (its `xmin`/`xmax`), it is returned.
+3.  If not, the reader follows `roll_ptr` into the undo log and walks the chain backward until a visible version is found or the chain terminates (`roll_ptr = 0`, or an invalid pointer; see below).
 
 ```
 [B+Tree Leaf]
@@ -141,17 +138,17 @@ When reading a row (scans and lookups) under a transaction snapshot with ID `cur
 ```
 
 ### Post-Crash Stale Roll Pointer Handling
-Since the Undo Log is initialized fresh on boot, pre-crash roll pointers are stale:
-*   The database verifies the validity of a roll pointer using `isValidRollPtr(roll_ptr)`.
-*   If the page ID of the roll pointer is not present in the current active `undo_pages` list, the roll pointer is treated as `0` (terminating the version chain safely).
+Pre-crash roll pointers can address undo pages that the current run has not re-adopted:
+*   The database validates a roll pointer with `isValidRollPtr(roll_ptr)`.
+*   If the pointer's page id is not present in the active `undo_pages` list, the pointer is treated as `0`, terminating the version chain safely rather than following a dangling reference.
 
 ### Background Undo Log Purging
-The background writer task runs a garbage-collection phase periodically:
-1.  It retrieves the oldest active transaction ID ($T_{\text{oldest}}$) from the transaction manager.
-2.  It inspects sequential undo pages starting from the oldest.
-3.  If the maximum transaction ID ($xmin$/$xmax$) of all records on an undo page is less than $T_{\text{oldest}}$, the page is safely discarded using `PagePool.discardPage(pid)` and removed from the active undo log pages list.
+The background writer runs a reclamation phase on its periodic cycle:
+1.  It reads the oldest active transaction id, `T_oldest`, from the transaction manager.
+2.  It scans the undo pages from the front (oldest first), stopping at the active page.
+3.  A page is reclaimable only when the maximum `xmin`/`xmax` of every record on it is below `T_oldest`; such a page is discarded with `PagePool.discardPage(pid)` and dropped from the `undo_pages` list.
 
-The purge is prefix-only: it frees the contiguous run of oldest reclaimable undo pages and stops at the first page a still-open transaction needs. A long-running reader therefore holds the reclamation watermark back (head-of-line), and reclamation resumes once that transaction ends. This is a property of the append-log design, not a leak.
+The purge is prefix-only: it frees the contiguous leading run of reclaimable undo pages and stops at the first page a still-open transaction needs. A long-running reader therefore holds the reclamation watermark back (head-of-line), and reclamation resumes once that transaction ends. This is a property of the append-log design, not a leak.
 
 ---
 
@@ -162,7 +159,7 @@ The storage engine is disk-based, not in-memory. Every page lives on disk and is
 ### Page size and the pool
 
 *   **Page size:** 16 KiB (`PAGE_SIZE`), four times SQLite's 4 KiB default and twice PostgreSQL's 8 KiB. A larger page amortises per-page overhead over more rows and shortens the tree (fewer internal levels, so fewer page touches per descent), at the cost of more read amplification for a tiny point lookup.
-*   **Auto-sized pool:** the buffer pool defaults to roughly 50% of system RAM (`pool_size = 0` means auto). It is sharded into `num_instances` independent instances, each owning the pages where `page_id % num_instances == instance_ordinal`, each with its own page table, free list, CLOCK hand and `rw_lock`. Contention on a fetch is localised to one shard.
+*   **Auto-sized pool:** the buffer pool defaults to roughly 50% of system RAM (`pool_size = 0` means auto, resolved from `hw.memsize` at startup, with a headroom reserve and a cap). It is sharded into `num_instances` independent instances (16 for a pool of 64 frames or more, otherwise 4), each owning the pages where `page_id % num_instances == instance_ordinal`, each with its own page table, free list, CLOCK hand and `rw_lock`. Contention on a fetch is localised to one shard.
 
 ### Eviction: CLOCK / second-chance
 
@@ -173,23 +170,23 @@ This is the same family as PostgreSQL's clock-sweep and, like it, avoids the glo
 ### The miss path, step by step
 
 1.  `PagePool.fetchPage(page_id)` hashes to a shard and takes the shard `rw_lock` **shared**. A hit returns the pinned frame immediately: a hash probe plus a refcount, no page-sized allocation, no copy.
-2.  On a miss the shard lock is upgraded to exclusive and `findVictimFrame` returns a free frame or a CLOCK victim. Frame buffers are pre-allocated in a single slab, so reusing a victim is an in-place overwrite with no `malloc`/`free` (matching SQLite's buffer-recycle technique).
+2.  On a miss the shard lock is released and re-taken **exclusively**, and the page table is re-checked (a concurrent fetch may have installed the page in the gap). Otherwise `findVictimFrame` returns a free frame or a CLOCK victim. Frame buffers are pre-allocated in a single slab, so reusing a victim is an in-place overwrite with no `malloc`/`free` (matching SQLite's buffer-recycle technique).
 3.  If the victim is dirty it is written back first, honouring the WAL-before-page rule (`walBeforePageLsn`) so the log record that describes the page is durable before the page itself is overwritten on disk.
 4.  The page is read with a single positioned read: `pager.readPage` issues one `readPositionalAll` (`pread`) at offset `page_id * PAGE_SIZE`. One syscall per page, no `lseek`.
 
 ### mmap read path (optional)
 
-When enabled (server config, or `NOVADB_MMAP=1`), the pager memory-maps the file `MAP_SHARED` and a clean read borrows a pointer straight into the mapping with no `pread` and no `memcpy`, exactly like SQLite's mmap mode. `MAP_SHARED` keeps the map coherent with the pager's `pwrite`s. It is a pure optimisation: any page not covered by the mapping, or any write, falls back to the `pread` path. It is opt-in rather than default because the map must be grown carefully around outstanding borrows.
+When enabled (server config, or `NOVADB_MMAP=1`), the pager memory-maps the file `MAP_SHARED` and a clean read borrows a pointer straight into the mapping with no `pread` and no `memcpy`, exactly like SQLite's mmap mode. `MAP_SHARED` keeps the map coherent with the pager's `pwrite`s. It is a pure optimisation: any page not covered by the mapping (or the header page, page 0), or any write, falls back to the `pread` path; when the file has grown past the mapping the map is grown once and retried. It is opt-in rather than default because the map must be grown carefully around outstanding borrows.
 
 ### Torn-write protection: doublewrite buffer
 
-A crash mid-write can leave a page half-updated ("torn"). The flush paths use a doublewrite buffer: the batch of dirty pages is first written to a fixed staging area (a header page plus copies) and `fsync`ed, then written in place. On recovery, any page whose checksum fails is restored from its doublewrite copy. This is the same mechanism InnoDB uses, and it is why a `kill -9` mid-write recovers cleanly (verified by the crash-test harness).
+A crash mid-write can leave a page half-updated ("torn"). The flush paths use a doublewrite buffer: the batch of dirty pages is first written to a fixed staging area (a header page plus copies) and `fsync`ed, then written in place. On recovery, any page whose checksum fails is restored from its doublewrite copy. This is the same mechanism InnoDB uses, and it is what lets a `kill -9` mid-write recover cleanly.
 
 ### Prefetch and descent amortisation (the clustered-lookup optimisers)
 
 A secondary-index scan yields primary keys, and each PK must be resolved to its row by descending the clustered base tree. Two mechanisms keep that from being one full root-to-leaf descent plus one blocking read per row:
 
-*   **Adaptive base-leaf prefetch** (`iterator.zig`): the index scan gathers a look-ahead batch of matching PKs (`DEFAULT_PREFETCH_BATCH = 256`, grown to an MRR window of up to `262144` when the scan order is free, so an unbounded aggregate sorts a large window and a tight `LIMIT` keeps the small default), resolves them to their base-table leaf page IDs, and issues OS readahead (`pager.prefetchPages`, using Linux `readahead()` / the BSD `F_RDADVISE` equivalent) so those base pages are being fetched by the kernel before the scan consumes them. It is adaptive on two axes. First, the explicit per-PK prefetch descent runs only for the *scattered* (range-ordered) path: when a batch is sorted into clustered primary-key order (`may_reorder`), the base fetches walk the tree in ascending key order and the kernel's own sequential read-ahead already stages those pages, so the explicit descent is skipped as pure overhead (measured ~1.8x on the warm wide aggregate). Second, on the range-ordered path it is gated on the cumulative pool hit ratio, so it runs only while the base pages are actually missing (a cold or disk-bound scan) and a warm scan pays nothing for the prefetch machinery.
+*   **Adaptive base-leaf prefetch** (`iterator.zig`): the index scan gathers a look-ahead batch of matching PKs (`DEFAULT_PREFETCH_BATCH = 256`, grown to an MRR window of up to `262144` when the scan order is free, so an unbounded aggregate sorts a large window and a tight `LIMIT` keeps the small default), resolves them to their base-table leaf page IDs, and issues OS readahead (`pager.prefetchPages`, using Linux `readahead()` / the BSD `F_RDADVISE` equivalent) so those base pages are being fetched by the kernel before the scan consumes them. It is adaptive on two axes. First, the explicit per-PK prefetch descent runs only for the *scattered* (range-ordered) path: when a batch is sorted into clustered primary-key order (`may_reorder`), the base fetches walk the tree in ascending key order and the kernel's own sequential read-ahead already stages those pages, so the explicit descent is skipped as pure overhead. Second, on the range-ordered path it is gated on the cumulative pool hit ratio, so it runs only while the base pages are actually missing (a cold or disk-bound scan) and a warm scan pays nothing for the prefetch machinery.
 *   **Base-leaf cursor reuse** (`LeafReuseSearcher`): the scan keeps a base-table leaf cursor across fetches, so consecutive PKs that land on the same base leaf are answered without re-descending the tree. For a range of nearby PKs this collapses the per-row descent to a single leaf walk.
 
 Both are real, shipped optimisations. What is not yet present is genuinely asynchronous, overlapped I/O (the reads after the readahead hint are still synchronous `pread`s) and vectored `preadv` that combines physically adjacent pages into one syscall. Those are the frontier items in section 7.
@@ -207,16 +204,16 @@ Both are real, shipped optimisations. What is not yet present is genuinely async
 
 ## 6. Clustered Storage Model and the Index-to-Row Cost
 
-kaidb is **index-organised (clustered)**: a user table *is* its primary-key B+Tree, and the full row lives in the leaf. This has a direct, and mostly favourable, consequence for the cost of a lookup measured in page reads.
+kaidb is **index-organised (clustered)**: a user table *is* its primary-key B+Tree, and the full row lives in the leaf. This has a direct consequence for the cost of a lookup measured in page reads.
 
-*   **Primary-key point or range lookup: the row is in the leaf you already reached.** There is no separate "fetch the row" step. A heap-organised engine like PostgreSQL, by contrast, descends its index to a tuple id and then does a *second, unrelated* random read of the heap page. So for PK-driven access the clustered design does strictly less I/O. This is a structural advantage, and it is visible in the benchmark: kaidb wins or ties the PK, count, aggregate and DISTINCT queries.
-*   **Secondary-index lookup: this is where the clustered design pays.** A secondary index stores `(indexed-value, primary-key)`; resolving each match to its row requires descending the base PK tree. For scattered (non-correlated) matches, each is a fresh root-to-leaf descent, i.e. O(tree height) page touches, and this is the amplification that shows up on the medium-selectivity range scans PostgreSQL wins. The prefetch and leaf-cursor reuse in section 4 amortise the *sequential/correlated* case; the *random* case is the open lever (section 7).
-*   **Key encoding.** Secondary-index keys are encoded as order-preserving, delimiter-safe fixed tokens (`encodeIndexValueAlloc` / `index_key.zig`), so index range scans are true ordered seeks. The clustered base primary key, however, is currently stored as decimal **text**, so its physical order is lexical, not numeric. This is why the fast clustered-PK range path is gated to same-width, non-negative bounds (where lexical order equals numeric order). A fixed-width big-endian integer PK encoding would make clustered range scans general; it is an on-disk format change and is deliberately deferred.
-*   **Page density.** A 2026-09 footprint pass took a 1M-row load from about 15 GB to about 993 MB on disk. Density matters directly here: the denser the pages, the more of the dataset fits the pool and the fewer misses a given query takes.
+*   **Primary-key point or range lookup: the row is in the leaf you already reached.** There is no separate "fetch the row" step. A heap-organised engine like PostgreSQL, by contrast, descends its index to a tuple id and then does a *second, unrelated* random read of the heap page. So for PK-driven access the clustered design does strictly less I/O.
+*   **Secondary-index lookup: this is where the clustered design pays.** A secondary index stores `(indexed-value, primary-key)`; resolving each match to its row requires descending the base PK tree (`fetchVisibleFilteredJson`). For scattered (non-correlated) matches, each is a fresh root-to-leaf descent, i.e. O(tree height) page touches. The prefetch and leaf-cursor reuse in section 4 amortise the *sequential/correlated* case; the *random* case is the open lever (section 7).
+*   **Key encoding.** Secondary-index keys are encoded as order-preserving, delimiter-safe fixed tokens (`encodeIndexValueAlloc` in `src/schema/types.zig`), so index range scans are true ordered seeks. The clustered base primary key, however, is currently stored as decimal **text**, so its physical order is lexical, not numeric. This is why the fast clustered-PK range path (`pkClusteredWindow`) is gated to same-digit-width, non-negative bounds, where lexical order equals numeric order. A fixed-width big-endian integer PK encoding would make clustered range scans general; it is an on-disk format change and is deliberately deferred.
+*   **Page density.** The denser the pages -- fewer bytes per row, so more rows per leaf -- the more of the dataset fits the pool and the shorter the tree, so a given query takes fewer misses. Density is therefore a first-order lever, and the storage-format choices (compact cell layout, order-preserving keys) target it directly.
 
 ### Recommended practice: cover wide secondary-index reads with a composite index
 
-For a query that filters on a secondary-index column but returns or aggregates *another* column, the clustered design must descend the base tree once per matched row (the double-lookup above). On the RAM-pressure benchmark, `SELECT count(*), avg(customer_id) FROM ord WHERE total_due BETWEEN a AND b` (about 40% of the table) runs at ~365 ms as a scan and ~800 ms via the plain `total_due` index, versus ~150 ms on InnoDB. **The fix is the same one a DBA reaches for on any clustered engine (InnoDB and SQLite included): a covering composite index** that carries every column the query needs, so it is answered index-only with no base-row descent at all.
+For a query that filters on a secondary-index column but returns or aggregates a *different* column, the clustered design must descend the base tree once per matched row (the double-lookup above). **The fix is the one a DBA reaches for on any clustered engine (InnoDB and SQLite included): a covering composite index** that carries every column the query needs, so it is answered index-only with no base-row descent at all.
 
 ```sql
 -- Instead of relying on a single-column index that forces the double-lookup:
@@ -226,13 +223,13 @@ CREATE INDEX ix_td ON ord (total_due);
 CREATE INDEX ix_td_cust ON ord (total_due, customer_id);
 ```
 
-With the covering index the same query runs **index-only at ~11 ms** (ahead of PostgreSQL and InnoDB on this shape), because kaidb reads the aggregated value straight from the index key and never touches the clustered base tree. This applies to scalar aggregates (`avg`/`sum`/`min`/`max`/`count` over a trailing column filtered on the lead), `GROUP BY` on an indexed column, and projections of the covered columns. The planner selects the covering path automatically when a suitable composite index exists; no hint is needed.
+With the covering index the read is answered index-only: kaidb reads the aggregated or projected value straight from the composite key and never touches the clustered base tree. The planner selects this path automatically -- the index-only fast paths (`tryIndexOnlyCount`, `tryIndexMinMax`, `tryIndexGroupAgg`, `tryIndexOnlyScalarAgg`, `tryIndexOnlyScalarAggComposite`) are tried before the general scan -- so it covers scalar aggregates (`avg`/`sum`/`min`/`max`/`count` over a trailing column filtered on the lead), `GROUP BY` on an indexed column, and projections of the covered columns, with no hint required.
 
 Rules of thumb:
 
 *   Put the **filter column first** and the **selected/aggregated columns after it** in the composite index. The order-preserving key encoding then serves the range on the lead and carries the trailing values for free.
-*   This is the standard trade: a covering index costs extra write amplification and disk, so add it for the read patterns that matter, not universally.
-*   Without a covering index, kaidb still runs correctly and, for high-selectivity ranges, its cost-based planner already switches from the index to a single sequential clustered scan (the cheaper plan). The covering index is the way to turn such a read from "scan the table" into "read only the index".
+*   A covering index costs extra write amplification and disk, so add it for the read patterns that matter, not universally.
+*   Without a covering index, kaidb still runs correctly, and when a range matches a large fraction of the table the cost-based planner switches from the index to a single sequential clustered scan: `estimateRangeFraction` estimates the matched fraction from the index's value span and drops the index above roughly 30%. The covering index is the way to turn such a read from "scan the table" into "read only the index".
 
 ---
 
@@ -264,7 +261,7 @@ PostgreSQL's advantage past `shared_buffers` is not clock-sweep or `posix_fadvis
 1.  **Streaming reads with true asynchronous, overlapped I/O** (`read_stream.c` plus the AIO / `io_uring` backend). PostgreSQL keeps a ring of pinned buffers and a parallel ring of in-flight I/Os, prefetches ahead, and only blocks when the consumer actually reaches a page, with look-ahead distance that grows on real misses and decays on hits. kaidb prefetches via fire-and-forget OS `readahead()` and then reads synchronously (`pread` per page). **kaidb already has an async reactor (kqueue / epoll / io_uring); routing the base-row and scan fetches through genuinely overlapped async reads is the single highest-impact lever, and the infrastructure exists.**
 2.  **I/O combining (vectored `preadv`).** PostgreSQL merges physically-contiguous page reads into one `preadv` of up to `io_combine_limit` pages, collapsing per-page syscall overhead on cold scans. kaidb issues one `pread` per page.
 3.  **Bulk-scan ring buffer** (`BufferAccessStrategy` / `BAS_BULKREAD`, 256 KiB, capped at 1/8 of the pool). A scan of a table larger than the pool is confined to a tiny fixed set of frames so it cannot evict the hot working set. kaidb relies on CLOCK alone, so a large cold scan can still churn the pool.
-4.  **Random-probe remedy: block-sorted / bitmap fetch.** For scattered secondary-index matches, PostgreSQL collects the target tuple ids, sorts them by physical block, dedups, and walks the heap in physical order so the reads pipeline. kaidb already gathers PKs and prefetches their base leaves; adding a block-sort plus dedup plus the vectored/async read above completes the same pattern. The alternative structural fix is a **physical row locator**: store a validated base-leaf page hint in each secondary-index entry so a random probe is a one-page fetch (like a PostgreSQL heap tuple id), instead of a full descent.
+4.  **Random-probe remedy: block-sorted / bitmap fetch.** For scattered secondary-index matches, PostgreSQL collects the target tuple ids, sorts them by physical block, dedups, and walks the heap in physical order so the reads pipeline. kaidb already does the first half: when a scan's order is free (`may_reorder`) it sorts each primary-key look-ahead batch into clustered order and walks the base tree in that physical order (`IndexScanIterator`, the sorted-batch "bitmap" walk). What remains to complete the pattern is the vectored / overlapped-async read of lever 1 (and PK dedup). The alternative structural fix is a **physical row locator**: store a validated base-leaf page hint in each secondary-index entry so a random probe is a one-page fetch (like a PostgreSQL heap tuple id), instead of a full descent.
 
 The one asymmetry no engine removes: sequential and batched-random misses pipeline; a single pointer-chasing descent (each index level's address depends on reading the previous level) cannot be prefetched and serialises. The goal is to make the sequential and batched cases fast, which is exactly what levers 1 to 4 do.
 
