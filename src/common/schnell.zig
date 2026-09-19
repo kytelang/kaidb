@@ -1,7 +1,7 @@
-//! `schnell`, a small, self-contained HTTP/1.1 server and client for NovaDB.
+//! `schnell`, a small, self-contained HTTP/1.1 server and client for kaidb.
 //!
 //! "Schnell" is German for "fast", and this module is deliberately tiny: it is
-//! the HTTP transport NovaDB uses for its non-wire-protocol surface (health
+//! the HTTP transport kaidb uses for its non-wire-protocol surface (health
 //! checks, the admin/observability endpoints, and outbound HTTP the engine
 //! needs to make) without pulling in a full web framework. The parser is a
 //! blocking, byte-at-a-time HTTP/1.1 implementation, sufficient for small

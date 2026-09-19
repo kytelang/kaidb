@@ -1,4 +1,4 @@
-//! Streaming primary/follower replication for NovaDB.
+//! Streaming primary/follower replication for kaidb.
 //!
 //! This module carries committed writes from the primary (leader) to one or more
 //! followers over a length-framed binary stream, so a follower can stand in if the

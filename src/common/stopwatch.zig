@@ -1,4 +1,4 @@
-//! A minimal monotonic-clock stopwatch for coarse timing inside NovaDB.
+//! A minimal monotonic-clock stopwatch for coarse timing inside kaidb.
 //!
 //! This is a tiny instrumentation helper, not a database subsystem. It exists
 //! so that engine code (query executor stages, WAL flush timing, checkpoint
@@ -22,7 +22,7 @@
 //!     and report the sum. [`StopWatch.reset`] clears the total back to zero.
 //!
 //!   * The `Io` handle is threaded in per call rather than captured, because
-//!     NovaDB's I/O abstraction (`std.Io`) is passed explicitly through the
+//!     kaidb's I/O abstraction (`std.Io`) is passed explicitly through the
 //!     call graph rather than held as global state.
 //!
 //! It is deliberately allocation-free and holds only two integers, so it is

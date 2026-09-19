@@ -1,7 +1,7 @@
-//! NovaDB server entry point: bootstraps the storage engine and serves it over
+//! kaidb server entry point: bootstraps the storage engine and serves it over
 //! two network fronts.
 //!
-//! This is the top-level `main` for the standalone `btree`/`novadb` executable.
+//! This is the top-level `main` for the standalone `btree`/`kaidb` executable.
 //! Its whole job is orchestration, not storage logic: it reads configuration,
 //! opens (and on first run creates) the on-disk [`Database`], wires up the
 //! query layer, optionally joins a replication topology, and then runs two
@@ -11,7 +11,7 @@
 //! [`Database`]:
 //!
 //!   1. A binary/TCP protocol server ([`TcpServer`]) on `config.address:config.port`
-//!     , the intended fast path that Nova's driver speaks (see `src/proto/`).
+//!     , the intended fast path that Kyte's driver speaks (see `src/proto/`).
 //!   2. An HTTP server ([`schnell.Server`]) on `config.http.*` that serves static
 //!      content and a JSON `POST /query` convenience endpoint via [`handleHttp`].
 //!
@@ -125,7 +125,7 @@ const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
 /// The JSON-decodable request shape accepted by the HTTP `POST /query` endpoint;
 /// parsed from the request body in [`handleHttp`].
 const QueryRequest = @import("query/query_executor.zig").QueryRequest;
-/// The binary/wire-protocol listener, the primary path Nova's driver speaks. Run
+/// The binary/wire-protocol listener, the primary path Kyte's driver speaks. Run
 /// as an async task by [`startTcpServer`].
 const TcpServer = @import("query/tcp_server.zig").TcpServer;
 
@@ -507,7 +507,7 @@ pub fn main(init: std.process.Init) !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Offline maintenance: `novadb compact <src_dir> <dst_dir>` rebuilds the
+    // Offline maintenance: `kaidb compact <src_dir> <dst_dir>` rebuilds the
     // database into a fresh, fully packed file and exits (see compact.zig). Runs
     // before any server/config setup so it is a pure one-shot tool.
     {
@@ -518,26 +518,26 @@ pub fn main(init: std.process.Init) !void {
             try @import("compact.zig").compact(allocator, io, args[2], args[3]);
             return;
         }
-        // Backup: `novadb backup <base_dir> <dest_dir>` writes a consistent snapshot
+        // Backup: `kaidb backup <base_dir> <dest_dir>` writes a consistent snapshot
         // (checkpoint + fsync + full page copy + WAL) to <dest_dir>/snapshot.db(+wal).
         // Run against a STOPPED server (this opens its own handle); the underlying
         // exportSnapshot primitive is the same one the replication path uses live.
         if (args.len >= 4 and std.mem.eql(u8, args[1], "backup")) {
             const base = args[2];
             const dest = args[3];
-            const dbf = try std.fmt.allocPrint(allocator, "{s}/nova.db", .{base});
+            const dbf = try std.fmt.allocPrint(allocator, "{s}/kaidb.db", .{base});
             defer allocator.free(dbf);
             const wdir = try std.fmt.allocPrint(allocator, "{s}/wal", .{base});
             defer allocator.free(wdir);
-            // Fail loudly if there is no database at <base>/nova.db. Otherwise
+            // Fail loudly if there is no database at <base>/kaidb.db. Otherwise
             // `Database.open` would CREATE a fresh empty file (pager.zig FileNotFound
             // -> createFile) and we would happily "back up" an empty database, with a
             // success message, discovered only when a restore comes up empty. <base>
             // must be the server's base_dir (the directory that directly contains
-            // nova.db + wal/, default '<deployment>/data'), NOT the deployment root
+            // kaidb.db + wal/, default '<deployment>/data'), NOT the deployment root
             // that holds db.json.
             if (Io.Dir.access(.cwd(), io, dbf, .{})) {} else |_| {
-                log.err("backup: no database found at {s}. Point <base_dir> at the directory that directly contains nova.db and wal/ (the server's base_dir, default '<deployment>/data'), not the deployment root.", .{dbf});
+                log.err("backup: no database found at {s}. Point <base_dir> at the directory that directly contains kaidb.db and wal/ (the server's base_dir, default '<deployment>/data'), not the deployment root.", .{dbf});
                 return error.FileNotFound;
             }
             log.info("backing up {s} -> {s} ...", .{ base, dest });
@@ -547,8 +547,8 @@ pub fn main(init: std.process.Init) !void {
             log.info("backup complete: {s}/snapshot.db (+ wal/)", .{dest});
             return;
         }
-        // Restore: `novadb restore <snapshot_dir> <dest_base_dir>` reconstructs a data
-        // directory from a snapshot (copies snapshot.db -> nova.db and the WAL back);
+        // Restore: `kaidb restore <snapshot_dir> <dest_base_dir>` reconstructs a data
+        // directory from a snapshot (copies snapshot.db -> kaidb.db and the WAL back);
         // the next server start on <dest_base_dir> runs recovery over it.
         //
         // Point-in-time recovery (PITR): add
@@ -573,7 +573,7 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
             try Io.Dir.createDirPath(.cwd(), io, dest_base);
-            const dbf = try std.fmt.allocPrint(allocator, "{s}/nova.db", .{dest_base});
+            const dbf = try std.fmt.allocPrint(allocator, "{s}/kaidb.db", .{dest_base});
             defer allocator.free(dbf);
             const wdir = try std.fmt.allocPrint(allocator, "{s}/wal", .{dest_base});
             defer allocator.free(wdir);
@@ -613,7 +613,7 @@ pub fn main(init: std.process.Init) !void {
 
             if (target_lsn != 0) {
                 // Open at the target LSN so recovery replays only up to N, then
-                // close so the recovered-to-N state is checkpointed into nova.db.
+                // close so the recovered-to-N state is checkpointed into kaidb.db.
                 // A later plain open sees a clean database as of the target.
                 var rdb = try Database.openAt(allocator, io, dbf, 8192, wdir, target_lsn);
                 rdb.close();
@@ -623,7 +623,7 @@ pub fn main(init: std.process.Init) !void {
             }
             return;
         }
-        // Offline password rotation: `novadb passwd <base_dir> <user> <newpassword>`
+        // Offline password rotation: `kaidb passwd <base_dir> <user> <newpassword>`
         // opens its own handle (server may be stopped), so it can rotate the seeded
         // admin/admin before the server is ever exposed. This is the escape hatch
         // for `security.require_admin_password_change`.
@@ -631,7 +631,7 @@ pub fn main(init: std.process.Init) !void {
             const base = args[2];
             const user = args[3];
             const newpw = args[4];
-            const dbf = try std.fmt.allocPrint(allocator, "{s}/nova.db", .{base});
+            const dbf = try std.fmt.allocPrint(allocator, "{s}/kaidb.db", .{base});
             defer allocator.free(dbf);
             const wdir = try std.fmt.allocPrint(allocator, "{s}/wal", .{base});
             defer allocator.free(wdir);
@@ -676,7 +676,7 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
-    const db_file_path = try std.fmt.allocPrint(allocator, "{s}/nova.db", .{config.base_dir});
+    const db_file_path = try std.fmt.allocPrint(allocator, "{s}/kaidb.db", .{config.base_dir});
     defer allocator.free(db_file_path);
 
     const wal_dir = if (config.durability.enabled)
@@ -772,12 +772,12 @@ pub fn main(init: std.process.Init) !void {
     // lockout-free comparison (never `authenticate`, which would feed the
     // brute-force counter). Fail closed BEFORE opening the listeners. The
     // bootstrap paradox (a fresh DB seeds admin/admin, and rotating needs an admin
-    // login) is resolved by the offline `novadb passwd admin '<newpw>'` command,
+    // login) is resolved by the offline `kaidb passwd admin '<newpw>'` command,
     // which rotates without the server running; the error points operators to it.
     if (config.security.require_admin_password_change and
         db.security_manager.passwordMatches("admin", "admin"))
     {
-        log.err("security.require_admin_password_change is on but 'admin' still has the default password; rotate it first with `novadb passwd admin '<newpassword>'` (server may be stopped), then start. Refusing to start.", .{});
+        log.err("security.require_admin_password_change is on but 'admin' still has the default password; rotate it first with `kaidb passwd admin '<newpassword>'` (server may be stopped), then start. Refusing to start.", .{});
         return error.DefaultAdminPasswordNotRotated;
     }
 

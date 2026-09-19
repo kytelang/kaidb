@@ -1,4 +1,4 @@
-//! Abstract syntax tree for NovaDB's SQL dialect.
+//! Abstract syntax tree for kaidb's SQL dialect.
 //!
 //! This file is the shared vocabulary between the two ends of the SQL layer:
 //! the parser produces these nodes from a query string, and the query executor

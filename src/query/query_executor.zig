@@ -111,7 +111,7 @@ const command_mod = @import("../proto/command.zig");
 ///
 /// - `read_committed`: the default; each statement re-checks commit status, so
 ///   a transaction sees other transactions' commits as they land. `READ
-///   UNCOMMITTED` is also mapped here (NovaDB does not expose dirty reads).
+///   UNCOMMITTED` is also mapped here (kaidb does not expose dirty reads).
 /// - `repeatable_read`: captures a [`txn_mod.Snapshot`] at BEGIN and reuses it
 ///   for every statement, so the visible commit set is frozen. `SNAPSHOT` is an
 ///   alias for this level.
@@ -837,7 +837,7 @@ pub const QueryExecutor = struct {
     /// executor must NOT re-apply the offset and may stream + break at LIMIT.
     scan_offset_pushed: bool = false,
 
-    /// Profiling (gated by env NOVADB_QPROF): when true, the SELECT path prints a
+    /// Profiling (gated by env KAIDB_QPROF): when true, the SELECT path prints a
     /// per-query phase breakdown and `buildRowJson` accumulates into `qp_json`.
     qprof: bool = false,
     /// Optional row sink: when set by the connection layer, the scan-order SELECT
@@ -845,7 +845,7 @@ pub const QueryExecutor = struct {
     /// result set, so the client decodes rows concurrently with the server scan.
     /// Null (the default) keeps the buffer-then-return behaviour. Cleared after use.
     row_sink: ?RowSink = null,
-    /// Gated by env `NOVADB_BINARY_RESULTS`: when set, a single-table `SELECT *`
+    /// Gated by env `KAIDB_BINARY_RESULTS`: when set, a single-table `SELECT *`
     /// ships numeric columns as binary (big-endian fixed-width) cells and marks
     /// them binary in the RowDescription, instead of decimal text. Default off,
     /// so the wire stays text for existing clients.
@@ -1000,7 +1000,7 @@ pub const QueryExecutor = struct {
     /// Rewrites an expression tree, replacing every subquery with the literal
     /// value(s) it evaluates to.
     ///
-    /// This is NovaDB's subquery strategy: rather than correlate at scan time it
+    /// This is kaidb's subquery strategy: rather than correlate at scan time it
     /// eagerly evaluates uncorrelated subqueries once and splices the results
     /// in. A scalar `(SELECT ...)` becomes a text literal (or NULL when empty);
     /// an `x IN (SELECT ...)` becomes an `IN (list of literals)`. All other node
@@ -1757,7 +1757,7 @@ pub const QueryExecutor = struct {
     /// directory (`<backup_path>/snapshot.db` + `<backup_path>/wal/`) using the
     /// same primitive the replication path uses, so `BACKUP DATABASE TO 'dir'`
     /// does not require a stopped server and the result is restorable with the
-    /// exact same tooling as an offline backup (`novadb restore`, PITR).
+    /// exact same tooling as an offline backup (`kaidb restore`, PITR).
     ///
     /// Runs under the db `rw_lock` held exclusively by [`executeStatement`] (a
     /// `.backup` statement has no single table, so it takes the coarse exclusive
@@ -4762,12 +4762,12 @@ pub const QueryExecutor = struct {
                     sort_keys.deinit(self.allocator);
                 }
 
-                self.qprof = std.c.getenv("NOVADB_QPROF") != null;
+                self.qprof = std.c.getenv("KAIDB_QPROF") != null;
                 // Binary numeric results are the default: the driver now decodes
                 // big-endian int/float cells directly from the socket buffer (no
                 // string alloc, no decimal round-trip), which is faster than parsing
-                // text digits. `NOVADB_TEXT_RESULTS` forces the legacy text encoding.
-                self.binary_results = std.c.getenv("NOVADB_TEXT_RESULTS") == null;
+                // text digits. `KAIDB_TEXT_RESULTS` forces the legacy text encoding.
+                self.binary_results = std.c.getenv("KAIDB_TEXT_RESULTS") == null;
                 self.qp_json.reset();
                 self.qp_seek.reset();
                 const qp_io = self.db.pool.pager.io;
@@ -4857,7 +4857,7 @@ pub const QueryExecutor = struct {
                                             }
                                         }
                                         // Numeric columns ship binary only when explicitly
-                                        // enabled (env NOVADB_BINARY_RESULTS). Default is text:
+                                        // enabled (env KAIDB_BINARY_RESULTS). Default is text:
                                         // the driver's `takeI64`/`takeF64` parse digits straight
                                         // from the socket buffer with no per-cell allocation,
                                         // whereas the binary float path round-trips through a
@@ -6393,7 +6393,7 @@ pub const QueryExecutor = struct {
     /// Decodes a stored cell into the single row version visible to
     /// `current_tx`, or null if none is.
     ///
-    /// Handles the two on-disk encodings NovaDB supports:
+    /// Handles the two on-disk encodings kaidb supports:
     /// - the legacy JSON encoding, where the cell is a JSON object carrying a
     ///   `versions` array of `{xmin, xmax, data}`; the first version passing
     ///   [`rowVisible`] is cloned out;
@@ -7544,7 +7544,7 @@ pub const QueryExecutor = struct {
     /// Scans the child table for a visible row whose FK column equals the
     /// value being deleted/changed on the parent. A true result blocks the
     /// parent DELETE/UPDATE with `error.ForeignKeyConstraintViolation`
-    /// (NovaDB uses restrict semantics, not cascade).
+    /// (kaidb uses restrict semantics, not cascade).
     fn checkChildRowExists(self: *QueryExecutor, child_table_id: u32, child_col_name: []const u8, parent_val: []const u8) !bool {
         const child_table = for (self.db.catalog.tables.items) |tbl| {
             if (tbl.id == child_table_id) break tbl;

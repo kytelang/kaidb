@@ -1,5 +1,5 @@
 //! The top-level `Database` object: the catalog owner and lifecycle root that
-//! ties every NovaDB subsystem together behind a single on-disk file.
+//! ties every kaidb subsystem together behind a single on-disk file.
 //!
 //! Everything else in the engine is a building block; this file is where they
 //! are wired into a working database. A [`Database`] owns the buffer pool /
@@ -108,7 +108,7 @@ const Header = page_mod.Header;
 const readHeader = page_mod.readHeader;
 /// Encodes a [`Header`] back into the raw bytes of page 0.
 const writeHeader = page_mod.writeHeader;
-/// The file-format magic number; a mismatch means "not a NovaDB file".
+/// The file-format magic number; a mismatch means "not a kaidb file".
 const MAGIC = page_mod.MAGIC;
 /// The on-disk format version; a mismatch aborts the open as unsupported.
 const VERSION = page_mod.VERSION;
@@ -184,7 +184,7 @@ const row = @import("row.zig");
 /// The in-memory [`catalog.SystemCatalog`] holding tables, indexes and FKs.
 const catalog = @import("catalog.zig");
 
-/// A single open NovaDB database: the catalog owner and lifecycle root.
+/// A single open kaidb database: the catalog owner and lifecycle root.
 ///
 /// Heap-allocated and returned by [`Database.open`] / [`Database.openAt`]; it
 /// owns its pool, trees, catalog, WAL and undo log and must be torn down with
@@ -2528,7 +2528,7 @@ pub const Database = struct {
         // requirement as `checkpoint` / `durableFlush`. Safe here: the hot `BACKUP
         // DATABASE TO` path holds the executor's exclusive `rw_lock` (so no writer can
         // allocate a page while `persistFreeList` writes its chain), and the cold
-        // `novadb backup` CLI has its own single-threaded handle. Do NOT call
+        // `kaidb backup` CLI has its own single-threaded handle. Do NOT call
         // `checkpoint()` here: it re-takes `rw_lock`, which the hot path already holds
         // and which is not reentrant.
         {

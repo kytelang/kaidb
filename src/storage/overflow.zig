@@ -67,11 +67,11 @@ const PagePool = pool_mod.PagePool;
 /// than stored inline in a B+Tree cell.
 ///
 /// Set to an EIGHTH of the page. The split-correctness geometry would allow up to
-/// HALF the usable page inline (NovaDB's 2-way contiguous split, made byte-safe in
+/// HALF the usable page inline (kaidb's 2-way contiguous split, made byte-safe in
 /// `btree.splitAndInsert`, keeps both halves within a page for cells <= usable/2),
 /// but a SEPARATE, deeper constraint holds the cutoff down: CRASH RECOVERY.
 ///
-/// NovaDB recovers by LOGICAL redo - it replays committed row inserts from the
+/// kaidb recovers by LOGICAL redo - it replays committed row inserts from the
 /// WAL. That cannot correctly reconstruct a B+Tree when the buffer pool evicts a
 /// PARTIAL structural change: a split (or a cascading split) mutates several pages
 /// together, and if a kill -9 leaves some of them on disk and others not, redo

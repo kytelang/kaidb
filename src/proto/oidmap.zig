@@ -1,10 +1,10 @@
-//! Maps NovaDB's internal column types onto the binary wire protocol's type
+//! Maps kaidb's internal column types onto the binary wire protocol's type
 //! identifiers (OIDs) and on-wire size hints.
 //!
 //! The wire protocol describes every result column to a client with a
 //! `RowDescription` message, and each column in it carries three pieces of
 //! type metadata: a numeric type OID (see [`wire.oid`]), the column position,
-//! and a fixed on-wire size (or `-1` for variable-length values). NovaDB stores
+//! and a fixed on-wire size (or `-1` for variable-length values). kaidb stores
 //! and reasons about columns using the richer [`ColumnType`] enum from the
 //! schema layer; this file is the single, small translation seam that converts
 //! a schema-side [`ColumnType`] into the protocol-side facts a client needs.

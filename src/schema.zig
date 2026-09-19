@@ -1,4 +1,4 @@
-//! Schema subsystem facade: the single import surface for NovaDB's logical
+//! Schema subsystem facade: the single import surface for kaidb's logical
 //! data model.
 //!
 //! Everything that describes *what* the database stores, as opposed to the

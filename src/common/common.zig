@@ -1,6 +1,6 @@
 //! On-disk record format for the write-ahead log (WAL).
 //!
-//! This module defines the single unit of durability in NovaDB: a
+//! This module defines the single unit of durability in kaidb: a
 //! [`LogRecord`], the length-prefixed, checksummed entry that the WAL appends
 //! for every transaction boundary and every row mutation. Everything the
 //! recovery path replays after a crash is a stream of these records read back

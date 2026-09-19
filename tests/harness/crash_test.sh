@@ -1,5 +1,5 @@
 #!/bin/bash
-# NovaDB crash-durability harness.
+# kaidb crash-durability harness.
 #
 # Verifies that committed data survives a hard crash (kill -9) and that the server
 # recovers without crashing. Exercises the WAL-replay recovery path (rebuild user

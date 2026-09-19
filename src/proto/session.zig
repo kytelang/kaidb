@@ -1,4 +1,4 @@
-//! Per-connection session state machine for the NovaDB binary wire protocol.
+//! Per-connection session state machine for the kaidb binary wire protocol.
 //!
 //! One [`Session`] exists for the lifetime of a single client connection. It
 //! owns the client's per-connection state (authentication, prepared statements,
@@ -20,7 +20,7 @@
 //!     Bind ([`handleBind`]) substitutes parameter values to produce a portal,
 //!     and Execute ([`streamPortal`]) streams rows from that portal, optionally
 //!     in `max_rows`-sized chunks with a `PortalSuspended` in between. Because
-//!     NovaDB substitutes parameters textually rather than binding them into a
+//!     kaidb substitutes parameters textually rather than binding them into a
 //!     plan, a "portal" here just carries the fully substituted SQL string plus
 //!     a cached result and a cursor over its rows.
 //!
@@ -410,7 +410,7 @@ pub fn run(sess: *Session, reader: *Io.Reader, writer: *Io.Writer) !void {
                     sess.authenticated = true;
                 }
                 try sendOwned(writer, allocator, try wire.encodeAuthOk(allocator));
-                try sendOwned(writer, allocator, try wire.encodeParameterStatus(allocator, "server", "NovaDB"));
+                try sendOwned(writer, allocator, try wire.encodeParameterStatus(allocator, "server", "kaidb"));
                 try sendOwned(writer, allocator, try wire.encodeReady(allocator, .idle));
                 try writer.flush();
             },
@@ -584,20 +584,20 @@ fn runSql(sess: *Session, writer: *Io.Writer, sql: []const u8) !void {
     const a = sess.allocator;
     var tokbuf: [64]u8 = undefined;
     // Stream SELECT rows to the client during the scan (overlaps the client's row
-    // decode with the server scan) — the default; NOVADB_NOSTREAM forces the old
+    // decode with the server scan) — the default; KAIDB_NOSTREAM forces the old
     // buffer-then-send path. The sink is attached only for the duration of this call
     // and used solely by the scan-order SELECT * fast path (a sorted/offset/distinct
     // query ignores it and still buffers); every other statement ignores it too.
     var sctx = StreamCtx{ .writer = writer, .a = a };
-    if (std.c.getenv("NOVADB_NOSTREAM") == null) {
+    if (std.c.getenv("KAIDB_NOSTREAM") == null) {
         sess.executor.row_sink = .{ .ctx = @ptrCast(&sctx), .begin = streamBegin, .row = streamRow };
     }
     defer sess.executor.row_sink = null;
-    // Coarse per-query wire profiling, gated by env NOVADB_QEXEC. Splits the
+    // Coarse per-query wire profiling, gated by env KAIDB_QEXEC. Splits the
     // server's time into execute() (planner + storage) versus encode+socket
     // send, so a client-observed round trip can be decomposed into
     // server-execute / server-encode+send / (network + client decode).
-    const qwire = std.c.getenv("NOVADB_QEXEC") != null;
+    const qwire = std.c.getenv("KAIDB_QEXEC") != null;
     const qio = sess.executor.db.pool.pager.io;
     var sw_exec = StopWatch{};
     if (qwire) sw_exec.start(qio);

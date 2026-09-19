@@ -1,7 +1,7 @@
 //! Wall-clock time source, expressed as a thin wrapper over Zig's `std.Io`
 //! clock facility.
 //!
-//! NovaDB threads I/O capability explicitly rather than reaching for global
+//! kaidb threads I/O capability explicitly rather than reaching for global
 //! syscalls, so reading the clock is also routed through an [`Io`] handle
 //! instead of calling `std.time.milliTimestamp` directly. This file exists to
 //! give the rest of the engine a single, ergonomic entry point for "what time
@@ -41,7 +41,7 @@ pub const Now = struct {
     /// The I/O capability used to reach the system clock. Every accessor routes
     /// its `Io.Clock.now(.real, ...)` call through this handle rather than a
     /// global syscall, which is what lets timing be injected/redirected in the
-    /// same way as the rest of NovaDB's I/O.
+    /// same way as the rest of kaidb's I/O.
     io: Io,
 
     /// Current real-time instant in milliseconds since the Unix epoch.

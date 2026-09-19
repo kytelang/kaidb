@@ -1,5 +1,5 @@
 #!/bin/bash
-# NovaDB LIVE replication harness (R1-R6): a running LEADER process ships committed writes to a running
+# kaidb LIVE replication harness (R1-R6): a running LEADER process ships committed writes to a running
 # FOLLOWER process over the network, and the follower serves them.
 #
 # Proves the leader<->follower shipping that main.zig now wires (becomeDurableLeader when primary +

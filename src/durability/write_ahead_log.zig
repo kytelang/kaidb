@@ -1,4 +1,4 @@
-//! Write-ahead log (WAL) for NovaDB: the durability backbone of the storage
+//! Write-ahead log (WAL) for kaidb: the durability backbone of the storage
 //! engine.
 //!
 //! Every mutation the engine intends to make is first serialised as a

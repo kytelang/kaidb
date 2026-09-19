@@ -1,4 +1,4 @@
-//! CLI client for the NovaDB server (`kaidb-cli`).
+//! CLI client for the kaidb server (`kaidb-cli`).
 //!
 //! A thin, standalone SQL client: it owns no storage and never interprets SQL.
 //! It opens a socket to a running server, speaks the **pure binary wire
@@ -367,7 +367,7 @@ pub fn main(init: std.process.Init) !void {
         var stdin_r = stdin_file.reader(io, &stdin_buf);
         const stdin = &stdin_r.interface;
         while (true) {
-            try out.writeAll("nova> ");
+            try out.writeAll("kaidb> ");
             try out.flush();
             const line = stdin.takeDelimiterExclusive('\n') catch |err| {
                 if (err == error.EndOfStream) break;

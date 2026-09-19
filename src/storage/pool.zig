@@ -320,7 +320,7 @@ pub const PagePool = struct {
     borrow_serves: std.atomic.Value(u64) = .init(0),
     pread_serves: std.atomic.Value(u64) = .init(0),
     copyout_writes: std.atomic.Value(u64) = .init(0),
-    /// Perf instrumentation (gated by NOVADB_QPROF, read once): breaks a cache MISS
+    /// Perf instrumentation (gated by KAIDB_QPROF, read once): breaks a cache MISS
     /// into victim selection, the `pread`, and checksum validation so the dominant
     /// per-miss cost is measurable. Not thread-safe; single-client profiling only.
     miss_prof: bool = false,
@@ -440,12 +440,12 @@ pub const PagePool = struct {
             }
         }
 
-        // Test/stress hook: `NOVADB_MMAP=1` turns on Phase 4 mmap reads for the
+        // Test/stress hook: `KAIDB_MMAP=1` turns on Phase 4 mmap reads for the
         // whole process, so the unit suite and the concurrency fuzzer exercise the
         // borrow/copy-out path (a missed copy-out then SIGBUSes on the read-only
         // map). The server enables it from config instead (see `enableMmapReads`).
         if (builtin.os.tag != .windows) {
-            if (std.c.getenv("NOVADB_MMAP")) |v| {
+            if (std.c.getenv("KAIDB_MMAP")) |v| {
                 if (v[0] != 0 and v[0] != '0') pool.enableMmapReads();
             }
         }
@@ -632,7 +632,7 @@ pub const PagePool = struct {
 
         if (!self.miss_prof_checked) {
             self.miss_prof_checked = true;
-            if (std.c.getenv("NOVADB_QPROF")) |v| self.miss_prof = v[0] != 0 and v[0] != '0';
+            if (std.c.getenv("KAIDB_QPROF")) |v| self.miss_prof = v[0] != 0 and v[0] != '0';
         }
         const mp = self.miss_prof;
         if (mp) self.sw_victim.start(self.pager.io);
@@ -1073,7 +1073,7 @@ test "page-mgmt Phase 3: relaxed-atomic pin/unpin balances exactly and guards un
     defer threaded.deinit();
     const io = threaded.io();
 
-    const path = "novadb_pool_pin_test.tmp";
+    const path = "kaidb_pool_pin_test.tmp";
     std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
     defer std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
 

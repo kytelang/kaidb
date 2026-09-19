@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Throughput/scaling harness for NovaDB.
+"""Throughput/scaling harness for kaidb.
 
 Unlike concurrency_stress.py (a CORRECTNESS gate), this measures how throughput scales with
 concurrency, and separates read scaling from write scaling. That distinction is the whole point:

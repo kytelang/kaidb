@@ -1,4 +1,4 @@
-//! PostgreSQL-style binary wire-protocol codec for the NovaDB server.
+//! PostgreSQL-style binary wire-protocol codec for the kaidb server.
 //!
 //! This module is the pure, transport-agnostic encode/decode layer that sits
 //! between raw bytes on a socket and the typed messages the server loop in
@@ -37,7 +37,7 @@
 //! [`Frontend`] tags are messages a CLIENT sends (query, parse, bind, execute,
 //! ...); [`Backend`] tags are messages the SERVER sends (row description, data
 //! row, ready-for-query, ...). The tag byte values match PostgreSQL's, which is
-//! what lets an off-the-shelf Postgres client talk to NovaDB.
+//! what lets an off-the-shelf Postgres client talk to kaidb.
 //!
 //! ## NULL handling
 //!
@@ -66,7 +66,7 @@ const Allocator = mem.Allocator;
 /// Type tag byte for a message the CLIENT sends to the server.
 ///
 /// The values are the PostgreSQL frontend message-type bytes, chosen so a
-/// standard Postgres client interoperates with NovaDB. The non-exhaustive `_`
+/// standard Postgres client interoperates with kaidb. The non-exhaustive `_`
 /// member lets [`parseFrame`] surface an unknown tag as data rather than a
 /// decode error, leaving the policy decision (reject vs ignore) to the server
 /// loop in `session.zig`.
@@ -93,9 +93,9 @@ pub const Frontend = enum(u8) {
     close = 'C',
     /// Client is disconnecting; the server should tear the session down cleanly.
     terminate = 'X',
-    /// NovaDB document-model operation (insert/find/...). This is NOT a
+    /// kaidb document-model operation (insert/find/...). This is NOT a
     /// PostgreSQL frontend byte, so a standard PG client never sends it; the
-    /// NovaDB driver uses it to carry BSON document commands over the same
+    /// kaidb driver uses it to carry BSON document commands over the same
     /// negotiated connection. Payload shape: see [`decodeDocRequest`].
     doc_op = 'J',
     /// Non-exhaustive catch-all so an unrecognised tag byte does not make the
@@ -176,11 +176,11 @@ pub const Format = enum(u16) {
     binary = 1,
 };
 
-/// A NovaDB object identifier for a data type, mirroring PostgreSQL's `Oid` concept.
+/// A kaidb object identifier for a data type, mirroring PostgreSQL's `Oid` concept.
 pub const Oid = u32;
-/// The fixed set of built-in type OIDs NovaDB advertises in row descriptions and parameter lists.
+/// The fixed set of built-in type OIDs kaidb advertises in row descriptions and parameter lists.
 ///
-/// These are NovaDB's own small, dense numbering (not PostgreSQL's system-catalog
+/// These are kaidb's own small, dense numbering (not PostgreSQL's system-catalog
 /// OIDs); the driver maps them to Nova types. Referenced as `oid.int8` etc. from
 /// [`FieldDesc.type_oid`] and [`decodeParse`].
 pub const oid = struct {
@@ -458,7 +458,7 @@ pub fn encodeSimple(a: Allocator, t: Backend) ![]u8 {
 
 /// Builds a [`Backend.error_response`] frame from a severity, SQLSTATE code, and message.
 ///
-/// This is NovaDB's compact three-field error layout (severity, code, message
+/// This is kaidb's compact three-field error layout (severity, code, message
 /// each as a str16), not PostgreSQL's tagged field-list form. Returns an owned
 /// frame the caller must free.
 pub fn encodeError(a: Allocator, severity: []const u8, code: []const u8, message: []const u8) ![]u8 {
@@ -792,7 +792,7 @@ pub fn encodeUpdatePayload(a: Allocator, filter: []const u8, spec: []const u8) !
 
 /// Result-set tag byte for a document response (server -> client). Lowercase so
 /// it does not collide with any exhaustive [`Backend`] message byte; only the
-/// NovaDB driver reads it.
+/// kaidb driver reads it.
 pub const doc_result_tag: u8 = 'j';
 
 /// Encodes a document result set: `u32 count` then, per document, `i32 length`
@@ -1007,14 +1007,14 @@ test "framing round-trip: ready" {
 
 test "data row with NULL round-trips (-1 length, not a sentinel)" {
     const a = testing.allocator;
-    const vals = [_]?[]const u8{ "Nova", null, "42" };
+    const vals = [_]?[]const u8{ "kaidb", null, "42" };
     const msg = try encodeDataRow(a, &vals);
     defer a.free(msg);
     const parsed = (try parseFrame(msg)).?;
     try testing.expectEqual(@as(u8, @intFromEnum(Backend.data_row)), parsed.frame.type);
     var c = Cursor{ .data = parsed.frame.payload };
     try testing.expectEqual(@as(u16, 3), try c.u16v());
-    try testing.expectEqualStrings("Nova", (try c.value()).?);
+    try testing.expectEqualStrings("kaidb", (try c.value()).?);
     try testing.expect((try c.value()) == null); // real NULL
     try testing.expectEqualStrings("42", (try c.value()).?);
 }
@@ -1043,7 +1043,7 @@ test "decode startup + query + execute" {
     try b.putU16(1); // major
     try b.putU16(0); // minor
     try b.putStr16("admin");
-    try b.putStr16("nova");
+    try b.putStr16("kaidb");
     try b.putStr16("workbench");
     const framed = try b.finish(@intFromEnum(Frontend.startup));
     defer a.free(framed);
@@ -1051,7 +1051,7 @@ test "decode startup + query + execute" {
     try testing.expectEqual(@as(u8, @intFromEnum(Frontend.startup)), parsed.frame.type);
     const s = try decodeStartup(parsed.frame.payload);
     try testing.expectEqualStrings("admin", s.user);
-    try testing.expectEqualStrings("nova", s.database);
+    try testing.expectEqualStrings("kaidb", s.database);
 
     var b2 = Builder.init(a);
     defer b2.deinit();

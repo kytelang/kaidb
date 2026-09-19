@@ -1,9 +1,9 @@
-//! Recursive-descent SQL parser: turns a SQL string into a NovaDB AST.
+//! Recursive-descent SQL parser: turns a SQL string into a kaidb AST.
 //!
 //! This is the front half of the SQL engine. It sits between the [`Lexer`]
 //! (which turns raw text into a flat `[]Token`) and the query executor (which
 //! walks the AST this file produces). The grammar it accepts is the SQL subset
-//! NovaDB actually runs: DML (`SELECT`/`INSERT`/`UPDATE`/`DELETE`), DDL
+//! kaidb actually runs: DML (`SELECT`/`INSERT`/`UPDATE`/`DELETE`), DDL
 //! (`CREATE`/`DROP`/`ALTER TABLE`, indexes), transaction control
 //! (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`/`RELEASE`), bulk `IMPORT`/`EXPORT`,
 //! and access control (`CREATE USER`/`ROLE`, `LOGIN`, `GRANT`/`REVOKE`).
@@ -1101,7 +1101,7 @@ pub const Parser = struct {
     /// NULL`/`NULL`, `DEFAULT (string|int|NULL)`, `AUTO_INCREMENT` (accepted and
     /// ignored), and `REFERENCES parent(col)` for a foreign key. An optional
     /// type size/precision `(n)` or `(n, m)` after the type name is parsed and
-    /// discarded (NovaDB does not store column widths). Returns
+    /// discarded (kaidb does not store column widths). Returns
     /// `error.ExpectedDefaultValue` if `DEFAULT` is not followed by a literal.
     fn parseCreateTable(self: *Parser) !ast.Statement {
         self.eat();

@@ -2,7 +2,7 @@
 //!
 //! The binary wire protocol lets a client send a parameterised statement
 //! (`... WHERE id = $1 AND name = $2`) together with a positional list of
-//! argument values. NovaDB's SQL parser does not itself carry placeholders all
+//! argument values. kaidb's SQL parser does not itself carry placeholders all
 //! the way through the executor, so the protocol layer resolves the placeholders
 //! into concrete SQL literals BEFORE the text reaches the parser. This module is
 //! that resolution step: [`substituteParams`] rewrites every `$N` into the

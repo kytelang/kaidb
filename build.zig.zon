@@ -1,7 +1,7 @@
 .{
-    .name = .novadb,
+    .name = .kaidb,
     .version = "0.1.0",
-    .fingerprint = 0x3d32df95b5c98f02,
+    .fingerprint = 0x4e717f5f186f62ae,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .tls = .{

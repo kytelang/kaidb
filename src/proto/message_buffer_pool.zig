@@ -1,6 +1,6 @@
 //! Thread-safe free-list of reusable byte buffers for the binary wire protocol.
 //!
-//! Every request/response cycle on a NovaDB session needs a scratch `[]u8` to
+//! Every request/response cycle on a kaidb session needs a scratch `[]u8` to
 //! decode an incoming frame into or to encode an outgoing frame from. Allocating
 //! and freeing that buffer on the general-purpose allocator on every message is
 //! both a per-message syscall-class cost and a source of heap fragmentation on a

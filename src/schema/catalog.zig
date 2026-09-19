@@ -32,8 +32,8 @@
 //! [`SystemCatalog.getIndexesForTable`], which allocates a fresh owned slice the
 //! caller must free.
 //!
-//! The catalog is not internally synchronised. In NovaDB the db-wide lock gates
-//! DDL exclusively (see NovaDB's `architecture.md`), so schema mutation happens
+//! The catalog is not internally synchronised. In kaidb the db-wide lock gates
+//! DDL exclusively (see kaidb's `architecture.md`), so schema mutation happens
 //! single-threaded under that lock while readers are excluded; concurrent
 //! append and scan is therefore never expected here.
 

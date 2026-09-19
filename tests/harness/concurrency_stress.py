@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NovaDB concurrency stress + correctness harness.
+"""kaidb concurrency stress + correctness harness.
 
 Drives the running server (HTTP :3008) with many parallel writers doing
 insert/update/delete over disjoint key ranges, then verifies end-to-end that the

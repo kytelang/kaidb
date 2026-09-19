@@ -1,6 +1,6 @@
 //! Volcano-style row iterators and the SQL expression evaluation engine.
 //!
-//! This module is the execution layer of NovaDB's SQL engine: the set of
+//! This module is the execution layer of kaidb's SQL engine: the set of
 //! pull-based operators the [`QueryExecutor`] wires into a tree to answer a
 //! `SELECT`, plus the scalar/predicate evaluator that operators call to test a
 //! `WHERE`, compute a projected value, or resolve a join key. Every operator
@@ -84,17 +84,17 @@ const QueryExecutor = @import("query_executor.zig").QueryExecutor;
 /// and memory small; measured as the knee on the 10M orders workload.
 const DEFAULT_PREFETCH_BATCH: usize = 256;
 
-/// Resolve the per-scan prefetch batch size, honouring `NOVADB_PREFETCH_BATCH`
+/// Resolve the per-scan prefetch batch size, honouring `KAIDB_PREFETCH_BATCH`
 /// (a value of `0`/`1` disables prefetch and streams one PK at a time).
 fn resolvePrefetchBatch() usize {
-    const raw = std.c.getenv("NOVADB_PREFETCH_BATCH") orelse return DEFAULT_PREFETCH_BATCH;
+    const raw = std.c.getenv("KAIDB_PREFETCH_BATCH") orelse return DEFAULT_PREFETCH_BATCH;
     const v = std.mem.span(raw);
     const n = std.fmt.parseInt(usize, v, 10) catch return DEFAULT_PREFETCH_BATCH;
     return if (n == 0) 1 else n;
 }
 
 /// Whether the equality index scan should reuse a base-table leaf cursor across
-/// its (pk-ascending) row fetches. Opt-in via `NOVADB_BASE_CURSOR`; default off
+/// its (pk-ascending) row fetches. Opt-in via `KAIDB_BASE_CURSOR`; default off
 /// because it holds the base tree's shared structure lock for the scan's
 /// lifetime (fine for a single reader, but it delays writers).
 fn useBaseCursor() bool {
@@ -102,8 +102,8 @@ fn useBaseCursor() bool {
     // the base-table leaf-reuse cursor answers most fetches without re-descending
     // from the root. `LeafReuseSearcher.get` re-descends whenever a key leaves the
     // current leaf, so it stays correct even if order is imperfect. Set
-    // NOVADB_BASE_CURSOR=0 to force the old per-fetch descent.
-    if (std.c.getenv("NOVADB_BASE_CURSOR")) |v| return !(v[0] == '0');
+    // KAIDB_BASE_CURSOR=0 to force the old per-fetch descent.
+    if (std.c.getenv("KAIDB_BASE_CURSOR")) |v| return !(v[0] == '0');
     return true;
 }
 
@@ -1340,12 +1340,12 @@ pub const IndexScanIterator = struct {
     /// early: the batch is a look-ahead window, not a materialise-everything.
     ///
     /// `1` disables prefetch and streams one PK at a time (the old plain
-    /// index-order fetch). Overridable with `NOVADB_PREFETCH_BATCH`.
+    /// index-order fetch). Overridable with `KAIDB_PREFETCH_BATCH`.
     prefetch_batch: usize = DEFAULT_PREFETCH_BATCH,
     /// Reusable scratch for the base-leaf page ids of the current batch, so a
     /// scan does not allocate a fresh list per refill.
     leaf_ids: std.ArrayList(page.PageId) = .empty,
-    /// Optional base-table leaf-reuse cursor (env `NOVADB_BASE_CURSOR`). The
+    /// Optional base-table leaf-reuse cursor (env `KAIDB_BASE_CURSOR`). The
     /// equality index yields PKs in ascending pk order, so a persistent leaf
     /// cursor answers most base fetches without re-descending. Held for the scan;
     /// closed in `deinit`. `prev_base_searcher` restores the executor's prior

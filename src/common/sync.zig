@@ -1,7 +1,7 @@
 //! Concurrency primitives layered over Zig's async `std.Io` synchronisation.
 //!
 //! Every lock here takes an `Io` argument on the blocking calls rather than
-//! parking a raw OS thread: they cooperate with NovaDB's async scheduler, so a
+//! parking a raw OS thread: they cooperate with kaidb's async scheduler, so a
 //! coroutine that cannot acquire a lock yields its executor instead of
 //! spinning a kernel thread. All acquisition uses the *uncancelable* variants
 //! (`lockUncancelable`, `waitUncancelable`), because a half-taken storage lock
@@ -15,7 +15,7 @@
 //!     engine a single import surface and a stable API even if the underlying
 //!     `std.Io` types shift.
 //!
-//!   * [`GroupLock`] is the heart of NovaDB's per-table access protocol. Unlike
+//!   * [`GroupLock`] is the heart of kaidb's per-table access protocol. Unlike
 //!     an ordinary reader/writer lock it has THREE co-operating admission
 //!     classes, chosen to match how SQL statements touch a table:
 //!       - **read** mode  (SELECT): many readers run concurrently;
@@ -125,7 +125,7 @@ pub const RwLock = struct {
 
 /// Three-mode per-table access lock: read, write and exclusive groups.
 ///
-/// This is the table-granularity lock in NovaDB's Stage-3 concurrency design.
+/// This is the table-granularity lock in kaidb's Stage-3 concurrency design.
 /// It generalises a reader/writer lock with a third class so that INSERTs (which
 /// only append and are made mutually safe by the B+Tree's own `structure_lock`)
 /// can run as a concurrent *group* distinct from SELECTs, while UPDATE/DELETE/

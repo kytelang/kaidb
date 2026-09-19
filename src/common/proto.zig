@@ -1,7 +1,7 @@
-//! Wire-protocol message types for the NovaDB server.
+//! Wire-protocol message types for the kaidb server.
 //!
 //! This module defines the on-the-wire shapes exchanged between a client and
-//! the NovaDB server, and between a primary and its replicas. It is the shared
+//! the kaidb server, and between a primary and its replicas. It is the shared
 //! vocabulary that both ends serialise to and parse from, so it lives in
 //! `common/` and is deliberately free of any storage, executor, or networking
 //! logic: it only knows how to turn a message into bytes and back.

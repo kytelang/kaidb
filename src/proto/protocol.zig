@@ -1,7 +1,7 @@
-//! Binary wire-protocol primitives shared by the NovaDB server and its driver.
+//! Binary wire-protocol primitives shared by the kaidb server and its driver.
 //!
-//! This module defines the on-the-wire encoding that a client (Nova's
-//! `packages/nova-novadb` driver) and the `btree` server speak to each other.
+//! This module defines the on-the-wire encoding that a client (Kyte's
+//! `packages/nova-kaidb` driver) and the `btree` server speak to each other.
 //! It is deliberately a low-level, POD-oriented layer: the framing types are
 //! `extern struct`s laid out with a fixed C ABI so both ends can memcpy them
 //! directly to and from a socket buffer, and the read/write helpers do nothing
@@ -122,7 +122,7 @@ pub fn negotiate(peer_version: u16) ?u16 {
 /// and padding are guaranteed. The header is followed on the wire by exactly
 /// [`MessageHeader.payload_len`] body bytes.
 pub const MessageHeader = extern struct {
-    /// Sentinel identifying a NovaDB frame; must equal [`MAGIC_VALUE`].
+    /// Sentinel identifying a kaidb frame; must equal [`MAGIC_VALUE`].
     /// A mismatch means the stream is corrupt or misaligned, see [`isValid`].
     magic: u32,
     /// The body's [`MessageType`], stored as its raw `u8` value.

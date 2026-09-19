@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
 
     const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose name matches a filter") orelse &.{};
 
-    const host = buildNovadb(b, target, optimize);
+    const host = buildKaidb(b, target, optimize);
     b.installArtifact(host.exe);
     b.installArtifact(host.cli_exe);
 
@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) void {
     clean_scratch.step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&clean_scratch.step);
 
-    const cross_step = b.step("cross", "Cross-compile NovaDB for all supported OS/arch targets");
+    const cross_step = b.step("cross", "Cross-compile kaidb for all supported OS/arch targets");
     const CrossTarget = struct { triple: []const u8, server: bool };
     const cross_targets = [_]CrossTarget{
         .{ .triple = "aarch64-macos", .server = true },
@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
     for (cross_targets) |ct| {
         const q = std.Build.parseTargetQuery(.{ .arch_os_abi = ct.triple }) catch @panic("bad target triple");
         const rt = b.resolveTargetQuery(q);
-        const built = buildNovadb(b, rt, .ReleaseSafe);
+        const built = buildKaidb(b, rt, .ReleaseSafe);
         const custom_dir = b.fmt("cross/{s}", .{ct.triple});
         if (ct.server) {
             cross_step.dependOn(&b.addInstallArtifact(built.exe, .{
@@ -76,7 +76,7 @@ const Built = struct {
     mod: *std.Build.Module,
 };
 
-fn buildNovadb(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Built {
+fn buildKaidb(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Built {
     const utils_mod = b.createModule(.{
         .root_source_file = b.path("src/common/utils.zig"),
         .target = target,

@@ -1,5 +1,5 @@
 #!/bin/bash
-# NovaDB MID-WRITE crash-durability harness (P0 gate: "kill the leader mid-write, no committed loss").
+# kaidb MID-WRITE crash-durability harness (P0 gate: "kill the leader mid-write, no committed loss").
 #
 # Unlike crash_test.sh (which loads all rows, THEN kills), this kills the server WHILE inserts are still
 # streaming, so a transaction is in flight at the moment of death. It proves two things on recovery:

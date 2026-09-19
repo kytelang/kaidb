@@ -1,5 +1,5 @@
 #!/bin/bash
-# NovaDB kill-follower + CATCH-UP harness (R6/P8): kill the follower while the leader keeps writing, then
+# kaidb kill-follower + CATCH-UP harness (R6/P8): kill the follower while the leader keeps writing, then
 # restart it and prove the leader RECONNECTS and BACKFILLS the writes the follower missed -- the follower
 # ends fully consistent, no committed loss.
 #

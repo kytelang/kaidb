@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NovaDB primary-key ordering / range regression harness.
+"""kaidb primary-key ordering / range regression harness.
 
 Exercises numeric AND text primary keys across insert / point-lookup / range / update /
 delete / ORDER BY, checking that:

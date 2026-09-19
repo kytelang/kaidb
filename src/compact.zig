@@ -71,14 +71,14 @@ fn dupColumns(allocator: std.mem.Allocator, cols: []const types.Column) ![]types
     return out;
 }
 
-/// Rebuilds the database at `<src_dir>/nova.db` into a fresh, fully packed
-/// `<dst_dir>/nova.db`. Both are opened without a WAL (compaction is a one-shot
+/// Rebuilds the database at `<src_dir>/kaidb.db` into a fresh, fully packed
+/// `<dst_dir>/kaidb.db`. Both are opened without a WAL (compaction is a one-shot
 /// rebuild made durable by the final flush+sync); the destination directory is
 /// created if absent.
 pub fn compact(allocator: std.mem.Allocator, io: std.Io, src_dir: []const u8, dst_dir: []const u8) !void {
-    const src_path = try std.fmt.allocPrint(allocator, "{s}/nova.db", .{src_dir});
+    const src_path = try std.fmt.allocPrint(allocator, "{s}/kaidb.db", .{src_dir});
     defer allocator.free(src_path);
-    const dst_path = try std.fmt.allocPrint(allocator, "{s}/nova.db", .{dst_dir});
+    const dst_path = try std.fmt.allocPrint(allocator, "{s}/kaidb.db", .{dst_dir});
     defer allocator.free(dst_path);
 
     try std.Io.Dir.createDirPath(.cwd(), io, dst_dir);

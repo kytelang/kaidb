@@ -1,10 +1,10 @@
-//! Hand-written SQL tokeniser: the first stage of NovaDB's SQL front end.
+//! Hand-written SQL tokeniser: the first stage of kaidb's SQL front end.
 //!
 //! This module turns a flat `[]const u8` of SQL text into a stream of
 //! [`Token`]s that the parser pulls one at a time via [`Lexer.nextToken`].
 //! It is a classic single-pass, character-at-a-time scanner: there is no
 //! regex engine and no lookahead beyond a single character ([`Lexer.peekNext`]),
-//! which is all the SQL grammar NovaDB accepts requires.
+//! which is all the SQL grammar kaidb accepts requires.
 //!
 //! Design decisions and invariants worth knowing:
 //!
@@ -38,7 +38,7 @@
 //!     an error: [`Lexer.readString`] simply runs to end-of-input. Line numbers
 //!     ([`Token.line`]) are tracked purely for diagnostics.
 //!
-//! This file sits directly under the SQL parser in NovaDB's `sql/` layer; the
+//! This file sits directly under the SQL parser in kaidb's `sql/` layer; the
 //! parser owns a `Lexer`, and the tokens feed the query executor and catalog.
 
 const std = @import("std");
@@ -75,9 +75,9 @@ pub const TokenType = enum(u8) {
     CREATE,
     /// `DROP` keyword: begins a DDL removal.
     DROP,
-    /// `EXPORT` keyword: NovaDB extension to dump data to a file format.
+    /// `EXPORT` keyword: kaidb extension to dump data to a file format.
     EXPORT,
-    /// `IMPORT` keyword: NovaDB extension to load data from a file format.
+    /// `IMPORT` keyword: kaidb extension to load data from a file format.
     IMPORT,
     /// `CSV` keyword: file format for [`EXPORT`]/[`IMPORT`].
     CSV,
@@ -85,7 +85,7 @@ pub const TokenType = enum(u8) {
     JSON,
     /// `BSON` keyword: file format for [`EXPORT`]/[`IMPORT`].
     BSON,
-    /// `MANIFEST` keyword: NovaDB extension used with export/backup manifests.
+    /// `MANIFEST` keyword: kaidb extension used with export/backup manifests.
     MANIFEST,
     /// `ALL` keyword: e.g. `UNION ALL`, or select-all qualifiers.
     ALL,
@@ -187,7 +187,7 @@ pub const TokenType = enum(u8) {
     ON,
     /// `ANALYZE` keyword: refreshes planner statistics for a table.
     ANALYZE,
-    /// `BACKUP` keyword: NovaDB extension to snapshot the database.
+    /// `BACKUP` keyword: kaidb extension to snapshot the database.
     BACKUP,
     /// `GRANT` keyword: grants a privilege (authz).
     GRANT,
@@ -556,7 +556,7 @@ pub const Lexer = struct {
     ///
     /// Returns `error.UnexpectedCharacter` for a lone `!` not followed by `=`,
     /// and for any byte that begins no known token. Note that `=` is a single
-    /// token: NovaDB SQL has no `==`.
+    /// token: kaidb SQL has no `==`.
     pub fn nextToken(self: *Lexer) !Token {
         self.skipWhitespace();
         if (self.pos >= self.source.len) {

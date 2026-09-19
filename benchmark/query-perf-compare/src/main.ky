@@ -366,7 +366,7 @@ async fn tableCount(conn: db.Connection, tbl: string): int {
 // holds the old ids, so a reload collides with KeyAlreadyExists). A COUNT check
 // therefore cannot prove emptiness. The only reliably clean table is one whose
 // NAME was never used, so kaidb always gets a fresh, run-unique name. This does
-// leak the old table in nova.db (that is the DROP-does-not-reclaim bug); restart
+// leak the old table in kaidb.db (that is the DROP-does-not-reclaim bug); restart
 // kaidb with a clean data dir to reclaim. Returns "" if no clean table is made.
 async fn ensureCleanTable(conn: db.Connection, kind: string, base: string, suffix: string, er: EngineResult): string {
     // All three engines now reset the SAME stable table name with DROP+CREATE:

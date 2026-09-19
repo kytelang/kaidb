@@ -1,7 +1,7 @@
 //! Common utilities facade: the single import surface for cross-cutting helpers.
 //!
 //! This module owns nothing of its own. It is a thin re-export barrel that
-//! gathers the small, self-contained support types used throughout NovaDB, so
+//! gathers the small, self-contained support types used throughout kaidb, so
 //! that the rest of the engine (storage, durability, proto, schema) can write
 //! `@import("common/utils.zig").StopWatch` instead of reaching into the exact
 //! file each helper happens to live in. When `build.zig` wires the whole
@@ -55,7 +55,7 @@ pub const StopWatch = @import("stopwatch.zig").StopWatch;
 /// This points at `std.Io.Mutex` so call sites depend on
 /// `common/utils.Mutex` rather than the exact std path; if the engine's mutex
 /// choice ever changes, only this line moves. For per-table access control see
-/// the `GroupLock` in [`sync`] instead, which is NovaDB's own primitive.
+/// the `GroupLock` in [`sync`] instead, which is kaidb's own primitive.
 pub const Mutex = std.Io.Mutex;
 
 /// In-memory store of static assets served by the built-in HTTP surface.
@@ -68,7 +68,7 @@ pub const StaticContentStore = @import("static_content.zig").StaticContentStore;
 /// Concurrency primitives module, notably the per-table `GroupLock`.
 ///
 /// Re-exported whole from `sync.zig` (a module alias, not a single type). This
-/// is where NovaDB's own locking lives: the `GroupLock` that gates per-table
+/// is where kaidb's own locking lives: the `GroupLock` that gates per-table
 /// access (SELECT in read mode with concurrent readers, INSERT in write mode
 /// with concurrent writers, UPDATE/DELETE exclusive), as described in
 /// `architecture.md`. Import it as `utils.sync.GroupLock`.

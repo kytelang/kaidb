@@ -1,7 +1,7 @@
-//! Slotted-page B+Tree: the ordered index at the heart of NovaDB's storage engine.
+//! Slotted-page B+Tree: the ordered index at the heart of kaidb's storage engine.
 //!
 //! This file implements the B+Tree that every table and secondary index in
-//! NovaDB is built on. Keys and values are variable-length byte slices; the
+//! kaidb is built on. Keys and values are variable-length byte slices; the
 //! tree keeps keys in sorted order and links all leaves in a singly-linked
 //! chain (`next_page_id`) so that a range scan is a leftmost descent followed
 //! by a straight walk along the leaf chain, never revisiting internal nodes.

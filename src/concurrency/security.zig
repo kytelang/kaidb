@@ -1,4 +1,4 @@
-//! Authentication, authorisation, and session management for NovaDB.
+//! Authentication, authorisation, and session management for kaidb.
 //!
 //! This module is the security gate that sits in front of the SQL engine. Every
 //! connection that arrives over the binary wire protocol is authenticated here,

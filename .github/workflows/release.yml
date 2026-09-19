@@ -1,6 +1,6 @@
 name: release
 
-# Build NovaDB for every supported OS/arch and publish them on a GitHub Release.
+# Build kaidb for every supported OS/arch and publish them on a GitHub Release.
 #
 # Fires when a version tag `vX.Y.Z` is pushed, or manually via the Actions tab
 # (workflow_dispatch) with a tag name. Zig cross-compiles every target from a
@@ -55,8 +55,8 @@ jobs:
         run: zig build cross
 
       # One archive per target: .zip for Windows, .tar.gz elsewhere. Each archive
-      # carries whatever binaries that target produced (server `novadb` and/or
-      # the `novadb-cli`, `.exe` on Windows) plus LICENSE/README when present.
+      # carries whatever binaries that target produced (server `kaidb` and/or
+      # the `kaidb-cli`, `.exe` on Windows) plus LICENSE/README when present.
       - name: Package artifacts
         id: package
         run: |
@@ -67,13 +67,13 @@ jobs:
           shopt -s nullglob
           for dir in zig-out/cross/*/; do
             triple="$(basename "$dir")"
-            stage="$(mktemp -d)/novadb-${TAG}-${triple}"
+            stage="$(mktemp -d)/kaidb-${TAG}-${triple}"
             mkdir -p "$stage"
             cp "$dir"* "$stage"/ 2>/dev/null || true
             for extra in LICENSE LICENSE.md README.md; do
               [ -f "$extra" ] && cp "$extra" "$stage"/ || true
             done
-            base="novadb-${TAG}-${triple}"
+            base="kaidb-${TAG}-${triple}"
             if [[ "$triple" == *windows* ]]; then
               ( cd "$(dirname "$stage")" && zip -r -q "$base.zip" "$(basename "$stage")" )
               mv "$(dirname "$stage")/$base.zip" "$OUT/"
@@ -88,7 +88,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: NovaDB ${{ steps.tag.outputs.tag }}
+          name: kaidb ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

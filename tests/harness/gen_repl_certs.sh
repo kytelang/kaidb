@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../../testdata/repl"
 DAYS=36500
-subj() { echo "/C=IN/O=NovaDB Test/CN=$1"; }
+subj() { echo "/C=IN/O=kaidb Test/CN=$1"; }
 
 mkca() { # name
   local n=$1
@@ -19,7 +19,7 @@ x509_extensions=v3
 prompt=no
 [dn]
 CN=$n
-O=NovaDB Test
+O=kaidb Test
 [v3]
 basicConstraints=critical,CA:TRUE
 keyUsage=critical,keyCertSign,cRLSign

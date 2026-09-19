@@ -3,7 +3,7 @@
 //!
 //! This module is the vocabulary the schema/catalog layer uses to describe
 //! *what* is stored, as opposed to the storage layer (`storage/`) which owns
-//! *how* bytes live in pages. Every persistent object in NovaDB, a table, an
+//! *how* bytes live in pages. Every persistent object in kaidb, a table, an
 //! index, a sequence, an FK constraint, is ultimately one of the structs here,
 //! and the catalog persists them by calling the `serialize`/`deserialize`
 //! methods defined alongside each type.
@@ -91,7 +91,7 @@ pub const IndexValue = union(enum) {
     blob: []const u8,
 };
 
-/// The set of column data types NovaDB understands.
+/// The set of column data types kaidb understands.
 ///
 /// Backed by `u8`: the tag value is written verbatim to disk by
 /// [`ColumnMetadata.serialize`] and mapped to a Zig primitive at comptime by

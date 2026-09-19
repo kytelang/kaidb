@@ -1,6 +1,6 @@
 //! Proleptic-Gregorian UTC date/time arithmetic for the SQL layer.
 //!
-//! NovaDB stores `DATE`, `TIME`, and `TIMESTAMP` columns as a single signed
+//! kaidb stores `DATE`, `TIME`, and `TIMESTAMP` columns as a single signed
 //! millisecond count relative to the Unix epoch (1970-01-01T00:00:00Z). That
 //! `i64` is what the codec writes into a cell and what comparisons, ordering,
 //! and range scans operate on: reducing every temporal value to one integer
@@ -34,7 +34,7 @@
 const std = @import("std");
 
 /// A broken-down UTC calendar timestamp: the human-readable form of the `i64`
-/// epoch-millisecond value NovaDB actually stores.
+/// epoch-millisecond value kaidb actually stores.
 ///
 /// Fields are stored as-is with no normalisation, so it is possible to
 /// construct an out-of-range instance (e.g. `month = 13`); the validated entry

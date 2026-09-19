@@ -1,4 +1,4 @@
-//! On-disk page allocator: the lowest layer of NovaDB's storage stack.
+//! On-disk page allocator: the lowest layer of kaidb's storage stack.
 //!
 //! The database file is nothing but a flat array of fixed-size pages
 //! ([`PAGE_SIZE`] bytes each), addressed by a [`PageId`] which is simply the

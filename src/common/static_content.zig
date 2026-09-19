@@ -1,6 +1,6 @@
-//! In-memory static-content store for the NovaDB server.
+//! In-memory static-content store for the kaidb server.
 //!
-//! NovaDB is primarily a binary-protocol database, but the server can also
+//! kaidb is primarily a binary-protocol database, but the server can also
 //! serve a small bundle of static web assets (an admin/status UI, favicons,
 //! scripts, stylesheets) directly over HTTP. This module is that asset store:
 //! it slurps a whole directory tree into RAM once at start-up and then answers

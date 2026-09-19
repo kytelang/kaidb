@@ -1,6 +1,6 @@
 //! Server-startup configuration, parsed from the on-disk `db.json`.
 //!
-//! This module defines the single source of truth for how a NovaDB server
+//! This module defines the single source of truth for how a kaidb server
 //! instance is wired up at boot: which data model it serves, which address and
 //! port it binds, where its data and WAL live, how durable commits are, pool
 //! sizing, per-query memory, TLS, and replication. Everything the server needs
@@ -53,7 +53,7 @@ const log = std.log.scoped(.config);
 /// or `"document"`).
 pub const ServerMode = enum {
     /// SQL only. Document (`doc_op`) requests are rejected. Default, matching
-    /// NovaDB's role as the orchestrator's relational control-plane store.
+    /// kaidb's role as the orchestrator's relational control-plane store.
     relational,
     /// Document (NoSQL) only. SQL query/parse/bind/describe/execute frames and
     /// the HTTP `/query` endpoint are rejected.
@@ -166,7 +166,7 @@ pub const Config = struct {
         /// Refuse to start while the bootstrap `admin` account still has its
         /// default password (`admin`). Forces an operator to rotate the seeded
         /// credential before the server will serve. Rotate it offline first with
-        /// `novadb passwd admin '<newpw>'` (the server need not be running), then
+        /// `kaidb passwd admin '<newpw>'` (the server need not be running), then
         /// start with this on. Defaults false to keep first-run/dev friction low.
         require_admin_password_change: bool = false,
     } = .{},

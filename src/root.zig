@@ -1,16 +1,16 @@
-//! NovaDB root module: the crate entry point and the engine's integration test surface.
+//! kaidb root module: the crate entry point and the engine's integration test surface.
 //!
 //! This is the `root.zig` that `build.zig` names as the library module's root, so
 //! everything reachable from here is what the rest of the tree (and `zig build test`)
 //! compiles against. It plays two distinct roles.
 //!
 //! First, it is the small **public re-export** point for the two protocol namespaces a
-//! consumer of NovaDB-as-a-library reaches for: [`wire_proto`] (the low-level frame
+//! consumer of kaidb-as-a-library reaches for: [`wire_proto`] (the low-level frame
 //! codec in `common/proto.zig`) and [`proto`] (the higher-level server protocol in
 //! `proto/protocol.zig`). Nothing else in the storage/query/durability stack is
 //! surfaced here; those are pulled in directly by their own modules. Keeping the
-//! re-exports thin is deliberate: the wire types are the stable seam that Nova's
-//! `nova-novadb` driver talks to, so they get a single, discoverable home.
+//! re-exports thin is deliberate: the wire types are the stable seam that Kyte's
+//! `nova-kaidb` driver talks to, so they get a single, discoverable home.
 //!
 //! Second, and by line-count overwhelmingly, this file is the engine's **end-to-end
 //! integration test bench**. Rather than unit-test each subsystem in isolation, these
@@ -912,7 +912,7 @@ test "compaction: rebuild packs and preserves visible rows (drops dead versions)
     // Build a small source db: 5 rows, then delete one and update one so the
     // version chains have dead/superseded versions for compaction to drop.
     {
-        var db = try Database.open(allocator, io, src_dir ++ "/nova.db", 64, null);
+        var db = try Database.open(allocator, io, src_dir ++ "/kaidb.db", 64, null);
         defer db.close();
         var exec = QueryExecutor.init(allocator, db);
         defer exec.deinit();
@@ -935,7 +935,7 @@ test "compaction: rebuild packs and preserves visible rows (drops dead versions)
     // 4 rows (id 3 dropped), id=5 has the updated value, the index still finds
     // rows, and COUNT is correct.
     {
-        var db = try Database.open(allocator, io, dst_dir ++ "/nova.db", 64, null);
+        var db = try Database.open(allocator, io, dst_dir ++ "/kaidb.db", 64, null);
         defer db.close();
         var exec = QueryExecutor.init(allocator, db);
         defer exec.deinit();
@@ -1519,8 +1519,8 @@ test "database crash recovery" {
 /// The low-level binary wire codec (frame headers, length-prefixed fields, typed
 /// value encode/decode) from `common/proto.zig`.
 ///
-/// This is the byte-level contract between NovaDB and any client, most importantly
-/// Nova's `nova-novadb` driver. It is re-exported here so a library consumer can
+/// This is the byte-level contract between kaidb and any client, most importantly
+/// Kyte's `nova-kaidb` driver. It is re-exported here so a library consumer can
 /// reach the frame types without depending on the internal module path. See
 /// [`proto`] for the higher-level message protocol layered on top of these frames.
 pub const wire_proto = @import("common/proto.zig");
@@ -4521,7 +4521,7 @@ test "ADMIN ROTATION: passwordMatches detects the default and clears after rotat
     try std.testing.expect(!sec.passwordMatches("admin", "wrong"));
     try std.testing.expect(!sec.passwordMatches("ghost", "admin"));
 
-    // Rotate exactly as the offline `novadb passwd` CLI does: hash + updateUserPassword.
+    // Rotate exactly as the offline `kaidb passwd` CLI does: hash + updateUserPassword.
     var salt: [32]u8 = undefined;
     std.Io.random(io, &salt);
     const hash = try sec.hashKey("newadminpw", salt);
@@ -5236,7 +5236,7 @@ test "STRESS: concurrent readers + writers on one table stay consistent (group l
 /// so the B+Tree's ordered scans line up with the fuzzer's in-memory model. The digit
 /// widths bound the fuzzers to ns < 1000 and seq < 10_000_000.
 // True when an environment variable whose name starts with `prefix` (include the `=`) is present.
-// Used to scale the concurrency fuzzers up under NOVADB_FUZZ / opt into the perf test under NOVADB_PERF.
+// Used to scale the concurrency fuzzers up under KAIDB_FUZZ / opt into the perf test under KAIDB_PERF.
 fn envSet(prefix: []const u8) bool {
     var i: usize = 0;
     while (std.c.environ[i]) |entry| : (i += 1) {
@@ -5354,9 +5354,9 @@ test "FUZZER (serial): randomized insert/delete/search stays model-consistent + 
 
 test "FUZZER (concurrent): disjoint-namespace writers on ONE tree stay model-consistent" {
     // Default-on (a short run) so the riskiest path -- concurrent writers racing structure_lock on one
-    // tree -- is exercised by the plain `zig build test` gate, not just opt-in. NOVADB_FUZZ=1 scales it up
+    // tree -- is exercised by the plain `zig build test` gate, not just opt-in. KAIDB_FUZZ=1 scales it up
     // to the long soak. (It used to SkipZigTest without the env, so the gate never ran it.)
-    const fuzz_full = envSet("NOVADB_FUZZ=");
+    const fuzz_full = envSet("KAIDB_FUZZ=");
 
     const alloc = std.heap.c_allocator;
 
@@ -5495,8 +5495,8 @@ test "FUZZER (concurrent): OVERLAPPING-key writers on one tree stay self-consist
     // survive, so instead of a per-key model we assert INTERNAL consistency after the storm: the tree's
     // structural invariants hold, and every key reachable by a full scan is also found by a point search
     // (scan == point-lookup). No writer may hit anything but the benign KeyAlreadyExists / KeyNotFound
-    // races. Default-on (short); NOVADB_FUZZ=1 scales it up.
-    const fuzz_full = envSet("NOVADB_FUZZ=");
+    // races. Default-on (short); KAIDB_FUZZ=1 scales it up.
+    const fuzz_full = envSet("KAIDB_FUZZ=");
     const alloc = std.heap.c_allocator;
 
     var threaded = std.Io.Threaded.init(alloc, .{});

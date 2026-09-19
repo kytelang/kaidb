@@ -1,10 +1,10 @@
-//! Front-door TCP listener for the NovaDB server: it accepts client sockets,
+//! Front-door TCP listener for the kaidb server: it accepts client sockets,
 //! optionally wraps them in TLS, and demultiplexes each connection onto one of
 //! three wire dialects that this one port speaks.
 //!
 //! ## Why one listener, three protocols
 //!
-//! A NovaDB deployment has to serve heterogeneous clients over a single port,
+//! A kaidb deployment has to serve heterogeneous clients over a single port,
 //! so the very first byte (or first 4 bytes) of a connection decides which
 //! dialect the peer is speaking. [`runLoop`] is the demux point and never
 //! guesses twice: once a connection commits to a dialect it stays there for its
@@ -24,7 +24,7 @@
 //!   3. **Binary wire protocol**, if the first 4 bytes equal
 //!      [`binary_proto.MessageHeader.MAGIC_VALUE`], the connection upgrades to
 //!      the compact framed protocol handled by [`runBinaryProtocolStream`]. This
-//!      is the intended fast path for Nova's own driver.
+//!      is the intended fast path for Kyte's own driver.
 //!
 //! The trick that makes the demux free is that the JSON path's `u32` length and
 //! the binary path's magic occupy the same first 4 bytes: [`runLoop`] reads
@@ -100,7 +100,7 @@ const Config = @import("../common/config.zig").Config;
 /// disconnects are surfaced here.
 const log = std.log.scoped(.tcp_server);
 
-/// The NovaDB network front door: an accept loop that spawns one async handler
+/// The kaidb network front door: an accept loop that spawns one async handler
 /// per connection and demultiplexes it onto the startup / JSON-packet / binary
 /// dialects described in the module header.
 ///

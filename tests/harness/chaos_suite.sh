@@ -1,5 +1,5 @@
 #!/bin/bash
-# NovaDB CHAOS SUITE (R6/P8) -- fault-injection scenarios reported as NUMBERS.
+# kaidb CHAOS SUITE (R6/P8) -- fault-injection scenarios reported as NUMBERS.
 #
 # Turns the durability/replication gates into an automated pass/fail report, per the P8 gate: "zero
 # committed loss beyond the stated RPO, zero split-brain writes, recovery within the stated RTO -- reported

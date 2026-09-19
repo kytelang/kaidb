@@ -1,4 +1,4 @@
-//! Slotted-page layout: the on-disk unit of the NovaDB B+Tree.
+//! Slotted-page layout: the on-disk unit of the kaidb B+Tree.
 //!
 //! Every node of the B+Tree, plus every overflow and undo page, is one
 //! fixed-size [`PAGE_SIZE`] byte block laid out as a *slotted page*. This file
@@ -91,9 +91,9 @@ pub const PageId = u64;
 /// `u16`.
 pub const PAGE_SIZE: u32 = 16384;
 
-/// Magic number written into the file [`Header`] to identify a NovaDB data file
+/// Magic number written into the file [`Header`] to identify a kaidb data file
 /// (ASCII "ATSS" little-endian). A mismatch on open means the file is not a
-/// NovaDB database or is corrupt.
+/// kaidb database or is corrupt.
 pub const MAGIC: u32 = 0x53535441;
 /// On-disk format version stamped into the file [`Header`]. Bump this on any
 /// incompatible change to the page or header layout so old files are rejected.
@@ -197,7 +197,7 @@ pub const PageHeader = extern struct {
 pub const Header = extern struct {
     /// Integrity checksum over the header; first field so it covers the rest.
     checksum: u64 = 0,
-    /// [`MAGIC`] identifying this as a NovaDB file; validated on open.
+    /// [`MAGIC`] identifying this as a kaidb file; validated on open.
     magic: u32,
     /// On-disk format [`VERSION`]; a mismatch rejects the file.
     version: u8,

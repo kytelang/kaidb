@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host gate for NovaDB (the B+Tree storage engine + SQL database, Zig). Builds and runs the full unit
+# Host gate for kaidb (the B+Tree storage engine + SQL database, Zig). Builds and runs the full unit
 # suite on THIS host OS, exiting non-zero on any failure. See ../CI-POLICY.md. Nothing merges red.
 set -uo pipefail
 cd "$(cd "$(dirname "$0")" && pwd)"
@@ -20,5 +20,5 @@ if [ $fail -eq 0 ]; then
 fi
 
 echo
-if [ $fail -eq 0 ]; then echo "GATE PASS  novadb  [$OS]"; else echo "GATE FAIL  novadb  [$OS]"; fi
+if [ $fail -eq 0 ]; then echo "GATE PASS  kaidb  [$OS]"; else echo "GATE FAIL  kaidb  [$OS]"; fi
 exit $fail
