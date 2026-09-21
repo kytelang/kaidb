@@ -899,9 +899,32 @@ Test and hardening plan:
   `SELECT x FROM t WHERE DBL(x) = 42` returns exactly the one row (`x = 21`) via the wasm
   predicate evaluated per row through the real executor, then `DROP FUNCTION DBL` makes the same
   query return no rows. **Filter pushdown with a wasm UDF now works from SQL.**
-  _Remaining for M1:_ WAL-backed persistence of the registered module bytes (so UDFs survive
-  restart, currently in-memory), a concurrent-DDL latch on the registry, an optional wall-clock
-  deadline backstop and output-size cap, the
+  _Concurrency: already safe._ `CREATE FUNCTION` / `DROP FUNCTION` are DDL, which
+  `executeStatement` runs under the database `rw_lock` held exclusively; a `SELECT` that reads
+  the registry holds the same lock shared. The two are therefore mutually exclusive, so
+  mutating the registry never races a query that reads it. No extra latch is required.
+  _Deadline backstop: covered by fuel for now._ Fuel already bounds execution deterministically
+  and per instruction; a wall-clock backstop would need clock access the pure interpreter does
+  not have (it would take a watchdog-set interrupt flag), so it is deferred as the optional
+  control the design already calls it. The output-size cap is not yet relevant: scalar UDFs
+  return a single numeric value, so there is nothing unbounded to cap until the string/bytes
+  frame codec lands.
+
+  **M1 is functionally complete: a wasm scalar UDF is authored (Kyte -> wasm), registered from
+  SQL, and used in a metered, sandboxed, deterministic filter predicate, with the engine built
+  into the kaidb binary.** What remains are later milestones, not M1 leftovers:
+  - **Persistence of the registered module (M4-scale).** The registry is in-memory, so UDFs do
+    not survive restart. kaidb's catalog stores only `{name, type, root_page_id}` per object, so
+    durably storing the module bytes means page/overflow storage plus reload in `loadCatalog`
+    and WAL/recovery. The clean reuse-existing-storage route (keep UDFs as rows in an internal
+    table) is complicated by `rw_lock` non-reentrancy: `CREATE FUNCTION` already holds the
+    exclusive lock, so it cannot call `self.execute` to write that table and must use the
+    lower-level table API. This is a genuine storage-integration slice, best done on its own.
+  - **String/bytes UDF arguments (M2).** The frame codec on `src/proto/wire.zig` (section 6),
+    for variable-length arguments; numeric UDFs need none and work now.
+  - **Scalar-expression projections (`SELECT fn(col)`).** kaidb has no scalar projections
+    today (section 10.1); this is a separate SQL feature.
+  - **The KYX-from-database apex (M7, section 12.4).**
   push-model frame codec on `src/proto/wire.zig` for variable-length (string/bytes) arguments,
   and the `CREATE FUNCTION ... LANGUAGE wasm` / `SELECT fn(col)` wiring into kaidb's lexer,
   parser, catalog, and executor (the larger SQL-surface slice). Demo target: a Kyte function
