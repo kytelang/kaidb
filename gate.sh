@@ -9,7 +9,7 @@ step() { echo; echo ">>> $* [$OS]"; }
 
 # Leftover test artifacts on disk can make a --seed-shuffled run pick up stale DB files (and, with
 # orphaned concurrent test binaries, starve each other into phantom failures). Start clean.
-find . -maxdepth 1 \( -name 'test_*.db' -o -name 'test_*_wal' -o -name 'repl_backfill' \) -exec rm -rf {} + 2>/dev/null || true
+find . -maxdepth 1 \( -name 'test_*.db' -o -name 'test_*_wal' -o -name 'repl_backfill' -o -name 'udf' \) -exec rm -rf {} + 2>/dev/null || true
 
 step "zig build (btree + btree-cli)"
 zig build || fail=1
@@ -17,6 +17,15 @@ zig build || fail=1
 if [ $fail -eq 0 ]; then
   step "zig build test (std.testing.allocator leak-checks every test)"
   zig build test || fail=1
+fi
+
+if [ $fail -eq 0 ]; then
+  step "zig test (wasm engine: metering, determinism, marshalling, hardening)"
+  # The embedded WebAssembly engine's own suites are standalone files (they import only the
+  # engine, not the whole DB). Run each explicitly so the sandbox guarantees are gated.
+  for t in smoke_test udf_test registry_test; do
+    zig test "src/wasm/$t.zig" || fail=1
+  done
 fi
 
 echo

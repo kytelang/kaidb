@@ -40,3 +40,31 @@ test "string UDF: byte-sum via linear-memory marshalling" {
     // A different string to be sure it is not a fixed value.
     try std.testing.expectEqual(@as(i64, 'h' + 'i'), try fn_.callString("hi"));
 }
+
+test "hardening: malformed and hostile modules are rejected or trapped, never crash" {
+    const alloc = std.testing.allocator;
+
+    // Non-wasm garbage: rejected at decode, no crash.
+    const garbage = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    try std.testing.expect(std.meta.isError(udf.WasmScalarFn.init(alloc, &garbage, .{})));
+
+    // Empty input: rejected.
+    try std.testing.expect(std.meta.isError(udf.WasmScalarFn.init(alloc, "", .{})));
+
+    // Truncated valid module (just the magic + version): rejected.
+    const magic_only = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+    // decode may accept an empty module; instantiate/invoke of a missing export must still fail.
+    if (udf.WasmScalarFn.init(alloc, &magic_only, .{})) |*ok| {
+        var m = ok.*;
+        defer m.deinit();
+        try std.testing.expect(std.meta.isError(m.callI64("kaidb_udf", &.{0})));
+    } else |_| {}
+
+    // Infinite recursion under a fuel budget: traps (fuel or control-stack overflow), never
+    // hangs or crashes the host.
+    {
+        var fn_ = try udf.WasmScalarFn.init(alloc, @embedFile("testdata_recurse.wasm"), .{ .fuel = 200_000 });
+        defer fn_.deinit();
+        try std.testing.expect(std.meta.isError(fn_.callI64("kaidb_udf", &.{0})));
+    }
+}

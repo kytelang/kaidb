@@ -948,8 +948,12 @@ Test and hardening plan:
 - **M4: persistence.** Computed columns and wasm-keyed indexes as durable derived data;
   optional page-backed `parsed_code` cache with checksum and format-version fallback.
 - **M5: aggregates.** Custom accumulate/merge/finalise UDFs streamed through the operator.
-- **M6: hardening to production.** Official test suite in CI, fuzz in `gate.sh`, ASAN,
-  determinism differential and replay tests, documented limits and failure modes.
+- **M6: hardening to production.** _Started:_ the engine's own suites (metering, determinism,
+  marshalling, and an adversarial-input test that feeds garbage, empty, truncated, and
+  infinite-recursion modules and asserts they are rejected or trapped, never crash) are wired
+  into `gate.sh` so the sandbox guarantees are gated on every run. _Remaining:_ the official
+  WebAssembly test suite in CI, a fuzzer over decode/validate/execute, ASAN over the VM, and
+  the determinism-differential and replay tests.
 - **M7: hypermedia from the database (KYX).** The apex use-case of section 12.4: a KYX view
   compiled into a wasm guest, invoked over a scan to return rendered HTML fragments through
   the response frame with a text/html payload tag, plus the option to persist a rendered
