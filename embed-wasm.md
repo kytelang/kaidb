@@ -913,13 +913,16 @@ Test and hardening plan:
   **M1 is functionally complete: a wasm scalar UDF is authored (Kyte -> wasm), registered from
   SQL, and used in a metered, sandboxed, deterministic filter predicate, with the engine built
   into the kaidb binary.** What remains are later milestones, not M1 leftovers:
-  - **Persistence of the registered module (M4-scale).** The registry is in-memory, so UDFs do
-    not survive restart. kaidb's catalog stores only `{name, type, root_page_id}` per object, so
-    durably storing the module bytes means page/overflow storage plus reload in `loadCatalog`
-    and WAL/recovery. The clean reuse-existing-storage route (keep UDFs as rows in an internal
-    table) is complicated by `rw_lock` non-reentrancy: `CREATE FUNCTION` already holds the
-    exclusive lock, so it cannot call `self.execute` to write that table and must use the
-    lower-level table API. This is a genuine storage-integration slice, best done on its own.
+  - **Persistence: done (file-backed).** A registered module is written to
+    `<base_dir>/udf/<NAME>.wasm` (`Database.persistWasmFunction`), removed by `DROP FUNCTION`
+    (`removeWasmFunction`), and reloaded into the registry on open after `loadCatalog`
+    (`loadWasmFunctions`, non-fatal so a bad file cannot block startup). Verified: a
+    `CREATE FUNCTION` then a full close and reopen leaves the UDF registered and usable in a
+    `WHERE` predicate with no re-`CREATE`. This survives a restart but is deliberately simple:
+    it is not WAL-consistent with table data and is not replicated. Moving the modules into the
+    catalog (so they ride the WAL and replicate) is the follow-up; it is gated on `rw_lock`
+    non-reentrancy (`CREATE FUNCTION` already holds the exclusive lock, so it must use the
+    lower-level table API rather than `self.execute`).
   - **String/bytes UDF arguments (M2).** The frame codec on `src/proto/wire.zig` (section 6),
     for variable-length arguments; numeric UDFs need none and work now.
   - **Scalar-expression projections (`SELECT fn(col)`).** kaidb has no scalar projections

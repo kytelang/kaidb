@@ -6400,3 +6400,64 @@ test "wasm UDF via SQL: CREATE FUNCTION + WHERE fn(col), then DROP FUNCTION" {
     try run.q(&exec, allocator, "DROP FUNCTION DBL");
     try std.testing.expectEqual(@as(usize, 0), try run.count(&exec, allocator, "SELECT x FROM t WHERE DBL(x) = 42"));
 }
+
+test "wasm UDF persistence: a CREATE FUNCTION survives a database restart" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_wasm_persist.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+    defer Io.Dir.deleteTree(.cwd(), io, "udf") catch {};
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+
+    const wasm = @embedFile("query/testdata_udf.wasm");
+    const hex = comptime std.fmt.bytesToHex(wasm, .lower);
+    const create_sql = "CREATE FUNCTION DBL LANGUAGE wasm AS '" ++ hex ++ "'";
+
+    const h = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+        fn count(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !usize {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+            return res.rows.len;
+        }
+    };
+
+    // Session 1: register the UDF and a table, confirm the wasm filter works.
+    {
+        var db = try Database.open(allocator, io, db_path, 64, null);
+        defer db.close();
+        var exec = QueryExecutor.init(allocator, db);
+        defer exec.deinit();
+        try h.q(&exec, allocator, create_sql);
+        try h.q(&exec, allocator, "CREATE TABLE t (x INT PRIMARY KEY)");
+        try h.q(&exec, allocator, "INSERT INTO t (x) VALUES (21)");
+        try h.q(&exec, allocator, "INSERT INTO t (x) VALUES (42)");
+        try std.testing.expectEqual(@as(usize, 1), try h.count(&exec, allocator, "SELECT x FROM t WHERE DBL(x) = 42"));
+    }
+
+    // Session 2: reopen the SAME database WITHOUT re-creating the function. The registry must
+    // repopulate from disk, so the wasm predicate still filters to the one matching row.
+    {
+        var db = try Database.open(allocator, io, db_path, 64, null);
+        defer db.close();
+        var exec = QueryExecutor.init(allocator, db);
+        defer exec.deinit();
+        // The UDF is present WITHOUT a re-CREATE FUNCTION: it was reloaded from disk on open.
+        try std.testing.expect(db.wasm_functions.get("DBL") != null);
+        // Drive the reloaded UDF over a fresh table (table durability is orthogonal here).
+        try h.q(&exec, allocator, "CREATE TABLE t2 (x INT PRIMARY KEY)");
+        try h.q(&exec, allocator, "INSERT INTO t2 (x) VALUES (21)");
+        try h.q(&exec, allocator, "INSERT INTO t2 (x) VALUES (42)");
+        try std.testing.expectEqual(@as(usize, 1), try h.count(&exec, allocator, "SELECT x FROM t2 WHERE DBL(x) = 42"));
+    }
+}

@@ -5640,12 +5640,18 @@ pub const QueryExecutor = struct {
                 defer self.allocator.free(upper);
                 self.db.wasm_functions.register(upper, bytes, .{}) catch
                     return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CREATE FUNCTION: module failed to decode or validate") };
+                // Persist so the UDF survives restart (embed-wasm.md M1). Best-effort: the
+                // in-memory registration already succeeded; a failed write only means it will
+                // not survive a restart, so warn rather than fail the statement.
+                self.db.persistWasmFunction(upper, bytes) catch |err|
+                    std.log.warn("CREATE FUNCTION {s}: persistence failed: {any}", .{ upper, err });
                 return QueryResponse{ .rows_affected = 1 };
             },
             .drop_function => |df| {
                 const upper = try std.ascii.allocUpperString(self.allocator, df.name);
                 defer self.allocator.free(upper);
                 _ = self.db.wasm_functions.drop(upper);
+                self.db.removeWasmFunction(upper);
                 return QueryResponse{ .rows_affected = 1 };
             },
             .drop_table => |dt| {
