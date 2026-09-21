@@ -10,6 +10,9 @@
 
 const std = @import("std");
 const zware = @import("engine/main.zig");
+const host = @import("host.zig");
+
+pub const RowCtx = host.RowCtx;
 
 /// Per-call resource policy (embed-wasm.md section 5). Defaults are conservative; the SQL
 /// layer overrides them from the function's `WITH (...)` options and the server config.
@@ -32,6 +35,11 @@ pub const WasmScalarFn = struct {
     /// i64 return is a packed `(ptr << 32) | len` pointing at bytes in its own linear memory;
     /// when false it is a plain numeric value.
     returns_string: bool = false,
+    /// Whether this is a row-facing UDF (embed-wasm.md M3): it imports the `kaidb.*` column
+    /// host functions and reads the current scan row on demand rather than taking arguments.
+    /// Detected at `init` by inspecting the module's imports; a row-facing UDF is invoked via
+    /// `callRow` (bound to a `RowCtx`), a scalar UDF via `call`.
+    row_facing: bool = false,
 
     /// A single UDF argument, mapped to wasm parameters by `call`: an int becomes one i64
     /// parameter, a string becomes two i32 parameters (ptr, len) after the host writes its
@@ -50,7 +58,24 @@ pub const WasmScalarFn = struct {
         errdefer module.deinit();
         try module.decode();
 
-        return .{ .alloc = alloc, .bytes = owned, .module = module, .policy = policy };
+        // Classify the module by its imports (embed-wasm.md M3). A UDF that imports nothing is a
+        // self-contained scalar UDF. A UDF that imports only the allowlisted `kaidb.*` column
+        // functions is row-facing. Anything else (a foreign namespace, a non-function import, or
+        // a `kaidb` name outside the allowlist) is rejected here, at CREATE FUNCTION time, so a
+        // module that could reach a clock, randomness, WASI, or an unaudited host call never
+        // becomes registered in the first place (section 7).
+        var row_facing = false;
+        for (module.imports.list.items) |imp| {
+            if (imp.desc_tag != .Func or
+                !std.mem.eql(u8, imp.module, host.NAMESPACE) or
+                !host.isAllowed(imp.name))
+            {
+                return error.HostImportsNotAllowed;
+            }
+            row_facing = true;
+        }
+
+        return .{ .alloc = alloc, .bytes = owned, .module = module, .policy = policy, .row_facing = row_facing };
     }
 
     pub fn deinit(self: *WasmScalarFn) void {
@@ -133,6 +158,48 @@ pub const WasmScalarFn = struct {
 
         // Unpack the (ptr << 32) | len result and copy the bytes out, bounds-checked. The host
         // never trusts the guest-supplied pointer (section 6.4).
+        const rptr: u32 = @truncate(out[0] >> 32);
+        const rlen: u32 = @truncate(out[0]);
+        const mem = try instance.getMemory(0);
+        const buf = mem.memory();
+        if (@as(usize, rptr) + rlen > buf.len) return error.OutOfBoundsMemoryAccess;
+        const copy_len = @min(@as(usize, rlen), out_buf.len);
+        @memcpy(out_buf[0..copy_len], buf[rptr .. rptr + copy_len]);
+        return .{ .str_len = copy_len };
+    }
+
+    /// Call a row-facing UDF against the current scan row (embed-wasm.md M3, the pull model of
+    /// section 6.3). Unlike `call`, the arguments are not marshalled up front: the guest reads
+    /// whichever columns it needs through the `kaidb.*` host imports, which read `rc` (the bound
+    /// row) read-only. The exported entry `kaidb_udf()` takes no wasm parameters and returns a
+    /// single i64 (a filter predicate returns 0/non-zero; a `RETURNS TEXT` row UDF returns a
+    /// packed `(ptr << 32) | len` copied into `out_buf`).
+    ///
+    /// The host functions are exposed on a fresh per-call store bound to `rc`, then the module is
+    /// instantiated so its imports resolve. Imports were already validated to be allowlisted at
+    /// `init`; instantiation would in any case fail (`ImportNotFound`) for anything not exposed
+    /// here, so a non-row-facing module cannot smuggle in an import through this path. The call
+    /// runs under the same fuel budget and memory-page cap as a scalar UDF.
+    pub fn callRow(self: *WasmScalarFn, rc: *const RowCtx, out_buf: []u8) !Result {
+        var store = zware.Store.init(self.alloc);
+        defer store.deinit();
+
+        // Expose the column host functions BEFORE instantiate so the guest's imports bind to them.
+        try host.expose(&store, rc);
+
+        var instance = zware.Instance.init(self.alloc, &store, self.module);
+        try instance.instantiate();
+        defer instance.deinit();
+
+        instance.fuel_budget = self.policy.fuel;
+        try instance.limitMemoryPages(self.policy.memory_pages);
+
+        var no_args = [0]u64{};
+        var out = [1]u64{0};
+        try instance.invoke(ENTRY, no_args[0..], out[0..], .{});
+
+        if (!self.returns_string) return .{ .int = @bitCast(out[0]) };
+
         const rptr: u32 = @truncate(out[0] >> 32);
         const rlen: u32 = @truncate(out[0]);
         const mem = try instance.getMemory(0);

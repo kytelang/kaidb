@@ -1,5 +1,112 @@
 const std = @import("std");
 const udf = @import("udf.zig");
+const host = @import("host.zig");
+
+/// A minimal in-test row the row-facing host functions read through, standing in for the
+/// executor's `TableRow`. Column values are just i64s (with a parallel text form for `col_bytes`).
+const MockRow = struct {
+    ints: []const i64,
+    texts: []const ?[]const u8 = &.{},
+
+    fn colCount(ptr: *anyopaque) u32 {
+        const self: *const MockRow = @ptrCast(@alignCast(ptr));
+        return @intCast(self.ints.len);
+    }
+    fn colI64(ptr: *anyopaque, idx: u32) host.RowCtx.ColError!i64 {
+        const self: *const MockRow = @ptrCast(@alignCast(ptr));
+        if (idx >= self.ints.len) return error.BadColumnIndex;
+        return self.ints[idx];
+    }
+    fn colF64(ptr: *anyopaque, idx: u32) host.RowCtx.ColError!f64 {
+        const self: *const MockRow = @ptrCast(@alignCast(ptr));
+        if (idx >= self.ints.len) return error.BadColumnIndex;
+        return @floatFromInt(self.ints[idx]);
+    }
+    fn colIsNull(ptr: *anyopaque, idx: u32) host.RowCtx.ColError!bool {
+        const self: *const MockRow = @ptrCast(@alignCast(ptr));
+        if (idx >= self.ints.len) return error.BadColumnIndex;
+        return false;
+    }
+    fn colBytes(ptr: *anyopaque, idx: u32) host.RowCtx.ColError!?[]const u8 {
+        const self: *const MockRow = @ptrCast(@alignCast(ptr));
+        if (idx >= self.texts.len) return error.BadColumnIndex;
+        return self.texts[idx];
+    }
+
+    const vtable = host.RowCtx.VTable{
+        .col_count = colCount,
+        .col_i64 = colI64,
+        .col_f64 = colF64,
+        .col_is_null = colIsNull,
+        .col_bytes = colBytes,
+    };
+
+    fn ctx(self: *const MockRow) host.RowCtx {
+        return .{ .ptr = @constCast(@ptrCast(self)), .vt = &vtable };
+    }
+};
+
+test "row-facing UDF: pulls columns via kaidb host imports" {
+    const alloc = std.testing.allocator;
+    var fn_ = try udf.WasmScalarFn.init(alloc, @embedFile("testdata_udf_row.wasm"), .{});
+    defer fn_.deinit();
+    // The module imports kaidb.col_i64, so it is classified as row-facing at init.
+    try std.testing.expect(fn_.row_facing);
+
+    var out: [64]u8 = undefined;
+
+    // col0 + col1 == 42 -> keep (1).
+    const keep = MockRow{ .ints = &.{ 40, 2 } };
+    var rc = keep.ctx();
+    const r = try fn_.callRow(&rc, out[0..]);
+    try std.testing.expectEqual(udf.WasmScalarFn.Result{ .int = 1 }, r);
+
+    // col0 + col1 != 42 -> drop (0). A fresh instance, so no state leaks between rows.
+    const drop = MockRow{ .ints = &.{ 40, 3 } };
+    var rc2 = drop.ctx();
+    const r2 = try fn_.callRow(&rc2, out[0..]);
+    try std.testing.expectEqual(udf.WasmScalarFn.Result{ .int = 0 }, r2);
+}
+
+test "row-facing UDF: a bad column index traps, never reads out of bounds" {
+    const alloc = std.testing.allocator;
+    var fn_ = try udf.WasmScalarFn.init(alloc, @embedFile("testdata_udf_row.wasm"), .{});
+    defer fn_.deinit();
+
+    var out: [64]u8 = undefined;
+    // The module reads columns 0 and 1; a one-column row makes col_i64(1) trap.
+    const short = MockRow{ .ints = &.{7} };
+    var rc = short.ctx();
+    try std.testing.expectError(error.Trap, fn_.callRow(&rc, out[0..]));
+}
+
+test "row-facing TEXT UDF: col_bytes into guest memory, returned as a string" {
+    const alloc = std.testing.allocator;
+    var fn_ = try udf.WasmScalarFn.init(alloc, @embedFile("testdata_udf_row_text.wasm"), .{});
+    defer fn_.deinit();
+    try std.testing.expect(fn_.row_facing);
+    fn_.returns_string = true;
+
+    var out: [64]u8 = undefined;
+    const row = MockRow{ .ints = &.{0}, .texts = &.{"hello"} };
+    var rc = row.ctx();
+    const r = try fn_.callRow(&rc, out[0..]);
+    try std.testing.expect(r == .str_len);
+    try std.testing.expectEqualStrings("hello", out[0..r.str_len]);
+}
+
+test "row-facing classification: a non-allowlisted import is rejected at init" {
+    const alloc = std.testing.allocator;
+    // A module importing an unknown host function (env.foo) must be rejected: only the audited
+    // kaidb.* column functions are allowed, so a UDF can never reach a clock, WASI, or randomness.
+    // wasm: (module (import "env" "foo" (func (param i32))))
+    const hostile = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+        0x01, 0x05, 0x01, 0x60, 0x01, 0x7f, 0x00, // type section: (func (param i32))
+        0x02, 0x0b, 0x01, 0x03, 0x65, 0x6e, 0x76, 0x03, 0x66, 0x6f, 0x6f, 0x00, 0x00, // import env.foo
+    };
+    try std.testing.expectError(error.HostImportsNotAllowed, udf.WasmScalarFn.init(alloc, &hostile, .{}));
+}
 
 test "scalar UDF: numeric call returns the result" {
     const alloc = std.testing.allocator;

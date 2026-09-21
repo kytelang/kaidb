@@ -471,6 +471,14 @@ const RowResolver = struct {
     fn resolve(self: RowResolver, col: []const u8) ?Scalar {
         return getValCol(col, self.row);
     }
+    /// The row a row-facing wasm UDF reads columns from (embed-wasm.md M3): the first table's
+    /// contribution to this combined row, in schema (positional) order. `null` for an empty or
+    /// outer-join non-match row, which reads as an unknown predicate.
+    fn primaryRow(self: RowResolver) ?TableRow {
+        if (self.row.data.len == 0) return null;
+        const d = self.row.data[0];
+        return if (d.is_null) null else d;
+    }
 };
 /// Column resolver backed by a single JSON object (row-at-a-time evaluation
 /// outside a scan, e.g. re-checking a predicate against one materialised row).
@@ -485,6 +493,10 @@ pub const JsonResolver = struct {
     fn resolve(self: JsonResolver, col: []const u8) ?Scalar {
         if (std.mem.indexOfScalar(u8, col, '.')) |di| return self.row.getScalar(col[di + 1 ..]);
         return self.row.getScalar(col);
+    }
+    /// The single row a row-facing wasm UDF reads (embed-wasm.md M3); `null` for a NULL row.
+    fn primaryRow(self: JsonResolver) ?TableRow {
+        return if (self.row.is_null) null else self.row;
     }
 };
 
@@ -543,6 +555,87 @@ threadlocal var fn_scratch_b: [512]u8 = undefined;
 /// both sides of `UPPER(a) = UPPER(b)`) without the second clobbering the first.
 threadlocal var fn_scratch_toggle: bool = false;
 
+/// The wasm host-ABI row view type (embed-wasm.md M3). A row-facing UDF reads columns through
+/// this vtable; `tableRowCtx` binds it to a [`TableRow`].
+const WasmRowCtx = @import("../wasm/udf.zig").RowCtx;
+
+/// Scratch for rendering a numeric/boolean cell to bytes for `col_bytes`. Only live for the
+/// duration of one host call (the host copies the bytes into guest memory synchronously), so a
+/// single thread-local buffer is enough.
+threadlocal var tr_bytes_scratch: [64]u8 = undefined;
+
+fn trOf(ptr: *anyopaque) *const TableRow {
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn trColCount(ptr: *anyopaque) u32 {
+    return @intCast(trOf(ptr).cells.len);
+}
+
+fn trColI64(ptr: *anyopaque, idx: u32) WasmRowCtx.ColError!i64 {
+    const tr = trOf(ptr);
+    if (idx >= tr.cells.len) return error.BadColumnIndex;
+    return switch (tr.cells[idx]) {
+        .null => 0,
+        .int => |v| v,
+        .uint => |v| @intCast(v),
+        .float => |v| std.math.lossyCast(i64, v),
+        .float32 => |v| std.math.lossyCast(i64, v),
+        .boolean => |b| @intFromBool(b),
+        .text => |t| std.fmt.parseInt(i64, t, 10) catch 0,
+    };
+}
+
+fn trColF64(ptr: *anyopaque, idx: u32) WasmRowCtx.ColError!f64 {
+    const tr = trOf(ptr);
+    if (idx >= tr.cells.len) return error.BadColumnIndex;
+    return switch (tr.cells[idx]) {
+        .null => 0,
+        .int => |v| @floatFromInt(v),
+        .uint => |v| @floatFromInt(v),
+        .float => |v| v,
+        .float32 => |v| v,
+        .boolean => |b| @floatFromInt(@intFromBool(b)),
+        .text => |t| std.fmt.parseFloat(f64, t) catch 0,
+    };
+}
+
+fn trColIsNull(ptr: *anyopaque, idx: u32) WasmRowCtx.ColError!bool {
+    const tr = trOf(ptr);
+    if (idx >= tr.cells.len) return error.BadColumnIndex;
+    return tr.cells[idx] == .null;
+}
+
+fn trColBytes(ptr: *anyopaque, idx: u32) WasmRowCtx.ColError!?[]const u8 {
+    const tr = trOf(ptr);
+    if (idx >= tr.cells.len) return error.BadColumnIndex;
+    return switch (tr.cells[idx]) {
+        .null => null,
+        .text => |t| t,
+        // Numeric/boolean cells are rendered to their text form so a text-oriented UDF (for
+        // example a KYX view) can read any column uniformly; the slice is valid for this call.
+        .int => |v| std.fmt.bufPrint(&tr_bytes_scratch, "{d}", .{v}) catch null,
+        .uint => |v| std.fmt.bufPrint(&tr_bytes_scratch, "{d}", .{v}) catch null,
+        .float => |v| std.fmt.bufPrint(&tr_bytes_scratch, "{d}", .{v}) catch null,
+        .float32 => |v| std.fmt.bufPrint(&tr_bytes_scratch, "{d}", .{v}) catch null,
+        .boolean => |b| if (b) "true" else "false",
+    };
+}
+
+const table_row_vtable = WasmRowCtx.VTable{
+    .col_count = trColCount,
+    .col_i64 = trColI64,
+    .col_f64 = trColF64,
+    .col_is_null = trColIsNull,
+    .col_bytes = trColBytes,
+};
+
+/// Wrap a [`TableRow`] as the read-only row view a row-facing wasm UDF sees (embed-wasm.md M3).
+/// The returned context borrows `tr` and is valid only for the wasm call it is passed to.
+fn tableRowCtx(tr: *const TableRow) WasmRowCtx {
+    return .{ .ptr = @constCast(@ptrCast(tr)), .vt = &table_row_vtable };
+}
+
 /// Evaluates a scalar SQL function call against a resolver.
 ///
 /// Recognised by name (case-sensitive, upper-case): `COALESCE` (first non-NULL
@@ -567,6 +660,20 @@ fn evalFunc(fc: ast.FuncCall, ctx: anytype) ?Scalar {
     // yields null, which predicates read as unknown.
     if (active_wasm_registry) |reg| {
         if (reg.get(name)) |wfn| {
+            // Row-facing UDFs (embed-wasm.md M3) take no SQL arguments: they read the current
+            // row's columns through the `kaidb.*` host imports. Bind the primary table row and
+            // run under the same fuel/memory policy. A NULL/absent row reads as unknown.
+            if (wfn.row_facing) {
+                const tr = ctx.primaryRow() orelse return null;
+                var rc = tableRowCtx(&tr);
+                const out_buf: []u8 = if (fn_scratch_toggle) fn_scratch_b[0..] else fn_scratch_a[0..];
+                fn_scratch_toggle = !fn_scratch_toggle;
+                const res = wfn.callRow(&rc, out_buf) catch return null;
+                return switch (res) {
+                    .int => |iv| .{ .integer = iv },
+                    .str_len => |len| .{ .string = out_buf[0..len] },
+                };
+            }
             // Build the argument list, mapping each SQL scalar to an int or a string (strings
             // are marshalled through the guest's linear memory by `call`; embed-wasm.md M2).
             const WasmArg = @import("../wasm/udf.zig").WasmScalarFn.Arg;

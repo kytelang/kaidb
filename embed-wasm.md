@@ -336,6 +336,22 @@ The plan is push for scalar (v1), pull for row-facing (later milestone), sharing
 `marshal.zig` encoders. The pull imports are the surface that has to be audited hardest,
 because they hand guest code a window onto live storage.
 
+**Status (M3, done).** The pull model is implemented in `src/wasm/host.zig`. A module that
+imports any of `kaidb.col_count`, `kaidb.col_i64`, `kaidb.col_f64`, `kaidb.col_is_null`, or
+`kaidb.col_bytes` (and nothing else) is classified as row-facing at `CREATE FUNCTION` time; an
+import outside that allowlist, a non-function import, or a foreign namespace is rejected there,
+so a UDF that could reach a clock, randomness, or WASI never registers. The executor
+(`iterator.zig`) binds the current scan row as a read-only `RowCtx` and invokes the module's
+zero-argument `kaidb_udf` export; the host functions read that bound row and, for `col_bytes`,
+bounds-check the guest destination pointer before writing (section 6.4). `col_bytes` on a NULL
+cell returns length -1 so the guest can tell NULL from an empty string. The predicate is
+evaluated in the WHERE/filter path exactly like a scalar UDF, so `WHERE rowfn() = 1` pushes a
+pull-model filter into the scan. Columns are addressed positionally in the projected row's
+order; forcing full-row materialisation when a row-facing predicate is present (so the guest
+always sees every column in schema order, regardless of projection pushdown) is a follow-up.
+`emit` and the aggregate accumulate/merge/finalise surface belong to M5 and are not exposed
+yet.
+
 ### 6.4 Bounds safety is the whole game
 
 Every offset and length the guest hands the host is untrusted. Before the host reads or
@@ -950,8 +966,14 @@ Test and hardening plan:
   coverage in `marshal.zig`, and the bounds-safety invariant with its fuzzer. Also add the
   `wasm=true` transport back end to the `kyte-kaidb` driver (section 11): the same wire
   codec over `kaidb_exec` host calls instead of a socket, selected by the DSN flag.
-- **M3: row-facing UDFs.** Pull-model column imports, filter pushdown into the scan against
-  the MVCC snapshot. This is the actual differentiator.
+- **M3: row-facing UDFs.** _Done._ Pull-model column imports (`kaidb.col_i64` / `col_f64` /
+  `col_bytes` / `col_is_null` / `col_count`) in `src/wasm/host.zig`, an import allowlist that
+  classifies a module as row-facing at registration and rejects everything else, and filter
+  pushdown into the scan: a zero-argument row UDF reads the bound scan row read-only through the
+  host functions and its result drives the WHERE predicate. Bounds-checked `col_bytes` writes,
+  a trap on a bad column index, and end-to-end SQL plus engine-level tests. Remaining for later:
+  forcing full-row materialisation under a row-facing predicate (columns are currently read from
+  the projected row), and `emit`/aggregate surface (folded into M5).
 - **M4: persistence.** Computed columns and wasm-keyed indexes as durable derived data;
   optional page-backed `parsed_code` cache with checksum and format-version fallback.
 - **M5: aggregates.** Custom accumulate/merge/finalise UDFs streamed through the operator.

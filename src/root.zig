@@ -6551,3 +6551,55 @@ test "wasm string-result UDF via SQL: RETURNS TEXT, WHERE fn(col) = literal" {
     try std.testing.expectEqual(@as(usize, 0), try h.count(&exec, allocator, "SELECT name FROM w WHERE UP(name) = 'abc'"));
     try std.testing.expectEqual(@as(usize, 1), try h.count(&exec, allocator, "SELECT name FROM w WHERE UP(name) = 'XYZ'"));
 }
+
+test "wasm row-facing UDF via SQL: pull-model filter over the scan (embed-wasm.md M3)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_wasm_row_udf.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+    defer Io.Dir.deleteTree(.cwd(), io, "udf") catch {};
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+    var db = try Database.open(allocator, io, db_path, 64, null);
+    defer db.close();
+    var exec = QueryExecutor.init(allocator, db);
+    defer exec.deinit();
+
+    const h = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+        fn count(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !usize {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+            return res.rows.len;
+        }
+    };
+
+    // The row-facing module takes no SQL arguments: it reads columns 0 and 1 of the current row
+    // through the kaidb.col_i64 host import and returns 1 when they sum to 42. Registering it does
+    // NOT reject the kaidb.* imports (they are the allowlisted row ABI); a foreign import would.
+    const wasm = @embedFile("wasm/testdata_udf_row.wasm");
+    const hex = comptime std.fmt.bytesToHex(wasm, .lower);
+    try h.q(&exec, allocator, "CREATE FUNCTION ROWKEEP LANGUAGE wasm AS '" ++ hex ++ "'");
+    try h.q(&exec, allocator, "CREATE TABLE t (a INT PRIMARY KEY, b INT)");
+    try h.q(&exec, allocator, "INSERT INTO t (a, b) VALUES (20, 22)"); // 20 + 22 == 42 -> keep
+    try h.q(&exec, allocator, "INSERT INTO t (a, b) VALUES (5, 10)"); //   5 + 10 == 15 -> drop
+    try h.q(&exec, allocator, "INSERT INTO t (a, b) VALUES (1, 41)"); //   1 + 41 == 42 -> keep
+
+    // The pull-model predicate selects exactly the two rows whose columns sum to 42, proving the
+    // guest read the live scan row through the host imports.
+    try std.testing.expectEqual(@as(usize, 2), try h.count(&exec, allocator, "SELECT * FROM t WHERE ROWKEEP() = 1"));
+    try std.testing.expectEqual(@as(usize, 1), try h.count(&exec, allocator, "SELECT * FROM t WHERE ROWKEEP() = 0"));
+
+    // DROP unregisters it; the now-unknown name yields NULL, so the predicate excludes every row.
+    try h.q(&exec, allocator, "DROP FUNCTION ROWKEEP");
+    try std.testing.expectEqual(@as(usize, 0), try h.count(&exec, allocator, "SELECT * FROM t WHERE ROWKEEP() = 1"));
+}
