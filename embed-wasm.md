@@ -923,8 +923,14 @@ Test and hardening plan:
     catalog (so they ride the WAL and replicate) is the follow-up; it is gated on `rw_lock`
     non-reentrancy (`CREATE FUNCTION` already holds the exclusive lock, so it must use the
     lower-level table API rather than `self.execute`).
-  - **String/bytes UDF arguments (M2).** The frame codec on `src/proto/wire.zig` (section 6),
-    for variable-length arguments; numeric UDFs need none and work now.
+  - **String UDF arguments: done (single arg, push model).** `WasmScalarFn.callString`
+    marshals a string through linear memory (section 6): the guest exports `kaidb_alloc` and
+    `memory`, the host allocates in the guest, writes the bytes bounds-checked, then calls
+    `kaidb_udf(ptr, len)`. `evalFunc` routes a single string argument here. Verified end to end
+    from SQL: `CREATE FUNCTION SUMB` (byte-sum), then `SELECT name FROM w WHERE SUMB(name) = 198`
+    selects exactly the matching row. Remaining M2: the general multi-argument frame codec on
+    `src/proto/wire.zig` for mixed and multi string/bytes arguments, and string/bytes *results*
+    (the output frame), which the KYX apex needs.
   - **Scalar-expression projections (`SELECT fn(col)`).** kaidb has no scalar projections
     today (section 10.1); this is a separate SQL feature.
   - **The KYX-from-database apex (M7, section 12.4).**

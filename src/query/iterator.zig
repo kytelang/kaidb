@@ -567,6 +567,22 @@ fn evalFunc(fc: ast.FuncCall, ctx: anytype) ?Scalar {
     // yields null, which predicates read as unknown.
     if (active_wasm_registry) |reg| {
         if (reg.get(name)) |wfn| {
+            // A single string argument is marshalled through linear memory (embed-wasm.md M2);
+            // numeric arguments are passed directly. Mixed/multi string args wait on the full
+            // frame codec.
+            if (fc.args.len == 1) {
+                if (evalScalar(fc.args[0], ctx)) |v| {
+                    if (v == .string) {
+                        const r = wfn.callString(v.string) catch return null;
+                        return .{ .integer = r };
+                    }
+                    // fall through to the numeric path for a non-string single arg
+                    const iv = asI64(v) orelse return null;
+                    const r = wfn.callI64(UDF_ENTRY, &.{iv}) catch return null;
+                    return .{ .integer = r };
+                }
+                return null;
+            }
             var args_buf: [8]i64 = undefined;
             if (fc.args.len > args_buf.len) return null;
             for (fc.args, 0..) |arg, i| {

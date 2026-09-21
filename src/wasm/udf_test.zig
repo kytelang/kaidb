@@ -26,3 +26,17 @@ test "scalar UDF: fuel budget bounds a call" {
     const r = fn_.callRaw("spin", no_in[0..], no_out[0..]);
     try std.testing.expectError(error.FuelExhausted, r);
 }
+
+test "string UDF: byte-sum via linear-memory marshalling" {
+    const alloc = std.testing.allocator;
+    var fn_ = try udf.WasmScalarFn.init(alloc, @embedFile("testdata_udf_str.wasm"), .{});
+    defer fn_.deinit();
+
+    // "ABC" = 65 + 66 + 67 = 198; the host marshals the string into guest memory and the UDF
+    // sums the bytes, proving the write landed correctly.
+    try std.testing.expectEqual(@as(i64, 198), try fn_.callString("ABC"));
+    // Empty string sums to 0.
+    try std.testing.expectEqual(@as(i64, 0), try fn_.callString(""));
+    // A different string to be sure it is not a fixed value.
+    try std.testing.expectEqual(@as(i64, 'h' + 'i'), try fn_.callString("hi"));
+}

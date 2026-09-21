@@ -70,6 +70,52 @@ pub const WasmScalarFn = struct {
         try instance.invoke(name, in, out, .{});
     }
 
+    /// The exported entry points a string-taking UDF module must provide.
+    pub const ENTRY = "kaidb_udf";
+    pub const ALLOC_ENTRY = "kaidb_alloc";
+
+    /// Call a UDF that takes a single string argument and returns an i64 (embed-wasm.md M2,
+    /// the push-model marshalling of section 6). The guest exports `kaidb_alloc(size)->ptr`
+    /// and `memory`; the host allocates space in the guest, writes the bytes there
+    /// bounds-checked, then calls `kaidb_udf(ptr, len)`. A fresh metered instance per call.
+    /// This is the string substrate; a full multi-arg frame codec on `src/proto/wire.zig`
+    /// comes later, but a single string argument covers the common text-UDF and KYX cases.
+    pub fn callString(self: *WasmScalarFn, s: []const u8) !i64 {
+        var store = zware.Store.init(self.alloc);
+        defer store.deinit();
+
+        var instance = zware.Instance.init(self.alloc, &store, self.module);
+        try instance.instantiate();
+        defer instance.deinit();
+
+        // A string UDF still imports nothing (it provides its own allocator and memory), so a
+        // host import is rejected exactly as for the numeric path.
+        for (instance.module.imports.list.items) |_| return error.HostImportsNotAllowed;
+
+        instance.fuel_budget = self.policy.fuel;
+        try instance.limitMemoryPages(self.policy.memory_pages);
+
+        // 1. Ask the guest to allocate space for the argument bytes.
+        const len_i64: i64 = @intCast(s.len);
+        var alloc_in = [1]u64{@bitCast(len_i64)};
+        var alloc_out = [1]u64{0};
+        try instance.invoke(ALLOC_ENTRY, alloc_in[0..], alloc_out[0..], .{});
+        const ptr: u32 = @truncate(alloc_out[0]);
+
+        // 2. Write the bytes into guest linear memory, bounds-checked (host never trusts the
+        //    guest-returned pointer, section 6.4).
+        const mem = try instance.getMemory(0);
+        const buf = mem.memory();
+        if (@as(usize, ptr) + s.len > buf.len) return error.OutOfBoundsMemoryAccess;
+        @memcpy(buf[ptr .. ptr + s.len], s);
+
+        // 3. Invoke the UDF with (ptr, len); it reads the frame and returns an i64.
+        var in = [2]u64{ ptr, @bitCast(len_i64) };
+        var out = [1]u64{0};
+        try instance.invoke(ENTRY, in[0..], out[0..], .{});
+        return @bitCast(out[0]);
+    }
+
     /// Convenience for the common int-in / int-out UDF shape.
     pub fn callI64(self: *WasmScalarFn, name: []const u8, args: []const i64) !i64 {
         // zware caps invoke arity via fixed-size stacks; a handful of args is plenty for a

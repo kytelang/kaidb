@@ -6461,3 +6461,49 @@ test "wasm UDF persistence: a CREATE FUNCTION survives a database restart" {
         try std.testing.expectEqual(@as(usize, 1), try h.count(&exec, allocator, "SELECT x FROM t2 WHERE DBL(x) = 42"));
     }
 }
+
+test "wasm string UDF via SQL: WHERE fn(textcol) marshals the string argument" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_wasm_str_udf.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+    defer Io.Dir.deleteTree(.cwd(), io, "udf") catch {};
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+    var db = try Database.open(allocator, io, db_path, 64, null);
+    defer db.close();
+    var exec = QueryExecutor.init(allocator, db);
+    defer exec.deinit();
+
+    const h = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+        fn count(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !usize {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+            return res.rows.len;
+        }
+    };
+
+    // SUMB(s) returns the sum of the string's byte values (marshalled into guest memory).
+    const wasm = @embedFile("wasm/testdata_udf_str.wasm");
+    const hex = comptime std.fmt.bytesToHex(wasm, .lower);
+    try h.q(&exec, allocator, "CREATE FUNCTION SUMB LANGUAGE wasm AS '" ++ hex ++ "'");
+
+    try h.q(&exec, allocator, "CREATE TABLE w (name TEXT PRIMARY KEY)");
+    try h.q(&exec, allocator, "INSERT INTO w (name) VALUES ('ABC')"); // 65+66+67 = 198
+    try h.q(&exec, allocator, "INSERT INTO w (name) VALUES ('AB')");  // 65+66    = 131
+
+    // Only 'ABC' has a byte sum of 198, so the string-marshalling predicate selects one row.
+    try std.testing.expectEqual(@as(usize, 1), try h.count(&exec, allocator, "SELECT name FROM w WHERE SUMB(name) = 198"));
+    try std.testing.expectEqual(@as(usize, 1), try h.count(&exec, allocator, "SELECT name FROM w WHERE SUMB(name) = 131"));
+    try std.testing.expectEqual(@as(usize, 0), try h.count(&exec, allocator, "SELECT name FROM w WHERE SUMB(name) = 999"));
+}
