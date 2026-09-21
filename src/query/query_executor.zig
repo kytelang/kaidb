@@ -4169,6 +4169,7 @@ pub const QueryExecutor = struct {
                         .is_auto_increment = false,
                         .is_nullable = col_ast.is_nullable,
                         .default_value = if (col_ast.default_value) |dv| try self.allocator.dupe(u8, dv) else null,
+                        .computed_by = if (col_ast.computed_by) |cb| try self.allocator.dupe(u8, cb) else null,
                     };
                 }
 
@@ -6751,6 +6752,66 @@ pub const QueryExecutor = struct {
         return .{ .names = names, .cells = cells, .owns_names = owns_names };
     }
 
+    /// Computes a wasm-backed generated column's value at insert/update time (embed-wasm.md M4).
+    ///
+    /// `expr_text` is the column's stored generating expression (for example `DBL(x)`); `new_data`
+    /// holds the row's other cells. The expression is parsed and evaluated against those cells via
+    /// the same scalar evaluator predicates use, so a registered wasm UDF is dispatched exactly as
+    /// in `WHERE fn(col)`. The result is returned as an owned textual value (caller frees) ready
+    /// for `RowBuilder.writeDynamic`, so the computed value is then stored, WAL-logged, and
+    /// doublewrite-protected like any ordinary column and survives restart. A NULL or
+    /// non-computable result becomes the string `"NULL"`.
+    ///
+    /// The wasm registry is already bound to `query_iter.active_wasm_registry` for the life of the
+    /// statement (set in `execute`), so no extra threading is needed here.
+    fn computeGeneratedCell(self: *QueryExecutor, table: Table, expr_text: []const u8, new_data: *const CatalogCellMap) ![]const u8 {
+        // Build a TYPED row view over the sibling cells. The insert/update cell map stores every
+        // value as text, but the evaluator (and a wasm UDF over it) must see a column's declared
+        // type: `DBL(x)` on an INT column has to pass an integer, not a string, or the UDF's
+        // parameter arity would not match. So coerce each text cell to its column's type here.
+        const names = try self.allocator.alloc([]const u8, table.columns.len);
+        defer self.allocator.free(names);
+        const cells = try self.allocator.alloc(query_iter.Cell, table.columns.len);
+        defer {
+            for (cells) |c| switch (c) {
+                .text => |t| self.allocator.free(t),
+                else => {},
+            };
+            self.allocator.free(cells);
+        }
+        for (table.columns, 0..) |col, i| {
+            names[i] = col.name;
+            cells[i] = blk: {
+                const v = new_data.get(col.name) orelse break :blk .null;
+                const s = switch (v) {
+                    .text => |t| t,
+                    else => break :blk v, // already typed
+                };
+                break :blk switch (col.type) {
+                    .INT32, .INT64 => query_iter.Cell{ .int = std.fmt.parseInt(i64, s, 10) catch break :blk .{ .text = try self.allocator.dupe(u8, s) } },
+                    .UINT32, .UINT64, .TIMESTAMP => query_iter.Cell{ .uint = std.fmt.parseInt(u64, s, 10) catch break :blk .{ .text = try self.allocator.dupe(u8, s) } },
+                    .FLOAT32, .FLOAT64 => query_iter.Cell{ .float = std.fmt.parseFloat(f64, s) catch break :blk .{ .text = try self.allocator.dupe(u8, s) } },
+                    .BOOL => query_iter.Cell{ .boolean = std.mem.eql(u8, s, "true") },
+                    .TEXT, .BLOB => query_iter.Cell{ .text = try self.allocator.dupe(u8, s) },
+                };
+            };
+        }
+        const row = query_iter.TableRow{ .names = names, .cells = cells, .owns_names = false };
+
+        var parser = Parser.init(self.allocator, expr_text) catch return self.allocator.dupe(u8, "NULL");
+        defer parser.deinit();
+        const expr = parser.parseExpr() catch return self.allocator.dupe(u8, "NULL");
+
+        const scalar = query_iter.evalScalarJson(expr, row) orelse return self.allocator.dupe(u8, "NULL");
+        return switch (scalar) {
+            .null => try self.allocator.dupe(u8, "NULL"),
+            .bool => |b| try self.allocator.dupe(u8, if (b) "true" else "false"),
+            .integer => |i| try std.fmt.allocPrint(self.allocator, "{d}", .{i}),
+            .float => |f| try std.fmt.allocPrint(self.allocator, "{d}", .{f}),
+            .string => |s| try self.allocator.dupe(u8, s),
+        };
+    }
+
     fn buildCatalogRows(self: *QueryExecutor, table_meta: Table, table_name: []const u8) ![]query_iter.TableRow {
         const saved_needed = self.scan_needed_cols;
         self.scan_needed_cols = null;
@@ -7428,6 +7489,16 @@ pub const QueryExecutor = struct {
         var builder = RowBuilder.init(table, fixed_buf, heap_buf, &heap_offset);
 
         for (table.columns) |col| {
+            // Wasm-backed generated column (embed-wasm.md M4): its stored value is always
+            // f(row), computed here from the sibling cells, ignoring any user-supplied value.
+            // The result rides the normal RowBuilder/WAL/doublewrite path, so it is durable and
+            // survives restart like any column.
+            if (col.computed_by) |expr_text| {
+                const str_val = try self.computeGeneratedCell(table, expr_text, &new_data);
+                defer self.allocator.free(str_val);
+                try builder.writeDynamic(col.name, str_val);
+                continue;
+            }
             const cell_val = new_data.get(col.name) orelse continue;
             const str_val = switch (cell_val) {
                 .text => |s| try self.allocator.dupe(u8, s),

@@ -185,6 +185,26 @@ pub const Parser = struct {
         return self.source[tok.start..(tok.start + tok.len)];
     }
 
+    /// Parses a wasm-backed generated-column expression `fn(col {, col})` after the `AS`
+    /// keyword (embed-wasm.md M4) and returns its raw source text as a borrowed slice (for
+    /// example `DBL(x)`). The text is stored in the catalog and re-parsed at insert time to
+    /// compute the column's value. Only a single function call over column references is
+    /// accepted for this milestone, which is exactly what a scalar UDF over the row needs.
+    fn parseGeneratedExpr(self: *Parser) ![]const u8 {
+        const fn_tok = try self.expect(.IDENTIFIER);
+        _ = try self.expect(.LPAREN);
+        // Zero or more column-reference arguments; a bare `fn()` is a row-facing UDF.
+        if (self.current().type != .RPAREN) {
+            _ = try self.expect(.IDENTIFIER);
+            while (self.current().type == .COMMA) {
+                self.eat();
+                _ = try self.expect(.IDENTIFIER);
+            }
+        }
+        const rparen = try self.expect(.RPAREN);
+        return self.source[fn_tok.start..(rparen.start + rparen.len)];
+    }
+
     /// Consumes an optional table alias after a `FROM`/`JOIN` table reference:
     /// `AS name` or the bare `name`. Every clause keyword (WHERE, JOIN, ON, ...)
     /// has its own token type, so a bare `IDENTIFIER` in this position is
@@ -1180,6 +1200,7 @@ pub const Parser = struct {
             var is_nullable = true;
             var is_unique = false;
             var default_value: ?[]const u8 = null;
+            var computed_by: ?[]const u8 = null;
             var foreign_key_table: ?[]const u8 = null;
             var foreign_key_column: ?[]const u8 = null;
 
@@ -1211,6 +1232,10 @@ pub const Parser = struct {
                     } else {
                         return error.ExpectedDefaultValue;
                     }
+                } else if (next.type == .AS) {
+                    // Wasm-backed generated column (embed-wasm.md M4): `col TYPE AS fn(args)`.
+                    self.eat();
+                    computed_by = try self.parseGeneratedExpr();
                 } else if (next.type == .AUTO_INCREMENT) {
                     self.eat();
                 } else if (next.type == .REFERENCES) {
@@ -1235,6 +1260,7 @@ pub const Parser = struct {
                 .is_nullable = is_nullable,
                 .is_unique = is_unique,
                 .default_value = default_value,
+                .computed_by = computed_by,
                 .foreign_key_table = foreign_key_table,
                 .foreign_key_column = foreign_key_column,
             });

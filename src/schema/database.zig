@@ -2032,6 +2032,7 @@ pub const Database = struct {
             for (meta.columns) |c| {
                 self.allocator.free(c.name);
                 if (c.default_value) |dv| self.allocator.free(dv);
+                if (c.computed_by) |cb| self.allocator.free(cb);
             }
             self.allocator.free(meta.columns);
             self.allocator.free(meta.name);
@@ -2056,6 +2057,7 @@ pub const Database = struct {
                 .is_auto_increment = cm.is_auto_increment,
                 .is_nullable = cm.is_nullable,
                 .default_value = if (cm.default_value) |dv| try self.allocator.dupe(u8, dv) else null,
+                .computed_by = if (cm.computed_by) |cb| try self.allocator.dupe(u8, cb) else null,
             };
         }
         _ = try self.createTable(meta.name, cols, rec.tx_id);
@@ -3023,6 +3025,7 @@ pub const Database = struct {
                                 for (meta.columns) |col| {
                                     self.allocator.free(col.name);
                                     if (col.default_value) |dv| self.allocator.free(dv);
+                                    if (col.computed_by) |cb| self.allocator.free(cb);
                                 }
                                 self.allocator.free(meta.columns);
                             }
@@ -3429,6 +3432,7 @@ pub const Database = struct {
                     for (table_meta.columns) |col| {
                         self.allocator.free(col.name);
                         if (col.default_value) |dv| self.allocator.free(dv);
+                        if (col.computed_by) |cb| self.allocator.free(cb);
                     }
                     self.allocator.free(table_meta.columns);
                     self.allocator.free(table_meta.name);
@@ -3445,6 +3449,7 @@ pub const Database = struct {
                         .is_auto_increment = col_meta.is_auto_increment,
                         .is_nullable = col_meta.is_nullable,
                         .default_value = if (col_meta.default_value) |dv| try self.allocator.dupe(u8, dv) else null,
+                        .computed_by = if (col_meta.computed_by) |cb| try self.allocator.dupe(u8, cb) else null,
                     };
                 }
 
@@ -3710,6 +3715,7 @@ pub const Database = struct {
                 .is_auto_increment = col.is_auto_increment,
                 .is_nullable = col.is_nullable,
                 .default_value = col.default_value,
+                .computed_by = col.computed_by,
             };
         }
 

@@ -447,6 +447,22 @@ and doublewrite, and are safe precisely because section 7 guarantees `f` is dete
 This is the feature that makes the subsystem more than a novelty: compute once, persist,
 reuse across every query and every restart.
 
+**Status (M4, done for computed columns).** A column can be declared
+`CREATE TABLE t (..., c TYPE AS fn(args))`. The generating expression is stored as durable
+catalog metadata (a new `computed_by` field on `ColumnMetadata`, serialised under flag bit
+`16`; a catalog written by an older engine reads back with the field absent, so the format
+is backward compatible). At insert and update time the executor evaluates `fn(args)` over the
+sibling cells through the same scalar-UDF path predicates use (`computeGeneratedCell` in
+`query_executor.zig`, hooked into the single `writeNewVersion` column loop shared by INSERT
+and UPDATE), coercing each text cell to its column's declared type so a wasm UDF receives a
+correctly typed argument. The result is written through the ordinary `RowBuilder`, so it rides
+the normal page store, WAL, and doublewrite and needs no new storage machinery: the computed
+value is stored, not recomputed on read. `Database.open` restores the `computed_by` expression
+through `loadCatalog`, so the derived-data definition survives a restart and a fresh insert
+after reopen recomputes through it. The optional page-backed `parsed_code` cache is
+deliberately skipped (section 9 item 2 permits this); modules recompile at start. Wasm-keyed
+secondary indexes reuse the same evaluated-at-write value and are a follow-up.
+
 ## 10. SQL and catalog surface
 
 - `CREATE FUNCTION name(param types) RETURNS type LANGUAGE wasm AS <bytes> [WITH (fuel=..,
@@ -974,8 +990,14 @@ Test and hardening plan:
   a trap on a bad column index, and end-to-end SQL plus engine-level tests. Remaining for later:
   forcing full-row materialisation under a row-facing predicate (columns are currently read from
   the projected row), and `emit`/aggregate surface (folded into M5).
-- **M4: persistence.** Computed columns and wasm-keyed indexes as durable derived data;
-  optional page-backed `parsed_code` cache with checksum and format-version fallback.
+- **M4: persistence.** _Done for computed columns._ `CREATE TABLE t (..., c TYPE AS fn(args))`
+  parses and stores the generating expression as durable catalog metadata (`computed_by` on
+  `ColumnMetadata`, flag bit `16`, backward compatible); the value is computed at insert/update
+  through the scalar-UDF path (`computeGeneratedCell`, hooked into the shared `writeNewVersion`
+  column loop) and written as an ordinary column, so it rides the page store, WAL, and
+  doublewrite. `loadCatalog` restores the expression on reopen. End-to-end SQL test. Remaining:
+  wasm-keyed secondary indexes, and the optional page-backed `parsed_code` cache with checksum
+  and format-version fallback (deliberately skipped for now; modules recompile at start).
 - **M5: aggregates.** Custom accumulate/merge/finalise UDFs streamed through the operator.
 - **M6: hardening to production.** _Started:_ the engine's own suites (metering, determinism,
   marshalling, and an adversarial-input test that feeds garbage, empty, truncated, and

@@ -182,6 +182,11 @@ pub const Column = struct {
     /// Optional heap-owned default value bytes, or `null` for no default;
     /// released by [`Column.deinit`] when present.
     default_value: ?[]const u8 = null,
+    /// For a wasm-backed generated column (embed-wasm.md M4), the heap-owned raw
+    /// source text of the generating expression (for example `DBL(x)`); the value
+    /// is computed at insert/update time and stored durably like any column.
+    /// `null` for an ordinary column. Released by [`Column.deinit`] when present.
+    computed_by: ?[]const u8 = null,
 
     /// Maps this column's [`ColumnType`] to the Zig primitive that represents it
     /// in a row image, evaluated at comptime.
@@ -213,6 +218,7 @@ pub const Column = struct {
     pub fn deinit(self: *Column, allocator: Allocator) void {
         allocator.free(self.name);
         if (self.default_value) |dv| allocator.free(dv);
+        if (self.computed_by) |cb| allocator.free(cb);
     }
 };
 
@@ -420,22 +426,33 @@ pub const ColumnMetadata = struct {
     is_nullable: bool = true,
     /// Optional heap-owned default value bytes, or `null`.
     default_value: ?[]const u8 = null,
+    /// For a wasm-backed generated column (embed-wasm.md M4), the heap-owned raw
+    /// source text of the generating expression, or `null`. Persisted via flag
+    /// bit `16`; older catalogs without the bit read back as `null`.
+    computed_by: ?[]const u8 = null,
 
     /// Serialises this column into a freshly allocated little-endian byte
     /// buffer that [`ColumnMetadata.deserialize`] can reverse.
     ///
     /// Layout, in order: `type` (1 byte tag), `size` (`u16`), `offset` (`u16`),
-    /// a `flags` byte, `name_len` (`u32`), the name bytes, and, only when a
-    /// default is present, `def_len` (`u32`) plus the default bytes. The flag
-    /// bits are fixed: `1` primary key, `2` auto-increment, `4` nullable, `8`
-    /// default-present; these bit values are part of the format and must match
-    /// the reader. Returns the owned buffer (caller frees) or an allocation
-    /// error.
+    /// a `flags` byte, `name_len` (`u32`), the name bytes, then (only when a
+    /// default is present) `def_len` (`u32`) plus the default bytes, then (only
+    /// when a generated expression is present) `comp_len` (`u32`) plus the
+    /// expression bytes. The flag bits are fixed: `1` primary key, `2`
+    /// auto-increment, `4` nullable, `8` default-present, `16` computed-present;
+    /// these bit values are part of the format and must match the reader. The
+    /// computed block is appended after the default block so a reader that stops
+    /// at bit 8 (an older engine) still parses the earlier fields identically.
+    /// Returns the owned buffer (caller frees) or an allocation error.
     pub fn serialize(self: ColumnMetadata, allocator: Allocator) ![]const u8 {
         const name_len = @as(u32, @intCast(self.name.len));
         var def_len: u32 = 0;
         if (self.default_value) |dv| {
             def_len = @as(u32, @intCast(dv.len));
+        }
+        var comp_len: u32 = 0;
+        if (self.computed_by) |cb| {
+            comp_len = @as(u32, @intCast(cb.len));
         }
 
         var flags: u8 = 0;
@@ -443,8 +460,11 @@ pub const ColumnMetadata = struct {
         if (self.is_auto_increment) flags |= 2;
         if (self.is_nullable) flags |= 4;
         if (self.default_value != null) flags |= 8;
+        if (self.computed_by != null) flags |= 16;
 
-        const total_size = 1 + 2 + 2 + 1 + 4 + name_len + (if (self.default_value != null) 4 + def_len else 0);
+        const total_size = 1 + 2 + 2 + 1 + 4 + name_len +
+            (if (self.default_value != null) 4 + def_len else 0) +
+            (if (self.computed_by != null) 4 + comp_len else 0);
         const bytes = try allocator.alloc(u8, total_size);
         errdefer allocator.free(bytes);
 
@@ -467,6 +487,13 @@ pub const ColumnMetadata = struct {
             offset += 4;
             @memcpy(bytes[offset .. offset + def_len], dv);
             offset += def_len;
+        }
+
+        if (self.computed_by) |cb| {
+            std.mem.writeInt(u32, bytes[offset..][0..4], comp_len, .little);
+            offset += 4;
+            @memcpy(bytes[offset .. offset + comp_len], cb);
+            offset += comp_len;
         }
 
         return bytes;
@@ -502,6 +529,7 @@ pub const ColumnMetadata = struct {
         offset.* += 4;
 
         const name = try allocator.dupe(u8, bytes[offset.* .. offset.* + name_len]);
+        errdefer allocator.free(name);
         offset.* += name_len;
 
         const is_primary_key = (flags & 1) != 0;
@@ -515,6 +543,15 @@ pub const ColumnMetadata = struct {
             default_value = try allocator.dupe(u8, bytes[offset.* .. offset.* + def_len]);
             offset.* += def_len;
         }
+        errdefer if (default_value) |dv| allocator.free(dv);
+
+        var computed_by: ?[]const u8 = null;
+        if ((flags & 16) != 0) {
+            const comp_len = std.mem.readInt(u32, bytes[offset.*..][0..4], .little);
+            offset.* += 4;
+            computed_by = try allocator.dupe(u8, bytes[offset.* .. offset.* + comp_len]);
+            offset.* += comp_len;
+        }
 
         return ColumnMetadata{
             .name = name,
@@ -525,6 +562,7 @@ pub const ColumnMetadata = struct {
             .is_auto_increment = is_auto_increment,
             .is_nullable = is_nullable,
             .default_value = default_value,
+            .computed_by = computed_by,
         };
     }
 };

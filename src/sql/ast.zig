@@ -388,6 +388,11 @@ pub const CreateColumn = struct {
     is_unique: bool = false,
     /// The `DEFAULT` expression's raw text, or `null` if no default.
     default_value: ?[]const u8 = null,
+    /// For a wasm-backed generated column (`col TYPE AS fn(args)`, embed-wasm.md
+    /// M4), the raw source text of the generating expression (for example
+    /// `DBL(x)`). The value is computed at insert time and stored durably like any
+    /// column. `null` for an ordinary column.
+    computed_by: ?[]const u8 = null,
     /// For an inline `REFERENCES`, the referenced table; paired with
     /// [`CreateColumn.foreign_key_column`].
     foreign_key_table: ?[]const u8 = null,
