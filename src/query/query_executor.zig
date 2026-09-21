@@ -3722,6 +3722,11 @@ pub const QueryExecutor = struct {
     /// It therefore (almost) never propagates a Zig error to the caller: logical
     /// failures come back inside [`QueryResponse.error_message`].
     pub fn execute(self: *QueryExecutor, req: QueryRequest) !QueryResponse {
+        // Point the scalar-eval wasm-UDF hook at this database's registry (embed-wasm.md M1).
+        // The registry is a stable field of the heap-allocated Database, so the pointer is
+        // valid for the query; setting it every execute is a cheap idempotent store.
+        query_iter.active_wasm_registry = &self.db.wasm_functions;
+
         // Record end-to-end latency of every top-level query into the shared
         // histogram, on all return/error paths. Monotonic clock; nanoseconds.
         const lat_io = self.db.pool.pager.io;

@@ -124,6 +124,7 @@ const RwLock = @import("utils").sync.RwLock;
 const GroupLock = @import("utils").sync.GroupLock;
 /// Tracks active and committed transaction ids and hands out new ones.
 const TransactionManager = @import("../concurrency/transaction.zig").TransactionManager;
+const WasmRegistry = @import("../wasm/registry.zig").Registry;
 /// The write-ahead log; durability and the source stream for replication.
 const WriteAheadLog = @import("../durability/write_ahead_log.zig").WriteAheadLog;
 
@@ -224,6 +225,11 @@ pub const Database = struct {
     /// In-memory catalog (tables, indexes, foreign keys) rebuilt on open by
     /// [`Database.loadCatalog`].
     catalog: catalog.SystemCatalog,
+    /// Registry of wasm scalar UDFs registered with `CREATE FUNCTION ... LANGUAGE wasm`
+    /// (embed-wasm.md M1). The query executor points the scalar-eval hook at this so
+    /// `WHERE fn(col) = ...` resolves registered functions. In-memory; WAL-backed persistence
+    /// of the source bytes is a later slice.
+    wasm_functions: WasmRegistry,
     /// Object name → root page id for every table, including `sys.*` tables.
     /// Keys are owned (duped) copies freed on teardown.
     table_roots: std.StringHashMap(u64),
@@ -369,6 +375,7 @@ pub const Database = struct {
             .pool = pool,
             .master_tree = undefined,
             .catalog = catalog.SystemCatalog.init(allocator),
+            .wasm_functions = WasmRegistry.init(allocator),
             .table_roots = std.StringHashMap(u64).init(allocator),
             .index_roots = std.StringHashMap(u64).init(allocator),
             .table_trees = std.StringHashMap(*BPlusTree).init(allocator),
@@ -704,6 +711,7 @@ pub const Database = struct {
         }
 
         self.master_tree.deinit();
+        self.wasm_functions.deinit();
         self.catalog.deinit();
         var table_it = self.table_roots.keyIterator();
         while (table_it.next()) |k| {
