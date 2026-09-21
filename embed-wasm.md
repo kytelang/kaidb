@@ -480,6 +480,30 @@ hook `evalFunc`, proving `SELECT wasmfn(intcol)` end to end with a programmatica
 function; then (2) add the `CREATE FUNCTION` / `DROP FUNCTION` DDL and catalog persistence so
 registration happens through SQL; then (3) filter pushdown and aggregates.
 
+### 10.2 Why the executor hook is genuinely invasive (deeper look)
+
+A closer read of `query_executor.zig` (roughly 5000 lines) shows the projection scalar
+evaluation is **not funnelled through a single choke point**. Different execution paths build
+output cells with their own `switch (proj.expr)` blocks: the simple-scan projection, the
+grouped/aggregate drain (which currently handles only `.aggregate` / `.column` / `.star`), and
+the join drains each have separate cases. `evalFunc` in `iterator.zig` is the choke point for
+the *scan/predicate* path, but the aggregate and join drains do not route through it. So wiring
+UDFs everywhere means either touching each `switch` or, better, a small refactor first:
+
+- **Preparatory refactor (recommended before hooking):** route every projection's scalar
+  (non-aggregate) evaluation through one function that ends at `evalScalar`/`evalFunc`, so the
+  wasm hook is added in exactly one place and all paths (scan, group, join) inherit it. This
+  is the clean way in, and it is a change to kaidb's most intricate file, so it wants its own
+  focused pass with the query test harness, not a late-session edit.
+- **Registry ownership + threading:** the `Registry` lives on `Database` (one per database);
+  `QueryExecutor` already holds `db: *Database`, so `evalFunc` reaches it once the resolver
+  (`RowResolver`) carries a `db`/registry pointer. `RowResolver` is constructed at few sites,
+  so that part is small; the projection-path unification above is the larger part.
+
+Net: the engine, the call seam, and the catalog are done and tested; the remaining executor
+integration is a deliberate refactor-then-hook in the query engine's hottest, most complex
+file, best done as its own slice rather than piecemeal.
+
 ## 11. In-process mode: kaidb as host, the Kyte app as guest, transport-agnostic driver
 
 Everything above treats a UDF as a small function called during a query. There is a larger
