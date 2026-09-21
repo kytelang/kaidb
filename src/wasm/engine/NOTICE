@@ -1,0 +1,16 @@
+The files in this directory (src/wasm/engine/) are a fork of zware, the Zig
+WebAssembly Runtime Engine by Malcolm Still.
+
+  Upstream: https://github.com/malcolmstill/zware
+  Forked from: master (commit pinned in this NOTICE at fork time, 2026-09).
+  Upstream licence: MIT.
+
+zware is distributed under the MIT Licence. That licence and Malcolm Still's
+copyright are retained for these files. kaidb's own additions on top (fuel
+metering, determinism, the database host ABI, page-backed caching) are part of
+the kaidb project and carry the kaidb licence.
+
+See embed-wasm.md for the design and the changes made to this fork.
+
+Trim: the WASI host-function surface (wasi/) was removed. kaidb UDFs run with
+no WASI (no filesystem, clock, or randomness); see embed-wasm.md section 8.
