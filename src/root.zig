@@ -6507,3 +6507,47 @@ test "wasm string UDF via SQL: WHERE fn(textcol) marshals the string argument" {
     try std.testing.expectEqual(@as(usize, 1), try h.count(&exec, allocator, "SELECT name FROM w WHERE SUMB(name) = 131"));
     try std.testing.expectEqual(@as(usize, 0), try h.count(&exec, allocator, "SELECT name FROM w WHERE SUMB(name) = 999"));
 }
+
+test "wasm string-result UDF via SQL: RETURNS TEXT, WHERE fn(col) = literal" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_wasm_strret_udf.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+    defer Io.Dir.deleteTree(.cwd(), io, "udf") catch {};
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+    var db = try Database.open(allocator, io, db_path, 64, null);
+    defer db.close();
+    var exec = QueryExecutor.init(allocator, db);
+    defer exec.deinit();
+
+    const h = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+        fn count(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !usize {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+            return res.rows.len;
+        }
+    };
+
+    const wasm = @embedFile("wasm/testdata_udf_upper.wasm");
+    const hex = comptime std.fmt.bytesToHex(wasm, .lower);
+    try h.q(&exec, allocator, "CREATE FUNCTION UP RETURNS TEXT LANGUAGE wasm AS '" ++ hex ++ "'");
+    try h.q(&exec, allocator, "CREATE TABLE w (name TEXT PRIMARY KEY)");
+    try h.q(&exec, allocator, "INSERT INTO w (name) VALUES ('abc')");
+    try h.q(&exec, allocator, "INSERT INTO w (name) VALUES ('xyz')");
+
+    // UP('abc') = 'ABC' (a string result marshalled out of guest memory), so only 'abc' matches.
+    try std.testing.expectEqual(@as(usize, 1), try h.count(&exec, allocator, "SELECT name FROM w WHERE UP(name) = 'ABC'"));
+    try std.testing.expectEqual(@as(usize, 0), try h.count(&exec, allocator, "SELECT name FROM w WHERE UP(name) = 'abc'"));
+    try std.testing.expectEqual(@as(usize, 1), try h.count(&exec, allocator, "SELECT name FROM w WHERE UP(name) = 'XYZ'"));
+}

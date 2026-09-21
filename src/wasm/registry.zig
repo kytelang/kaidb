@@ -38,9 +38,10 @@ pub const Registry = struct {
     /// Register (or replace) a wasm scalar function. Decoding and validation happen here, so a
     /// bad module is rejected at registration, not at call time. Replacing an existing name
     /// deinits the old function and bumps the version.
-    pub fn register(self: *Registry, name: []const u8, wasm_bytes: []const u8, policy: udf.Policy) !void {
+    pub fn register(self: *Registry, name: []const u8, wasm_bytes: []const u8, policy: udf.Policy, returns_string: bool) !void {
         var new_fn = try udf.WasmScalarFn.init(self.alloc, wasm_bytes, policy);
         errdefer new_fn.deinit();
+        new_fn.returns_string = returns_string;
 
         if (self.map.getPtr(name)) |existing| {
             existing.func.deinit();

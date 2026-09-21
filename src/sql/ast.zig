@@ -421,6 +421,8 @@ pub const CreateFunctionStmt = struct {
     name: []const u8,
     /// The wasm module bytes as a hex string (borrowed from the SQL text).
     wasm_hex: []const u8,
+    /// Whether the function returns text (`RETURNS TEXT`); otherwise a numeric result.
+    returns_string: bool = false,
 };
 
 /// `DROP FUNCTION name` unregisters a wasm scalar UDF.

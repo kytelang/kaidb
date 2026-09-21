@@ -662,31 +662,37 @@ pub const Database = struct {
     // WAL-consistent or replicated; moving the modules into the catalog (so they ride the WAL
     // and replicate) is a later slice. Names are already upper-cased by the caller.
 
-    /// Persist a registered wasm UDF's module bytes so it survives restart.
-    pub fn persistWasmFunction(self: *Database, name: []const u8, bytes: []const u8) !void {
+    /// Persist a registered wasm UDF's module bytes so it survives restart. The extension
+    /// encodes the result type so it is restored on reload: `.twasm` for a text-returning UDF,
+    /// `.wasm` for a numeric one.
+    pub fn persistWasmFunction(self: *Database, name: []const u8, bytes: []const u8, returns_string: bool) !void {
         if (self.base_dir.len == 0) return; // no on-disk home (e.g. transient/test db)
         const io = self.pool.pager.io;
         var dbuf: [512]u8 = undefined;
         const dir = try std.fmt.bufPrint(&dbuf, "{s}/udf", .{self.base_dir});
         std.Io.Dir.createDirPath(.cwd(), io, dir) catch {};
+        const ext: []const u8 = if (returns_string) "twasm" else "wasm";
         var pbuf: [700]u8 = undefined;
-        const path = try std.fmt.bufPrint(&pbuf, "{s}/{s}.wasm", .{ dir, name });
+        const path = try std.fmt.bufPrint(&pbuf, "{s}/{s}.{s}", .{ dir, name, ext });
         const f = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
         defer f.close(io);
         try f.writeStreamingAll(io, bytes);
     }
 
-    /// Remove a persisted wasm UDF module (best-effort; missing file is fine).
+    /// Remove a persisted wasm UDF module (best-effort; either extension, missing file is fine).
     pub fn removeWasmFunction(self: *Database, name: []const u8) void {
         if (self.base_dir.len == 0) return;
         const io = self.pool.pager.io;
         var pbuf: [700]u8 = undefined;
-        const path = std.fmt.bufPrint(&pbuf, "{s}/udf/{s}.wasm", .{ self.base_dir, name }) catch return;
-        std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
+        inline for ([_][]const u8{ "wasm", "twasm" }) |ext| {
+            const path = std.fmt.bufPrint(&pbuf, "{s}/udf/{s}.{s}", .{ self.base_dir, name, ext }) catch return;
+            std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
+        }
     }
 
     /// Reload persisted wasm UDFs into the registry on open (called after loadCatalog). A
     /// missing directory means none were registered; a bad module file is skipped, not fatal.
+    /// The `.twasm`/`.wasm` extension restores whether the UDF returns text.
     fn loadWasmFunctions(self: *Database) !void {
         if (self.base_dir.len == 0) return;
         const io = self.pool.pager.io;
@@ -697,13 +703,19 @@ pub const Database = struct {
         var it = d.iterate();
         while (it.next(io) catch null) |entry| {
             if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".wasm")) continue;
-            const fn_name = entry.name[0 .. entry.name.len - ".wasm".len];
+            var returns_string = false;
+            var stem: []const u8 = undefined;
+            if (std.mem.endsWith(u8, entry.name, ".twasm")) {
+                returns_string = true;
+                stem = entry.name[0 .. entry.name.len - ".twasm".len];
+            } else if (std.mem.endsWith(u8, entry.name, ".wasm")) {
+                stem = entry.name[0 .. entry.name.len - ".wasm".len];
+            } else continue;
             var pbuf: [700]u8 = undefined;
             const path = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir, entry.name }) catch continue;
             const bytes = std.Io.Dir.readFileAlloc(.cwd(), io, path, self.allocator, .unlimited) catch continue;
             defer self.allocator.free(bytes);
-            self.wasm_functions.register(fn_name, bytes, .{}) catch continue;
+            self.wasm_functions.register(stem, bytes, .{}, returns_string) catch continue;
         }
     }
 

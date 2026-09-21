@@ -5638,12 +5638,12 @@ pub const QueryExecutor = struct {
                     return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CREATE FUNCTION: invalid hex module") };
                 const upper = try std.ascii.allocUpperString(self.allocator, cf.name);
                 defer self.allocator.free(upper);
-                self.db.wasm_functions.register(upper, bytes, .{}) catch
+                self.db.wasm_functions.register(upper, bytes, .{}, cf.returns_string) catch
                     return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CREATE FUNCTION: module failed to decode or validate") };
                 // Persist so the UDF survives restart (embed-wasm.md M1). Best-effort: the
                 // in-memory registration already succeeded; a failed write only means it will
                 // not survive a restart, so warn rather than fail the statement.
-                self.db.persistWasmFunction(upper, bytes) catch |err|
+                self.db.persistWasmFunction(upper, bytes, cf.returns_string) catch |err|
                     std.log.warn("CREATE FUNCTION {s}: persistence failed: {any}", .{ upper, err });
                 return QueryResponse{ .rows_affected = 1 };
             },

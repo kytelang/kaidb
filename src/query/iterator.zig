@@ -567,30 +567,27 @@ fn evalFunc(fc: ast.FuncCall, ctx: anytype) ?Scalar {
     // yields null, which predicates read as unknown.
     if (active_wasm_registry) |reg| {
         if (reg.get(name)) |wfn| {
-            // A single string argument is marshalled through linear memory (embed-wasm.md M2);
-            // numeric arguments are passed directly. Mixed/multi string args wait on the full
-            // frame codec.
-            if (fc.args.len == 1) {
-                if (evalScalar(fc.args[0], ctx)) |v| {
-                    if (v == .string) {
-                        const r = wfn.callString(v.string) catch return null;
-                        return .{ .integer = r };
-                    }
-                    // fall through to the numeric path for a non-string single arg
-                    const iv = asI64(v) orelse return null;
-                    const r = wfn.callI64(UDF_ENTRY, &.{iv}) catch return null;
-                    return .{ .integer = r };
-                }
-                return null;
-            }
-            var args_buf: [8]i64 = undefined;
-            if (fc.args.len > args_buf.len) return null;
+            // Build the argument list, mapping each SQL scalar to an int or a string (strings
+            // are marshalled through the guest's linear memory by `call`; embed-wasm.md M2).
+            const WasmArg = @import("../wasm/udf.zig").WasmScalarFn.Arg;
+            var arg_buf: [8]WasmArg = undefined;
+            if (fc.args.len > arg_buf.len) return null;
             for (fc.args, 0..) |arg, i| {
                 const v = evalScalar(arg, ctx) orelse return null;
-                args_buf[i] = asI64(v) orelse return null;
+                arg_buf[i] = switch (v) {
+                    .string => |s| .{ .str = s },
+                    else => .{ .int = asI64(v) orelse return null },
+                };
             }
-            const r = wfn.callI64(UDF_ENTRY, args_buf[0..fc.args.len]) catch return null;
-            return .{ .integer = r };
+            // A text-returning UDF (RETURNS TEXT) copies its result into a threadlocal scratch
+            // buffer, matching the built-in string scalars; the buffer size is the output cap.
+            const out_buf: []u8 = if (fn_scratch_toggle) fn_scratch_b[0..] else fn_scratch_a[0..];
+            fn_scratch_toggle = !fn_scratch_toggle;
+            const res = wfn.call(arg_buf[0..fc.args.len], out_buf) catch return null;
+            return switch (res) {
+                .int => |iv| .{ .integer = iv },
+                .str_len => |len| .{ .string = out_buf[0..len] },
+            };
         }
     }
 
@@ -2844,7 +2841,7 @@ test "wasm UDF: a registered scalar function evaluates through evalFunc" {
     var reg = WasmRegistry.init(alloc);
     defer reg.deinit();
     // SQL names arrive upper-cased at parse time; register under the upper name.
-    try reg.register("DBL", @embedFile("testdata_udf.wasm"), .{});
+    try reg.register("DBL", @embedFile("testdata_udf.wasm"), .{}, false);
 
     active_wasm_registry = &reg;
     defer active_wasm_registry = null;

@@ -1065,6 +1065,16 @@ pub const Parser = struct {
         self.eat(); // FUNCTION
         const name_tok = try self.expect(.IDENTIFIER);
         const name = self.sliceText(name_tok);
+        // Optional `RETURNS TEXT|INT` (RETURNS and the type are not reserved keywords). TEXT
+        // means the function returns a string via the packed-pointer ABI; anything else is
+        // numeric. Default numeric.
+        var returns_string = false;
+        if (self.current().type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(self.current()), "RETURNS")) {
+            self.eat(); // RETURNS
+            const ty_tok = self.current();
+            returns_string = std.ascii.eqlIgnoreCase(self.sliceText(ty_tok), "TEXT");
+            self.eat(); // the return type
+        }
         if (self.current().type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(self.current()), "LANGUAGE")) {
             self.eat(); // LANGUAGE
             self.eat(); // the language name (e.g. wasm)
@@ -1072,7 +1082,7 @@ pub const Parser = struct {
         _ = try self.expect(.AS);
         const bytes_tok = try self.expect(.STRING);
         const wasm_hex = self.cleanString(self.sliceText(bytes_tok));
-        return .{ .create_function = .{ .name = name, .wasm_hex = wasm_hex } };
+        return .{ .create_function = .{ .name = name, .wasm_hex = wasm_hex, .returns_string = returns_string } };
     }
 
     /// Dispatches `DROP ...` to the matching object parser.

@@ -923,14 +923,21 @@ Test and hardening plan:
     catalog (so they ride the WAL and replicate) is the follow-up; it is gated on `rw_lock`
     non-reentrancy (`CREATE FUNCTION` already holds the exclusive lock, so it must use the
     lower-level table API rather than `self.execute`).
-  - **String UDF arguments: done (single arg, push model).** `WasmScalarFn.callString`
-    marshals a string through linear memory (section 6): the guest exports `kaidb_alloc` and
-    `memory`, the host allocates in the guest, writes the bytes bounds-checked, then calls
-    `kaidb_udf(ptr, len)`. `evalFunc` routes a single string argument here. Verified end to end
-    from SQL: `CREATE FUNCTION SUMB` (byte-sum), then `SELECT name FROM w WHERE SUMB(name) = 198`
-    selects exactly the matching row. Remaining M2: the general multi-argument frame codec on
-    `src/proto/wire.zig` for mixed and multi string/bytes arguments, and string/bytes *results*
-    (the output frame), which the KYX apex needs.
+  - **M2 marshalling: done (both directions, mixed args, string results).**
+    `WasmScalarFn.call(args, out_buf)` is the general scalar-UDF path: each argument maps to
+    wasm parameters (an int is one i64; a string is written into the guest via its exported
+    `kaidb_alloc` and passed as a `(ptr, len)` i32 pair, all bounds-checked, host never trusts
+    a guest pointer, section 6.4). The result is an i64 numeric value, or, for a
+    `CREATE FUNCTION ... RETURNS TEXT` function, a packed `(ptr, len)` string whose bytes are
+    copied out of guest memory into a threadlocal scratch buffer (the buffer size is the
+    output-size cap). `evalFunc` builds the arg list from the SQL scalars, calls `call`, and
+    returns `.integer` or `.string`. The DDL parses `RETURNS TEXT|INT`, and the result type is
+    persisted (a `.twasm` extension) so it survives restart. Verified end to end from SQL:
+    `SELECT name FROM w WHERE SUMB(name) = 198` (string in, int out) and
+    `CREATE FUNCTION UP RETURNS TEXT ... WHERE UP(name) = 'ABC'` (string in, string out) both
+    select exactly the matching rows. Remaining M2 (deferred): a fully typed wire frame on
+    `src/proto/wire.zig` for the richer `DbValue` set (decimal, timestamps, explicit NULL) and
+    for very large results beyond the scratch cap; the common int/string cases work now.
   - **Scalar-expression projections (`SELECT fn(col)`).** kaidb has no scalar projections
     today (section 10.1); this is a separate SQL feature.
   - **The KYX-from-database apex (M7, section 12.4).**

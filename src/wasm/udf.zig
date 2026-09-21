@@ -28,6 +28,19 @@ pub const WasmScalarFn = struct {
     bytes: []u8,
     module: zware.Module,
     policy: Policy,
+    /// Whether this UDF returns text (`CREATE FUNCTION ... RETURNS TEXT`). When true the guest's
+    /// i64 return is a packed `(ptr << 32) | len` pointing at bytes in its own linear memory;
+    /// when false it is a plain numeric value.
+    returns_string: bool = false,
+
+    /// A single UDF argument, mapped to wasm parameters by `call`: an int becomes one i64
+    /// parameter, a string becomes two i32 parameters (ptr, len) after the host writes its
+    /// bytes into the guest (embed-wasm.md section 6).
+    pub const Arg = union(enum) { int: i64, str: []const u8 };
+
+    /// A UDF result: a numeric value, or a string whose bytes were copied into the caller's
+    /// output buffer (the returned usize is its length; the output-size cap is the buffer size).
+    pub const Result = union(enum) { int: i64, str_len: usize };
 
     pub fn init(alloc: std.mem.Allocator, wasm_bytes: []const u8, policy: Policy) !WasmScalarFn {
         const owned = try alloc.dupe(u8, wasm_bytes);
@@ -68,6 +81,66 @@ pub const WasmScalarFn = struct {
 
         instance.fuel_budget = self.policy.fuel;
         try instance.invoke(name, in, out, .{});
+    }
+
+    /// The general scalar-UDF call (embed-wasm.md section 6): mixed int/string arguments and an
+    /// int or string result. Each string argument is written into the guest's linear memory
+    /// (via its exported `kaidb_alloc`) and passed as a `(ptr, len)` i32 pair; ints pass
+    /// directly. If `returns_string` the guest's packed `(ptr, len)` result is bounds-checked
+    /// and its bytes copied into `out_buf` (capped at the buffer size); otherwise the i64 is
+    /// returned as-is. A fresh metered, memory-capped, host-import-free instance per call.
+    pub fn call(self: *WasmScalarFn, args: []const Arg, out_buf: []u8) !Result {
+        var store = zware.Store.init(self.alloc);
+        defer store.deinit();
+
+        var instance = zware.Instance.init(self.alloc, &store, self.module);
+        try instance.instantiate();
+        defer instance.deinit();
+
+        for (instance.module.imports.list.items) |_| return error.HostImportsNotAllowed;
+        instance.fuel_budget = self.policy.fuel;
+        try instance.limitMemoryPages(self.policy.memory_pages);
+
+        // Build the wasm parameter slots, allocating+writing each string into guest memory.
+        var in_buf: [16]u64 = undefined;
+        var n: usize = 0;
+        for (args) |a| switch (a) {
+            .int => |v| {
+                if (n >= in_buf.len) return error.TooManyArgs;
+                in_buf[n] = @bitCast(v);
+                n += 1;
+            },
+            .str => |s| {
+                if (n + 2 > in_buf.len) return error.TooManyArgs;
+                var ai = [1]u64{@bitCast(@as(i64, @intCast(s.len)))};
+                var ao = [1]u64{0};
+                try instance.invoke(ALLOC_ENTRY, ai[0..], ao[0..], .{});
+                const ptr: u32 = @truncate(ao[0]);
+                const mem = try instance.getMemory(0);
+                const buf = mem.memory();
+                if (@as(usize, ptr) + s.len > buf.len) return error.OutOfBoundsMemoryAccess;
+                @memcpy(buf[ptr .. ptr + s.len], s);
+                in_buf[n] = ptr;
+                in_buf[n + 1] = @intCast(s.len);
+                n += 2;
+            },
+        };
+
+        var out = [1]u64{0};
+        try instance.invoke(ENTRY, in_buf[0..n], out[0..], .{});
+
+        if (!self.returns_string) return .{ .int = @bitCast(out[0]) };
+
+        // Unpack the (ptr << 32) | len result and copy the bytes out, bounds-checked. The host
+        // never trusts the guest-supplied pointer (section 6.4).
+        const rptr: u32 = @truncate(out[0] >> 32);
+        const rlen: u32 = @truncate(out[0]);
+        const mem = try instance.getMemory(0);
+        const buf = mem.memory();
+        if (@as(usize, rptr) + rlen > buf.len) return error.OutOfBoundsMemoryAccess;
+        const copy_len = @min(@as(usize, rlen), out_buf.len);
+        @memcpy(out_buf[0..copy_len], buf[rptr .. rptr + copy_len]);
+        return .{ .str_len = copy_len };
     }
 
     /// The exported entry points a string-taking UDF module must provide.

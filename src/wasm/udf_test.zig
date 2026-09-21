@@ -68,3 +68,20 @@ test "hardening: malformed and hostile modules are rejected or trapped, never cr
         try std.testing.expect(std.meta.isError(fn_.callI64("kaidb_udf", &.{0})));
     }
 }
+
+test "string-result UDF: uppercase returns a string via packed pointer" {
+    const alloc = std.testing.allocator;
+    var fn_ = try udf.WasmScalarFn.init(alloc, @embedFile("testdata_udf_upper.wasm"), .{});
+    defer fn_.deinit();
+    fn_.returns_string = true;
+
+    var out: [64]u8 = undefined;
+    const r = try fn_.call(&.{.{ .str = "abc" }}, out[0..]);
+    try std.testing.expect(r == .str_len);
+    try std.testing.expectEqualStrings("ABC", out[0..r.str_len]);
+
+    // A mixed shape works too: an int arg passed alongside would spread as one slot; here just
+    // confirm a different string produces a different result.
+    const r2 = try fn_.call(&.{.{ .str = "Hi!" }}, out[0..]);
+    try std.testing.expectEqualStrings("HI!", out[0..r2.str_len]);
+}
