@@ -349,8 +349,8 @@ evaluated in the WHERE/filter path exactly like a scalar UDF, so `WHERE rowfn() 
 pull-model filter into the scan. Columns are addressed positionally in the projected row's
 order; forcing full-row materialisation when a row-facing predicate is present (so the guest
 always sees every column in schema order, regardless of projection pushdown) is a follow-up.
-`emit` and the aggregate accumulate/merge/finalise surface belong to M5 and are not exposed
-yet.
+The aggregate accumulate/finalise surface is implemented in M5 (custom aggregates via
+`CREATE AGGREGATE`; see the roadmap). `emit` and `merge` remain for later slices.
 
 ### 6.4 Bounds safety is the whole game
 
@@ -998,7 +998,17 @@ Test and hardening plan:
   doublewrite. `loadCatalog` restores the expression on reopen. End-to-end SQL test. Remaining:
   wasm-keyed secondary indexes, and the optional page-backed `parsed_code` cache with checksum
   and format-version fallback (deliberately skipped for now; modules recompile at start).
-- **M5: aggregates.** Custom accumulate/merge/finalise UDFs streamed through the operator.
+- **M5: aggregates.** _Done (accumulate/finalise)._ `CREATE AGGREGATE name LANGUAGE wasm AS
+  '<hex>'` registers a module exporting `kaidb_agg_accumulate(i64)` and `kaidb_agg_finalize()
+  -> i64` (plus optional `kaidb_agg_init`), validated at registration. `SELECT name(col) FROM
+  t [GROUP BY g]` folds each row through a *persistent* per-group guest instance (its linear
+  memory and globals carry the running state across rows, unlike the fresh-per-call scalar
+  instance), finalising once per group. Wired into kaidb's existing GROUP BY choke points
+  (`foldOneAgg`/`formatAggregate`), gated out of the index-only fast path, with a parallel
+  `AggRegistry` and file-backed (`.wagg`) persistence reloaded on open. Engine-level and
+  end-to-end SQL tests (whole-table, per-group, case-insensitive, DROP). Remaining: `merge`
+  (only needed for parallel/partitioned aggregation), a wasm aggregate in HAVING, and
+  non-integer accumulator values.
 - **M6: hardening to production.** _Started:_ the engine's own suites (metering, determinism,
   marshalling, and an adversarial-input test that feeds garbage, empty, truncated, and
   infinite-recursion modules and asserts they are rejected or trapped, never crash) are wired

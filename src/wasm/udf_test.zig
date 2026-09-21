@@ -95,6 +95,39 @@ test "row-facing TEXT UDF: col_bytes into guest memory, returned as a string" {
     try std.testing.expectEqualStrings("hello", out[0..r.str_len]);
 }
 
+test "custom aggregate: accumulate across rows, finalise the group result" {
+    const alloc = std.testing.allocator;
+    var af = try udf.WasmAggFn.init(alloc, @embedFile("testdata_agg_sum.wasm"), .{});
+    defer af.deinit();
+
+    // One group: fold 10, 20, 12; the persistent instance carries the running sum, so finalise
+    // returns 42. State lives in the guest across accumulate calls, unlike a scalar UDF.
+    var aggr = try af.newAggregator();
+    defer aggr.deinit();
+    try aggr.accumulate(10);
+    try aggr.accumulate(20);
+    try aggr.accumulate(12);
+    try std.testing.expectEqual(@as(i64, 42), try aggr.finalize());
+
+    // A second aggregator is an independent group: fresh state, no leak from the first.
+    var aggr2 = try af.newAggregator();
+    defer aggr2.deinit();
+    try aggr2.accumulate(5);
+    try aggr2.accumulate(5);
+    try std.testing.expectEqual(@as(i64, 10), try aggr2.finalize());
+
+    // An empty group finalises to the aggregate's identity (0 for a sum).
+    var aggr3 = try af.newAggregator();
+    defer aggr3.deinit();
+    try std.testing.expectEqual(@as(i64, 0), try aggr3.finalize());
+}
+
+test "custom aggregate: a module missing the required exports is rejected at init" {
+    const alloc = std.testing.allocator;
+    // The scalar-doubling module exports `kaidb_udf`, not the aggregate entry points.
+    try std.testing.expectError(error.MissingAggregateExport, udf.WasmAggFn.init(alloc, @embedFile("testdata_add.wasm"), .{}));
+}
+
 test "row-facing classification: a non-allowlisted import is rejected at init" {
     const alloc = std.testing.allocator;
     // A module importing an unknown host function (env.foo) must be rejected: only the audited

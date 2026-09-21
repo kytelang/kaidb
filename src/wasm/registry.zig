@@ -79,3 +79,64 @@ pub const Registry = struct {
         return false;
     }
 };
+
+/// Registry of custom wasm aggregates (embed-wasm.md M5), populated by `CREATE AGGREGATE`.
+/// Parallel to [`Registry`] but holds a [`udf.WasmAggFn`]: an immutable decoded module the
+/// executor spins a per-group [`udf.Aggregator`] over. Same threading contract as [`Registry`].
+pub const AggRegistry = struct {
+    alloc: std.mem.Allocator,
+    map: std.StringHashMapUnmanaged(Entry) = .{},
+
+    pub const Entry = struct {
+        func: udf.WasmAggFn,
+        version: u32,
+    };
+
+    pub fn init(alloc: std.mem.Allocator) AggRegistry {
+        return .{ .alloc = alloc };
+    }
+
+    pub fn deinit(self: *AggRegistry) void {
+        var it = self.map.iterator();
+        while (it.next()) |kv| {
+            kv.value_ptr.func.deinit();
+            self.alloc.free(kv.key_ptr.*);
+        }
+        self.map.deinit(self.alloc);
+    }
+
+    /// Register (or replace) a wasm aggregate. Decode and export validation happen here, so a
+    /// module missing accumulate/finalise is rejected at registration.
+    pub fn register(self: *AggRegistry, name: []const u8, wasm_bytes: []const u8, policy: udf.Policy) !void {
+        var new_fn = try udf.WasmAggFn.init(self.alloc, wasm_bytes, policy);
+        errdefer new_fn.deinit();
+
+        if (self.map.getPtr(name)) |existing| {
+            existing.func.deinit();
+            existing.func = new_fn;
+            existing.version +%= 1;
+            return;
+        }
+
+        const key = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(key);
+        try self.map.put(self.alloc, key, .{ .func = new_fn, .version = 1 });
+    }
+
+    /// Look up a registered aggregate by name, or null.
+    pub fn get(self: *AggRegistry, name: []const u8) ?*udf.WasmAggFn {
+        if (self.map.getPtr(name)) |e| return &e.func;
+        return null;
+    }
+
+    /// Drop an aggregate. Returns true if it existed.
+    pub fn drop(self: *AggRegistry, name: []const u8) bool {
+        if (self.map.fetchRemove(name)) |kv| {
+            var e = kv.value;
+            e.func.deinit();
+            self.alloc.free(kv.key);
+            return true;
+        }
+        return false;
+    }
+};

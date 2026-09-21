@@ -268,3 +268,122 @@ pub const WasmScalarFn = struct {
         return @bitCast(out[0]);
     }
 };
+
+/// A decoded wasm module registered as a custom aggregate (embed-wasm.md M5). Unlike a scalar
+/// UDF, an aggregate keeps state across the rows of a group: the operator folds each row in with
+/// `accumulate` and reads the group result once with `finalize`. That state lives in the guest's
+/// own linear memory and globals, so an aggregate needs a *persistent* instance for the life of a
+/// group, not the fresh-per-call instance a scalar UDF uses. `WasmAggFn` is the immutable decoded
+/// module (shared across query threads); each group spins up an [`Aggregator`] over it.
+///
+/// The guest exports three functions (accumulate/finalise are required; init is optional):
+///   (func (export "kaidb_agg_init"))                     ;; reset state (optional; a fresh
+///                                                        ;; instance already starts zeroed)
+///   (func (export "kaidb_agg_accumulate") (param i64))   ;; fold one row's value into state
+///   (func (export "kaidb_agg_finalize") (result i64))    ;; produce the group result
+/// `merge` (combining two partial states) is part of the design's triple but is only needed for
+/// parallel/partitioned aggregation; the single-threaded operator here folds serially, so it is a
+/// later addition. An aggregate module imports nothing: the value to fold is passed as a param.
+pub const WasmAggFn = struct {
+    alloc: std.mem.Allocator,
+    bytes: []u8,
+    module: zware.Module,
+    policy: Policy,
+
+    pub const INIT_ENTRY = "kaidb_agg_init";
+    pub const ACC_ENTRY = "kaidb_agg_accumulate";
+    pub const FIN_ENTRY = "kaidb_agg_finalize";
+
+    pub fn init(alloc: std.mem.Allocator, wasm_bytes: []const u8, policy: Policy) !WasmAggFn {
+        const owned = try alloc.dupe(u8, wasm_bytes);
+        errdefer alloc.free(owned);
+
+        var module = zware.Module.init(alloc, owned);
+        errdefer module.deinit();
+        try module.decode();
+
+        // An aggregate is self-contained: it folds a value passed as a parameter and keeps its
+        // own state, so it imports nothing. Reject any import (a clock, WASI, randomness, or the
+        // row ABI) at registration, exactly as a scalar UDF does.
+        for (module.imports.list.items) |_| return error.HostImportsNotAllowed;
+
+        // Both required exports must be present, so a bad module is a DDL error, not a surprise
+        // mid-aggregation.
+        _ = module.getExport(.Func, ACC_ENTRY) catch return error.MissingAggregateExport;
+        _ = module.getExport(.Func, FIN_ENTRY) catch return error.MissingAggregateExport;
+
+        return .{ .alloc = alloc, .bytes = owned, .module = module, .policy = policy };
+    }
+
+    pub fn deinit(self: *WasmAggFn) void {
+        self.module.deinit();
+        self.alloc.free(self.bytes);
+    }
+
+    /// Start a new aggregation over this module: a fresh persistent instance whose linear memory
+    /// and globals hold the running state. Call [`Aggregator.accumulate`] once per row and
+    /// [`Aggregator.finalize`] once at group end, then [`Aggregator.deinit`]. Heap-allocates the
+    /// store and instance so their addresses stay stable while the instance borrows the store.
+    pub fn newAggregator(self: *WasmAggFn) !*Aggregator {
+        const agg = try self.alloc.create(Aggregator);
+        errdefer self.alloc.destroy(agg);
+
+        agg.alloc = self.alloc;
+        agg.store = try self.alloc.create(zware.Store);
+        errdefer self.alloc.destroy(agg.store);
+        agg.store.* = zware.Store.init(self.alloc);
+        errdefer agg.store.deinit();
+
+        agg.instance = try self.alloc.create(zware.Instance);
+        errdefer self.alloc.destroy(agg.instance);
+        agg.instance.* = zware.Instance.init(self.alloc, agg.store, self.module);
+        try agg.instance.instantiate();
+        errdefer agg.instance.deinit();
+
+        agg.instance.fuel_budget = self.policy.fuel;
+        try agg.instance.limitMemoryPages(self.policy.memory_pages);
+
+        // Optional explicit reset. A fresh instance already starts with zeroed memory and
+        // globals, so a module that needs no custom initial state can omit `kaidb_agg_init`.
+        if (self.module.getExport(.Func, INIT_ENTRY)) |_| {
+            var no_in = [0]u64{};
+            var no_out = [0]u64{};
+            try agg.instance.invoke(INIT_ENTRY, no_in[0..], no_out[0..], .{});
+        } else |_| {}
+
+        return agg;
+    }
+};
+
+/// A live aggregation over a [`WasmAggFn`] for one group. Owns a persistent instance whose state
+/// survives between `accumulate` calls; `finalize` reads the group result. Each `accumulate`/
+/// `finalize` invoke gets a fresh fuel budget (a single row's fold cannot exhaust the whole
+/// aggregation's fuel), while the guest's accumulator state persists across them.
+pub const Aggregator = struct {
+    alloc: std.mem.Allocator,
+    store: *zware.Store,
+    instance: *zware.Instance,
+
+    /// Fold one row's (already type-coerced) i64 value into the running state.
+    pub fn accumulate(self: *Aggregator, value: i64) !void {
+        var in = [1]u64{@bitCast(value)};
+        var no_out = [0]u64{};
+        try self.instance.invoke(WasmAggFn.ACC_ENTRY, in[0..], no_out[0..], .{});
+    }
+
+    /// Produce the group's result from the accumulated state.
+    pub fn finalize(self: *Aggregator) !i64 {
+        var no_in = [0]u64{};
+        var out = [1]u64{0};
+        try self.instance.invoke(WasmAggFn.FIN_ENTRY, no_in[0..], out[0..], .{});
+        return @bitCast(out[0]);
+    }
+
+    pub fn deinit(self: *Aggregator) void {
+        self.instance.deinit();
+        self.alloc.destroy(self.instance);
+        self.store.deinit();
+        self.alloc.destroy(self.store);
+        self.alloc.destroy(self);
+    }
+};

@@ -6698,3 +6698,84 @@ test "wasm generated column via SQL: computed at insert, stored durably, survive
         try std.testing.expectEqualStrings("100", v50);
     }
 }
+
+test "wasm custom aggregate via SQL: CREATE AGGREGATE + SELECT AGG(col), with GROUP BY (M5)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_wasm_agg.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+    defer Io.Dir.deleteTree(.cwd(), io, "udf") catch {};
+
+    const Database = @import("schema.zig").Database;
+    var db = try Database.open(allocator, io, db_path, 64, null);
+    defer db.close();
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+    var exec = QueryExecutor.init(allocator, db);
+    defer exec.deinit();
+
+    const run = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+        fn oneCell(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) ![]const u8 {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+            try std.testing.expectEqual(@as(usize, 1), res.rows.len);
+            return a.dupe(u8, res.rows[0][0]);
+        }
+    };
+
+    // MYSUM sums its argument column across the group's rows via a persistent guest instance.
+    const wasm = @embedFile("wasm/testdata_agg_sum.wasm");
+    const hex = comptime std.fmt.bytesToHex(wasm, .lower);
+    try run.q(&exec, allocator, "CREATE AGGREGATE MYSUM LANGUAGE wasm AS '" ++ hex ++ "'");
+    try run.q(&exec, allocator, "CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT)");
+    try run.q(&exec, allocator, "INSERT INTO t (id, g, v) VALUES (1, 1, 10)");
+    try run.q(&exec, allocator, "INSERT INTO t (id, g, v) VALUES (2, 1, 20)");
+    try run.q(&exec, allocator, "INSERT INTO t (id, g, v) VALUES (3, 1, 12)");
+    try run.q(&exec, allocator, "INSERT INTO t (id, g, v) VALUES (4, 2, 100)");
+
+    // Whole-table aggregate (single group, no GROUP BY): 10 + 20 + 12 + 100 = 142.
+    const total = try run.oneCell(&exec, allocator, "SELECT MYSUM(v) FROM t");
+    defer allocator.free(total);
+    try std.testing.expectEqualStrings("142", total);
+
+    // Case-insensitive call name resolves to the registered aggregate.
+    const total2 = try run.oneCell(&exec, allocator, "SELECT mysum(v) FROM t");
+    defer allocator.free(total2);
+    try std.testing.expectEqualStrings("142", total2);
+
+    // Per-group aggregation: group 1 sums to 42, group 2 to 100; each group has its own
+    // independent guest state, proving state does not leak across groups.
+    {
+        const res = try exec.execute(.{ .sql = "SELECT g, MYSUM(v) FROM t GROUP BY g" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+        try std.testing.expectEqual(@as(usize, 2), res.rows.len);
+        var seen_g1 = false;
+        var seen_g2 = false;
+        for (res.rows) |r| {
+            if (std.mem.eql(u8, r[0], "1")) {
+                try std.testing.expectEqualStrings("42", r[1]);
+                seen_g1 = true;
+            } else if (std.mem.eql(u8, r[0], "2")) {
+                try std.testing.expectEqualStrings("100", r[1]);
+                seen_g2 = true;
+            }
+        }
+        try std.testing.expect(seen_g1 and seen_g2);
+    }
+
+    // DROP unregisters it; the now-unknown aggregate name resolves to nothing, so the result is
+    // NULL (mirroring an unknown scalar UDF after DROP FUNCTION).
+    try run.q(&exec, allocator, "DROP AGGREGATE MYSUM");
+    const after = try run.oneCell(&exec, allocator, "SELECT MYSUM(v) FROM t");
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("NULL", after);
+}

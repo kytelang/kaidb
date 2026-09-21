@@ -761,13 +761,33 @@ pub const Parser = struct {
             } else if (tok.type == .IDENTIFIER) {
                 self.eat();
                 var name = self.sliceText(tok);
-                if (self.current().type == .DOT) {
+                if (self.current().type == .LPAREN) {
+                    // `ident(col)` in a projection is a custom wasm aggregate (embed-wasm.md M5):
+                    // kaidb has no scalar-expression projections, so a function call here can only
+                    // be a registered aggregate. The executor resolves `name` in the wasm-aggregate
+                    // registry; an unknown name is a run-time error, not a parse error.
                     self.eat();
-                    const col_tok = try self.expect(.IDENTIFIER);
-                    const col_name = self.sliceText(col_tok);
-                    name = try std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ name, col_name });
+                    const arg_tok = try self.expect(.IDENTIFIER);
+                    var arg_name = self.sliceText(arg_tok);
+                    if (self.current().type == .DOT) {
+                        self.eat();
+                        const c2 = try self.expect(.IDENTIFIER);
+                        arg_name = try std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ arg_name, self.sliceText(c2) });
+                    }
+                    _ = try self.expect(.RPAREN);
+                    // Upper-case the aggregate name to match the registry key (CREATE AGGREGATE
+                    // registers under the upper-cased name), so the call is case-insensitive.
+                    const uname = try std.ascii.allocUpperString(self.arena.allocator(), name);
+                    expr = .{ .aggregate = .{ .kind = .WASM, .wasm_name = uname, .argument = .{ .column = arg_name } } };
+                } else {
+                    if (self.current().type == .DOT) {
+                        self.eat();
+                        const col_tok = try self.expect(.IDENTIFIER);
+                        const col_name = self.sliceText(col_tok);
+                        name = try std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ name, col_name });
+                    }
+                    expr = .{ .column = name };
                 }
-                expr = .{ .column = name };
             } else {
                 return error.ExpectedColumn;
             }
@@ -1069,13 +1089,31 @@ pub const Parser = struct {
             },
             .USER => try self.parseCreateUser(),
             .ROLE => try self.parseCreateRole(),
-            // FUNCTION is not a reserved keyword, so it arrives as an identifier.
+            // FUNCTION and AGGREGATE are not reserved keywords, so they arrive as identifiers.
             else => {
                 if (tok.type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(tok), "FUNCTION"))
                     return try self.parseCreateFunction();
+                if (tok.type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(tok), "AGGREGATE"))
+                    return try self.parseCreateAggregate();
                 return error.UnexpectedToken;
             },
         };
+    }
+
+    /// Parses `CREATE AGGREGATE name [LANGUAGE wasm] AS '<hex>'` (embed-wasm.md M5). The wasm
+    /// module (exporting accumulate/finalise) is given inline as a hex string literal.
+    fn parseCreateAggregate(self: *Parser) !ast.Statement {
+        self.eat(); // AGGREGATE
+        const name_tok = try self.expect(.IDENTIFIER);
+        const name = self.sliceText(name_tok);
+        if (self.current().type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(self.current()), "LANGUAGE")) {
+            self.eat(); // LANGUAGE
+            self.eat(); // the language name (e.g. wasm)
+        }
+        _ = try self.expect(.AS);
+        const bytes_tok = try self.expect(.STRING);
+        const wasm_hex = self.cleanString(self.sliceText(bytes_tok));
+        return .{ .create_aggregate = .{ .name = name, .wasm_hex = wasm_hex } };
     }
 
     /// Parses `CREATE FUNCTION name [LANGUAGE <lang>] AS '<hex>'` (embed-wasm.md M1). The
@@ -1140,12 +1178,17 @@ pub const Parser = struct {
                 const user_tok = try self.expect(.IDENTIFIER);
                 return .{ .drop_user = .{ .username = self.sliceText(user_tok) } };
             },
-            // FUNCTION is not a reserved keyword; it arrives as an identifier.
+            // FUNCTION and AGGREGATE are not reserved keywords; they arrive as identifiers.
             else => {
                 if (tok.type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(tok), "FUNCTION")) {
                     self.eat(); // FUNCTION
                     const fn_tok = try self.expect(.IDENTIFIER);
                     return .{ .drop_function = .{ .name = self.sliceText(fn_tok) } };
+                }
+                if (tok.type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(tok), "AGGREGATE")) {
+                    self.eat(); // AGGREGATE
+                    const ag_tok = try self.expect(.IDENTIFIER);
+                    return .{ .drop_aggregate = .{ .name = self.sliceText(ag_tok) } };
                 }
                 return error.UnexpectedToken;
             },

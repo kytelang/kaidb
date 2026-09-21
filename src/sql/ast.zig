@@ -67,6 +67,10 @@ pub const Statement = union(enum) {
     create_function: CreateFunctionStmt,
     /// A `DROP FUNCTION name`.
     drop_function: DropFunctionStmt,
+    /// A `CREATE AGGREGATE ... LANGUAGE wasm AS '<hex>'` (embed-wasm.md M5).
+    create_aggregate: CreateAggregateStmt,
+    /// A `DROP AGGREGATE name`.
+    drop_aggregate: DropAggregateStmt,
     /// A `DROP TABLE`. See [`DropTableStmt`].
     drop_table: DropTableStmt,
     /// A `DROP INDEX`. See [`DropIndexStmt`].
@@ -435,6 +439,20 @@ pub const DropFunctionStmt = struct {
     name: []const u8,
 };
 
+/// A `CREATE AGGREGATE name [LANGUAGE wasm] AS '<hex>'` (embed-wasm.md M5): registers a custom
+/// aggregate whose wasm module exports accumulate/finalise.
+pub const CreateAggregateStmt = struct {
+    /// The aggregate name (upper-cased by the executor to match call sites).
+    name: []const u8,
+    /// The wasm module bytes as a hex string (borrowed from the SQL text).
+    wasm_hex: []const u8,
+};
+
+/// `DROP AGGREGATE name` unregisters a wasm aggregate.
+pub const DropAggregateStmt = struct {
+    name: []const u8,
+};
+
 /// A `DROP INDEX` statement.
 ///
 /// Both names are kept because an index name is only unique within its table, so
@@ -494,7 +512,11 @@ pub const Projection = struct {
 };
 
 /// The aggregate functions the `SELECT` list understands, backed by `u8`.
-pub const AggregateKind = enum(u8) { COUNT, AVG, MIN, MAX, SUM };
+///
+/// `WASM` is a custom aggregate backed by a registered wasm module (embed-wasm.md M5); the
+/// module name is carried in [`AggregateCall.wasm_name`]. The built-in five keep their fixed
+/// tags so persisted or wire-encoded plans are unaffected.
+pub const AggregateKind = enum(u8) { COUNT, AVG, MIN, MAX, SUM, WASM };
 
 /// The three shapes a projection can take in the `SELECT` list.
 ///
@@ -519,6 +541,9 @@ pub const AggregateCall = struct {
     distinct: bool = false,
     /// What the aggregate is applied to. See [`AggregateArg`].
     argument: AggregateArg,
+    /// For a custom wasm aggregate (`kind == .WASM`, embed-wasm.md M5), the registered
+    /// aggregate module's name, e.g. `MYSUM` in `SELECT MYSUM(x) FROM t`. `null` for a built-in.
+    wasm_name: ?[]const u8 = null,
 };
 
 /// The argument to an [`AggregateCall`].

@@ -87,6 +87,7 @@ const Lexer = @import("../sql/lexer.zig").Lexer;
 const OpKind = @import("../common/common.zig").OpKind;
 const hexEncode = @import("../concurrency/security.zig").hexEncode;
 const query_iter = @import("iterator.zig");
+const wasm_udf = @import("../wasm/udf.zig");
 const oidmap = @import("../proto/oidmap.zig");
 
 /// Owned text render of an evaluator scalar, matching the former all-text row
@@ -518,6 +519,10 @@ const AggAcc = struct {
     saw_value: bool = false,
     /// Set of already-seen values for COUNT(DISTINCT ...); allocated lazily.
     distinct_seen: ?std.StringHashMap(void) = null,
+    /// For a custom wasm aggregate (`kind == .WASM`, embed-wasm.md M5), the live per-group
+    /// aggregator whose guest state persists across the group's rows. Created lazily on the
+    /// first fold for this group and finalised in `formatAggregate`; freed with the group.
+    wasm_agg: ?*wasm_udf.Aggregator = null,
 };
 
 /// The per-group state for a GROUP BY query.
@@ -588,6 +593,10 @@ fn aggNumericValue(kind: ast.AggregateKind, acc: AggAcc) f64 {
         .AVG => if (acc.num_seen == 0) 0 else acc.sum / @as(f64, @floatFromInt(acc.num_seen)),
         .MIN => acc.min_num,
         .MAX => acc.max_num,
+        // A wasm aggregate's result is only known after finalise (a stateful guest call), which
+        // HAVING's pure float read cannot perform here; wasm aggregates in HAVING are a later
+        // slice. Treat as 0 for the numeric read.
+        .WASM => 0,
     };
 }
 
@@ -2032,6 +2041,21 @@ pub const QueryExecutor = struct {
                 try self.fmtNumeric(acc.max_num, acc.all_int)
             else
                 try self.allocator.dupe(u8, acc.max_str orelse "NULL"),
+            // Custom wasm aggregate (embed-wasm.md M5): finalise the group's guest state.
+            .WASM => blk: {
+                if (acc.wasm_agg) |aggr| {
+                    const v = aggr.finalize() catch break :blk try self.allocator.dupe(u8, "NULL");
+                    break :blk try std.fmt.allocPrint(self.allocator, "{d}", .{v});
+                }
+                // No rows folded (an empty group): finalise a fresh instance so the aggregate's
+                // identity value (for example 0 for a sum) is still produced.
+                const name = agg.wasm_name orelse break :blk try self.allocator.dupe(u8, "NULL");
+                const wfn = self.db.wasm_aggregates.get(name) orelse break :blk try self.allocator.dupe(u8, "NULL");
+                var aggr = wfn.newAggregator() catch break :blk try self.allocator.dupe(u8, "NULL");
+                defer aggr.deinit();
+                const v = aggr.finalize() catch break :blk try self.allocator.dupe(u8, "NULL");
+                break :blk try std.fmt.allocPrint(self.allocator, "{d}", .{v});
+            },
         };
     }
 
@@ -2052,6 +2076,8 @@ pub const QueryExecutor = struct {
                     .column => |c| self.lookupColumnType(sel, c) orelse .TEXT,
                     else => .TEXT,
                 },
+                // A custom wasm aggregate returns an i64 (embed-wasm.md M5).
+                .WASM => .INT64,
             },
             else => .TEXT,
         };
@@ -2374,6 +2400,7 @@ pub const QueryExecutor = struct {
                 .AVG => "AVG",
                 .MIN => "MIN",
                 .MAX => "MAX",
+                .WASM => agg.wasm_name orelse "AGG",
             });
             col_types[i] = self.projectionType(sel, p);
             cells[i] = try self.formatAggregate(agg, accs[i]);
@@ -2507,6 +2534,7 @@ pub const QueryExecutor = struct {
                 .AVG => "AVG",
                 .MIN => "MIN",
                 .MAX => "MAX",
+                .WASM => agg.wasm_name orelse "AGG",
             });
             col_types[i] = self.projectionType(sel, p);
             cells[i] = try self.formatAggregate(agg, accs[i]);
@@ -2774,6 +2802,12 @@ pub const QueryExecutor = struct {
         if (sel.joins.len != 0) return null;
         const gb = sel.group_by orelse return null;
         if (gb.len != 1 or sel.projections.len == 0) return null;
+        // A custom wasm aggregate (embed-wasm.md M5) folds real rows through a stateful guest, so
+        // it cannot be answered from index summaries: fall back to the hash GROUP BY over the base
+        // scan, which folds each row via `foldOneAgg`.
+        for (sel.projections) |p| {
+            if (p.expr == .aggregate and p.expr.aggregate.kind == .WASM) return null;
+        }
         // WHERE is allowed only when it is a plain range on the group column (the
         // index lead), so the whole predicate is captured by the scanned index
         // range and this fast path stays index-only (e.g.
@@ -2937,6 +2971,7 @@ pub const QueryExecutor = struct {
                     .AVG => "AVG",
                     .MIN => "MIN",
                     .MAX => "MAX",
+                    .WASM => agg.wasm_name orelse "AGG",
                 },
                 else => "?",
             });
@@ -4541,6 +4576,7 @@ pub const QueryExecutor = struct {
                             .MIN => "MIN",
                             .MAX => "MAX",
                             .AVG => "AVG",
+                            .WASM => agg.wasm_name orelse "AGG",
                         },
                     };
                     if (proj.alias) |alias| {
@@ -4575,6 +4611,17 @@ pub const QueryExecutor = struct {
                     const ga = g_arena.allocator();
 
                     var groups = std.StringHashMap(GroupAcc).init(ga);
+                    // A custom wasm aggregate keeps a heap-allocated per-group [`Aggregator`]
+                    // (its guest instance), which the group arena does not own. Free every one
+                    // before the arena drops the `AggAcc` structs that point at them. This defer
+                    // is declared after `g_arena`'s, so it runs first, while the map is still live.
+                    defer {
+                        var git = groups.iterator();
+                        while (git.next()) |kv| {
+                            for (kv.value_ptr.aggs) |a| if (a.wasm_agg) |aggr| aggr.deinit();
+                            for (kv.value_ptr.hv) |a| if (a.wasm_agg) |aggr| aggr.deinit();
+                        }
+                    }
                     var group_order = std.ArrayList([]const u8).empty;
 
                     var hv_specs = std.ArrayList(ast.AggregateCall).empty;
@@ -5655,6 +5702,32 @@ pub const QueryExecutor = struct {
                 self.db.removeWasmFunction(upper);
                 return QueryResponse{ .rows_affected = 1 };
             },
+            .create_aggregate => |ca| {
+                // Register a custom wasm aggregate (embed-wasm.md M5). Same inline-hex module form
+                // as CREATE FUNCTION; the module must export accumulate/finalise (validated at
+                // registration). Upper-cased so `SELECT NAME(col)` call sites match.
+                const hex = ca.wasm_hex;
+                if (hex.len % 2 != 0)
+                    return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CREATE AGGREGATE: odd-length hex module") };
+                const bytes = try self.allocator.alloc(u8, hex.len / 2);
+                defer self.allocator.free(bytes);
+                _ = std.fmt.hexToBytes(bytes, hex) catch
+                    return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CREATE AGGREGATE: invalid hex module") };
+                const upper = try std.ascii.allocUpperString(self.allocator, ca.name);
+                defer self.allocator.free(upper);
+                self.db.wasm_aggregates.register(upper, bytes, .{}) catch
+                    return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CREATE AGGREGATE: module failed to decode, validate, or is missing accumulate/finalise") };
+                self.db.persistWasmAggregate(upper, bytes) catch |err|
+                    std.log.warn("CREATE AGGREGATE {s}: persistence failed: {any}", .{ upper, err });
+                return QueryResponse{ .rows_affected = 1 };
+            },
+            .drop_aggregate => |da| {
+                const upper = try std.ascii.allocUpperString(self.allocator, da.name);
+                defer self.allocator.free(upper);
+                _ = self.db.wasm_aggregates.drop(upper);
+                self.db.removeWasmAggregate(upper);
+                return QueryResponse{ .rows_affected = 1 };
+            },
             .drop_table => |dt| {
                 try self.db.dropTable(dt.table_name, self.current_tx_id.?);
                 return QueryResponse{ .rows_affected = 1 };
@@ -6291,7 +6364,33 @@ pub const QueryExecutor = struct {
     /// columns. `ga` is the group arena that owns any duped strings. Reads the
     /// column value out of the streaming [`query_iter.Row`].
     fn foldOneAgg(self: *QueryExecutor, acc: *AggAcc, agg: ast.AggregateCall, row: query_iter.Row, ga: std.mem.Allocator) !void {
-        _ = self;
+        if (agg.kind == .WASM) {
+            // Custom wasm aggregate (embed-wasm.md M5): read the argument column, coerce it to
+            // i64, and fold it into this group's persistent guest state. The aggregator is created
+            // on the first fold for the group (its guest memory/globals then carry the running
+            // state across subsequent rows) and finalised in `formatAggregate`.
+            const col = switch (agg.argument) {
+                .column => |c| c,
+                else => return,
+            };
+            const v = query_iter.getVal(&ast.Expr{ .column_ref = col }, row) orelse return;
+            if (v == .null) return;
+            if (acc.wasm_agg == null) {
+                const name = agg.wasm_name orelse return;
+                const wfn = self.db.wasm_aggregates.get(name) orelse return;
+                acc.wasm_agg = try wfn.newAggregator();
+            }
+            const iv: i64 = switch (v) {
+                .integer => |x| x,
+                .float => |x| std.math.lossyCast(i64, x),
+                .bool => |b| @intFromBool(b),
+                .string => |s| std.fmt.parseInt(i64, s, 10) catch std.math.lossyCast(i64, std.fmt.parseFloat(f64, s) catch 0),
+                .null => return,
+            };
+            try acc.wasm_agg.?.accumulate(iv);
+            acc.saw_value = true;
+            return;
+        }
         if (agg.kind == .COUNT) {
             switch (agg.argument) {
                 .column => |col| {

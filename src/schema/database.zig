@@ -125,6 +125,7 @@ const GroupLock = @import("utils").sync.GroupLock;
 /// Tracks active and committed transaction ids and hands out new ones.
 const TransactionManager = @import("../concurrency/transaction.zig").TransactionManager;
 const WasmRegistry = @import("../wasm/registry.zig").Registry;
+const WasmAggRegistry = @import("../wasm/registry.zig").AggRegistry;
 /// The write-ahead log; durability and the source stream for replication.
 const WriteAheadLog = @import("../durability/write_ahead_log.zig").WriteAheadLog;
 
@@ -230,6 +231,10 @@ pub const Database = struct {
     /// `WHERE fn(col) = ...` resolves registered functions. In-memory; WAL-backed persistence
     /// of the source bytes is a later slice.
     wasm_functions: WasmRegistry,
+    /// Registry of custom wasm aggregates registered with `CREATE AGGREGATE ... LANGUAGE wasm`
+    /// (embed-wasm.md M5). The aggregate operator spins a per-group instance from this. In-memory;
+    /// file-backed persistence mirrors the scalar registry (see [`Database.loadWasmFunctions`]).
+    wasm_aggregates: WasmAggRegistry,
     /// Object name → root page id for every table, including `sys.*` tables.
     /// Keys are owned (duped) copies freed on teardown.
     table_roots: std.StringHashMap(u64),
@@ -376,6 +381,7 @@ pub const Database = struct {
             .master_tree = undefined,
             .catalog = catalog.SystemCatalog.init(allocator),
             .wasm_functions = WasmRegistry.init(allocator),
+            .wasm_aggregates = WasmAggRegistry.init(allocator),
             .table_roots = std.StringHashMap(u64).init(allocator),
             .index_roots = std.StringHashMap(u64).init(allocator),
             .table_trees = std.StringHashMap(*BPlusTree).init(allocator),
@@ -690,6 +696,30 @@ pub const Database = struct {
         }
     }
 
+    /// Persist a wasm aggregate module so it survives a restart (embed-wasm.md M5). Mirrors
+    /// [`persistWasmFunction`], writing a `.wagg` file into the same `udf` directory.
+    pub fn persistWasmAggregate(self: *Database, name: []const u8, bytes: []const u8) !void {
+        if (self.base_dir.len == 0) return;
+        const io = self.pool.pager.io;
+        var dbuf: [512]u8 = undefined;
+        const dir = try std.fmt.bufPrint(&dbuf, "{s}/udf", .{self.base_dir});
+        std.Io.Dir.createDirPath(.cwd(), io, dir) catch {};
+        var pbuf: [700]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pbuf, "{s}/{s}.wagg", .{ dir, name });
+        const f = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, bytes);
+    }
+
+    /// Remove a persisted wasm aggregate module (best-effort).
+    pub fn removeWasmAggregate(self: *Database, name: []const u8) void {
+        if (self.base_dir.len == 0) return;
+        const io = self.pool.pager.io;
+        var pbuf: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pbuf, "{s}/udf/{s}.wagg", .{ self.base_dir, name }) catch return;
+        std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
+    }
+
     /// Reload persisted wasm UDFs into the registry on open (called after loadCatalog). A
     /// missing directory means none were registered; a bad module file is skipped, not fatal.
     /// The `.twasm`/`.wasm` extension restores whether the UDF returns text.
@@ -705,9 +735,14 @@ pub const Database = struct {
             if (entry.kind != .file) continue;
             var returns_string = false;
             var stem: []const u8 = undefined;
+            var is_agg = false;
             if (std.mem.endsWith(u8, entry.name, ".twasm")) {
                 returns_string = true;
                 stem = entry.name[0 .. entry.name.len - ".twasm".len];
+            } else if (std.mem.endsWith(u8, entry.name, ".wagg")) {
+                // A custom wasm aggregate (embed-wasm.md M5); restore into the aggregate registry.
+                is_agg = true;
+                stem = entry.name[0 .. entry.name.len - ".wagg".len];
             } else if (std.mem.endsWith(u8, entry.name, ".wasm")) {
                 stem = entry.name[0 .. entry.name.len - ".wasm".len];
             } else continue;
@@ -715,7 +750,11 @@ pub const Database = struct {
             const path = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir, entry.name }) catch continue;
             const bytes = std.Io.Dir.readFileAlloc(.cwd(), io, path, self.allocator, .unlimited) catch continue;
             defer self.allocator.free(bytes);
-            self.wasm_functions.register(stem, bytes, .{}, returns_string) catch continue;
+            if (is_agg) {
+                self.wasm_aggregates.register(stem, bytes, .{}) catch continue;
+            } else {
+                self.wasm_functions.register(stem, bytes, .{}, returns_string) catch continue;
+            }
         }
     }
 
@@ -781,6 +820,7 @@ pub const Database = struct {
 
         self.master_tree.deinit();
         self.wasm_functions.deinit();
+        self.wasm_aggregates.deinit();
         self.catalog.deinit();
         var table_it = self.table_roots.keyIterator();
         while (table_it.next()) |k| {
