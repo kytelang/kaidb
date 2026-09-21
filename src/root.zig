@@ -6349,3 +6349,54 @@ test "ISOLATION: REPEATABLE READ freezes a snapshot; READ COMMITTED sees concurr
         try std.testing.expect(r.error_message == null);
     }
 }
+
+test "wasm UDF via SQL: CREATE FUNCTION + WHERE fn(col), then DROP FUNCTION" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_wasm_udf_ddl.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+
+    const Database = @import("schema.zig").Database;
+    var db = try Database.open(allocator, io, db_path, 64, null);
+    defer db.close();
+
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+    var exec = QueryExecutor.init(allocator, db);
+    defer exec.deinit();
+
+    const run = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+        fn count(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !usize {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+            return res.rows.len;
+        }
+    };
+
+    // The UDF module (exports kaidb_udf: doubles its i64 argument), inlined as hex.
+    const wasm = @embedFile("query/testdata_udf.wasm");
+    const hex = comptime std.fmt.bytesToHex(wasm, .lower);
+    const create_sql = "CREATE FUNCTION DBL LANGUAGE wasm AS '" ++ hex ++ "'";
+
+    try run.q(&exec, allocator, create_sql);
+    try run.q(&exec, allocator, "CREATE TABLE t (x INT PRIMARY KEY)");
+    try run.q(&exec, allocator, "INSERT INTO t (x) VALUES (21)");
+    try run.q(&exec, allocator, "INSERT INTO t (x) VALUES (42)");
+
+    // DBL(x) = 42 holds only for x = 21, so the wasm predicate selects exactly one row.
+    try std.testing.expectEqual(@as(usize, 1), try run.count(&exec, allocator, "SELECT x FROM t WHERE DBL(x) = 42"));
+    // Sanity: without the UDF match, a plain predicate still works.
+    try std.testing.expectEqual(@as(usize, 2), try run.count(&exec, allocator, "SELECT x FROM t"));
+
+    // DROP FUNCTION unregisters it; the now-unknown name yields NULL, excluding all rows.
+    try run.q(&exec, allocator, "DROP FUNCTION DBL");
+    try std.testing.expectEqual(@as(usize, 0), try run.count(&exec, allocator, "SELECT x FROM t WHERE DBL(x) = 42"));
+}

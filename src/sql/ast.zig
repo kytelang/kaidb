@@ -63,6 +63,10 @@ pub const Statement = union(enum) {
     /// A standalone `CREATE`/`ADD` foreign-key constraint. See
     /// [`CreateForeignKeyStmt`].
     create_foreign_key: CreateForeignKeyStmt,
+    /// A `CREATE FUNCTION ... LANGUAGE wasm AS '<hex>'` (embed-wasm.md M1).
+    create_function: CreateFunctionStmt,
+    /// A `DROP FUNCTION name`.
+    drop_function: DropFunctionStmt,
     /// A `DROP TABLE`. See [`DropTableStmt`].
     drop_table: DropTableStmt,
     /// A `DROP INDEX`. See [`DropIndexStmt`].
@@ -408,6 +412,20 @@ pub const CreateIndexStmt = struct {
 pub const DropTableStmt = struct {
     /// The table to drop.
     table_name: []const u8,
+};
+
+/// `CREATE FUNCTION name [LANGUAGE wasm] AS '<hex>'` registers a wasm scalar UDF
+/// (embed-wasm.md M1). The module bytes are given inline as a hex string literal.
+pub const CreateFunctionStmt = struct {
+    /// The SQL function name (upper-cased by the executor to match call sites).
+    name: []const u8,
+    /// The wasm module bytes as a hex string (borrowed from the SQL text).
+    wasm_hex: []const u8,
+};
+
+/// `DROP FUNCTION name` unregisters a wasm scalar UDF.
+pub const DropFunctionStmt = struct {
+    name: []const u8,
 };
 
 /// A `DROP INDEX` statement.

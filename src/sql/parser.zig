@@ -1049,8 +1049,30 @@ pub const Parser = struct {
             },
             .USER => try self.parseCreateUser(),
             .ROLE => try self.parseCreateRole(),
-            else => error.UnexpectedToken,
+            // FUNCTION is not a reserved keyword, so it arrives as an identifier.
+            else => {
+                if (tok.type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(tok), "FUNCTION"))
+                    return try self.parseCreateFunction();
+                return error.UnexpectedToken;
+            },
         };
+    }
+
+    /// Parses `CREATE FUNCTION name [LANGUAGE <lang>] AS '<hex>'` (embed-wasm.md M1). The
+    /// wasm module bytes are given inline as a hex string literal. The optional
+    /// `LANGUAGE wasm` clause is accepted and ignored (wasm is the only language).
+    fn parseCreateFunction(self: *Parser) !ast.Statement {
+        self.eat(); // FUNCTION
+        const name_tok = try self.expect(.IDENTIFIER);
+        const name = self.sliceText(name_tok);
+        if (self.current().type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(self.current()), "LANGUAGE")) {
+            self.eat(); // LANGUAGE
+            self.eat(); // the language name (e.g. wasm)
+        }
+        _ = try self.expect(.AS);
+        const bytes_tok = try self.expect(.STRING);
+        const wasm_hex = self.cleanString(self.sliceText(bytes_tok));
+        return .{ .create_function = .{ .name = name, .wasm_hex = wasm_hex } };
     }
 
     /// Dispatches `DROP ...` to the matching object parser.
@@ -1088,7 +1110,15 @@ pub const Parser = struct {
                 const user_tok = try self.expect(.IDENTIFIER);
                 return .{ .drop_user = .{ .username = self.sliceText(user_tok) } };
             },
-            else => error.UnexpectedToken,
+            // FUNCTION is not a reserved keyword; it arrives as an identifier.
+            else => {
+                if (tok.type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(tok), "FUNCTION")) {
+                    self.eat(); // FUNCTION
+                    const fn_tok = try self.expect(.IDENTIFIER);
+                    return .{ .drop_function = .{ .name = self.sliceText(fn_tok) } };
+                }
+                return error.UnexpectedToken;
+            },
         };
     }
 

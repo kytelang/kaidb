@@ -890,10 +890,18 @@ Test and hardening plan:
   path, with an unregistered name falling through to the built-ins. This is the tractable
   filter-pushdown path (`WHERE fn(col) = ...`); scalar projections (`SELECT fn(col)`) still need
   the separate scalar-projection SQL feature (section 10.1).
-  _Remaining for M1:_ set `active_wasm_registry` from a `Database`-owned `Registry` and add the
-  `CREATE FUNCTION ... LANGUAGE wasm` / `DROP FUNCTION` DDL and catalog persistence, so a UDF is
-  reachable from SQL text rather than a programmatically-set registry; then an optional
-  wall-clock deadline backstop and output-size cap, the
+  _Reachable from SQL text: done._ `Database` owns the `Registry` (`wasm_functions`), the
+  executor points the eval hook at it, and the `CREATE FUNCTION name [LANGUAGE wasm] AS '<hex>'`
+  / `DROP FUNCTION name` DDL registers and drops UDFs (new `ast.Statement` variants, parser
+  dispatch on the non-reserved `FUNCTION` identifier, executor handlers that hex-decode the
+  inline module and register under the upper-cased name). An end-to-end test in the kaidb suite
+  proves the whole path from SQL text: `CREATE FUNCTION DBL LANGUAGE wasm AS '<hex>'`, then
+  `SELECT x FROM t WHERE DBL(x) = 42` returns exactly the one row (`x = 21`) via the wasm
+  predicate evaluated per row through the real executor, then `DROP FUNCTION DBL` makes the same
+  query return no rows. **Filter pushdown with a wasm UDF now works from SQL.**
+  _Remaining for M1:_ WAL-backed persistence of the registered module bytes (so UDFs survive
+  restart, currently in-memory), a concurrent-DDL latch on the registry, an optional wall-clock
+  deadline backstop and output-size cap, the
   push-model frame codec on `src/proto/wire.zig` for variable-length (string/bytes) arguments,
   and the `CREATE FUNCTION ... LANGUAGE wasm` / `SELECT fn(col)` wiring into kaidb's lexer,
   parser, catalog, and executor (the larger SQL-surface slice). Demo target: a Kyte function

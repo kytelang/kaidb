@@ -5623,6 +5623,31 @@ pub const QueryExecutor = struct {
                 if (rows_deleted > 0) try self.db.markTableIndexesInexact(table_meta.id);
                 return QueryResponse{ .rows_affected = rows_deleted };
             },
+            .create_function => |cf| {
+                // Register a wasm scalar UDF (embed-wasm.md M1). The module is given inline as
+                // hex; decode it and register under the UPPER-cased name, because call sites
+                // (func_call) upper-case function names, so the registry key must match.
+                // (Registration mutates db.wasm_functions; a concurrent-DDL latch is a
+                // follow-up, as with the source-byte persistence.)
+                const hex = cf.wasm_hex;
+                if (hex.len % 2 != 0)
+                    return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CREATE FUNCTION: odd-length hex module") };
+                const bytes = try self.allocator.alloc(u8, hex.len / 2);
+                defer self.allocator.free(bytes);
+                _ = std.fmt.hexToBytes(bytes, hex) catch
+                    return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CREATE FUNCTION: invalid hex module") };
+                const upper = try std.ascii.allocUpperString(self.allocator, cf.name);
+                defer self.allocator.free(upper);
+                self.db.wasm_functions.register(upper, bytes, .{}) catch
+                    return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CREATE FUNCTION: module failed to decode or validate") };
+                return QueryResponse{ .rows_affected = 1 };
+            },
+            .drop_function => |df| {
+                const upper = try std.ascii.allocUpperString(self.allocator, df.name);
+                defer self.allocator.free(upper);
+                _ = self.db.wasm_functions.drop(upper);
+                return QueryResponse{ .rows_affected = 1 };
+            },
             .drop_table => |dt| {
                 try self.db.dropTable(dt.table_name, self.current_tx_id.?);
                 return QueryResponse{ .rows_affected = 1 };
