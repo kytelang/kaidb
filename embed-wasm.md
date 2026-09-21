@@ -452,15 +452,22 @@ reuse across every query and every restart.
 - **Computed columns and wasm-keyed indexes** build on the scalar path plus the persistence
   in section 9.
 
-### 10.1 Integration seam (found during M1, shrinks the SQL slice)
+### 10.1 Integration seam (found during M1)
 
-Reconnaissance of kaidb's SQL layer turned up a shortcut that removes most of the anticipated
-parser work for the scalar path:
+Reconnaissance of kaidb's SQL layer produced one correction and one genuine shortcut:
 
-- **No parser change is needed for `SELECT fn(col)`.** kaidb's grammar already parses any
-  `NAME(args)` call into an `ast.FuncCall` (`src/sql/ast.zig`, the `func_call` variant), the
-  same node used by the built-in `UPPER`/`LOWER`/`ABS`/`COALESCE` scalars. A registered wasm
-  function is just another name in that position.
+- **Correction: kaidb has no scalar-expression projections.** `ast.ProjectionExpr` has only
+  three variants, `column`, `star`, and `aggregate`. So `SELECT UPPER(col)` is not supported
+  today at all: `func_call` appears only in `WHERE`/`HAVING` predicates and aggregate
+  arguments, never as a projected output column. Adding `SELECT fn(col)` therefore means first
+  adding general scalar-expression projections to kaidb (a new `ProjectionExpr` variant, parser
+  support, and handling in every projection drain), a real SQL feature, before any wasm hook.
+- **Shortcut: the WHERE/filter predicate path already funnels through the one choke point.**
+  A predicate like `WHERE fn(col) = 1` parses `fn(col)` into `ast.FuncCall`, and predicate
+  evaluation runs `evalExpr` to `eval3` to `evalScalar` to `evalFunc` in `src/query/iterator.zig`.
+  `evalFunc` is the single place built-in scalars are dispatched. So the tractable first UDF
+  integration is **filter pushdown** (design section 10, item 2), not projection: hook
+  `evalFunc` once, no parser change, no projection-drain surgery.
 - **The single evaluation hook is `evalFunc(fc, ctx)` in `src/query/iterator.zig`.** That
   function dispatches built-in scalar functions by name and returns a `Scalar` value
   (`.integer` / `.float` / `.string`). The wasm path is a check at the top of `evalFunc`: if
@@ -872,7 +879,21 @@ Test and hardening plan:
   (so a re-`CREATE` never reuses stale lowered code or version-keyed derived data, section 9).
   In-memory now; WAL-backed persistence of the source bytes is a later slice. Verified:
   register, call through the registry, version bump on re-register, and drop.
-  _Remaining for M1:_ an optional wall-clock deadline backstop and output-size cap, the
+  _Executor hook: done (evaluation path)._ `evalFunc` in `src/query/iterator.zig` now checks a
+  module-level `active_wasm_registry` first: if the function name is registered, it evaluates
+  the integer arguments, runs the module sandboxed and metered via `WasmScalarFn`, and returns
+  the result, shadowing built-ins of the same name (the module-level pointer follows kaidb's
+  existing scalar-eval state pattern and avoids threading through every operator). The wasm
+  engine now compiles as part of the main kaidb build (`zig build` green, `kaidb`/`kai`
+  binaries produced), and an end-to-end test in the kaidb suite proves a registered UDF
+  `DBL(21)` evaluates to 42 through the real `evalScalarJson` to `evalScalar` to `evalFunc`
+  path, with an unregistered name falling through to the built-ins. This is the tractable
+  filter-pushdown path (`WHERE fn(col) = ...`); scalar projections (`SELECT fn(col)`) still need
+  the separate scalar-projection SQL feature (section 10.1).
+  _Remaining for M1:_ set `active_wasm_registry` from a `Database`-owned `Registry` and add the
+  `CREATE FUNCTION ... LANGUAGE wasm` / `DROP FUNCTION` DDL and catalog persistence, so a UDF is
+  reachable from SQL text rather than a programmatically-set registry; then an optional
+  wall-clock deadline backstop and output-size cap, the
   push-model frame codec on `src/proto/wire.zig` for variable-length (string/bytes) arguments,
   and the `CREATE FUNCTION ... LANGUAGE wasm` / `SELECT fn(col)` wiring into kaidb's lexer,
   parser, catalog, and executor (the larger SQL-surface slice). Demo target: a Kyte function

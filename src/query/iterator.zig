@@ -69,6 +69,19 @@
 
 const std = @import("std");
 const ast = @import("../sql/ast.zig");
+const WasmRegistry = @import("../wasm/registry.zig").Registry;
+
+/// The active wasm UDF registry for scalar-function evaluation (embed-wasm.md M1). Set once by
+/// the database that owns the registry; read (never written) during query evaluation, so it is
+/// safe for concurrent readers. This module-level pointer follows the same pattern iterator.zig
+/// already uses for scalar-function scratch state, and avoids threading a registry through every
+/// operator. A registered name takes precedence over a built-in scalar of the same name.
+pub var active_wasm_registry: ?*WasmRegistry = null;
+
+/// The exported entry point a wasm scalar UDF module must provide (the ABI convention). A
+/// Kyte/Rust/C guest names its scalar function this; the SQL name maps to the module via the
+/// registry, and the module's callable is always this export.
+pub const UDF_ENTRY = "kaidb_udf";
 const page = @import("../storage/page.zig");
 const BPlusTree = @import("../storage/btree.zig").BPlusTree;
 const BPlusTreeIterator = @import("../storage/btree.zig").Iterator;
@@ -546,6 +559,25 @@ threadlocal var fn_scratch_toggle: bool = false;
 /// `arg0` is computed because they have argument-count semantics of their own.
 fn evalFunc(fc: ast.FuncCall, ctx: anytype) ?Scalar {
     const name = fc.name;
+
+    // kaidb wasm UDFs (embed-wasm.md M1). If NAME is a registered wasm scalar function, evaluate
+    // its integer arguments, run the module sandboxed and metered, and return the integer
+    // result. A registered name shadows a built-in of the same name. Numeric args only for now;
+    // string/bytes args wait on the frame codec. Any failure (bad arg type, arity, or a trap)
+    // yields null, which predicates read as unknown.
+    if (active_wasm_registry) |reg| {
+        if (reg.get(name)) |wfn| {
+            var args_buf: [8]i64 = undefined;
+            if (fc.args.len > args_buf.len) return null;
+            for (fc.args, 0..) |arg, i| {
+                const v = evalScalar(arg, ctx) orelse return null;
+                args_buf[i] = asI64(v) orelse return null;
+            }
+            const r = wfn.callI64(UDF_ENTRY, args_buf[0..fc.args.len]) catch return null;
+            return .{ .integer = r };
+        }
+    }
+
     if (std.mem.eql(u8, name, "COALESCE")) {
         for (fc.args) |arg| {
             if (evalScalar(arg, ctx)) |v| return v;
@@ -2790,3 +2822,26 @@ pub const PrimaryKeyScanIterator = struct {
         };
     }
 };
+
+test "wasm UDF: a registered scalar function evaluates through evalFunc" {
+    const alloc = std.testing.allocator;
+    var reg = WasmRegistry.init(alloc);
+    defer reg.deinit();
+    // SQL names arrive upper-cased at parse time; register under the upper name.
+    try reg.register("DBL", @embedFile("testdata_udf.wasm"), .{});
+
+    active_wasm_registry = &reg;
+    defer active_wasm_registry = null;
+
+    // The expression DBL(21): a registered wasm UDF that doubles its argument.
+    var arg = ast.Expr{ .literal_int = 21 };
+    var args = [_]*ast.Expr{&arg};
+    const expr = ast.Expr{ .func_call = .{ .name = "DBL", .args = args[0..] } };
+
+    const r = evalScalarJson(&expr, TableRow.null_row) orelse return error.NoUdfResult;
+    try std.testing.expectEqual(@as(i64, 42), r.integer);
+
+    // An unregistered name falls through to the built-ins (here: unknown -> null).
+    const expr2 = ast.Expr{ .func_call = .{ .name = "NOPE", .args = args[0..] } };
+    try std.testing.expect(evalScalarJson(&expr2, TableRow.null_row) == null);
+}
