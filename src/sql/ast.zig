@@ -530,6 +530,10 @@ pub const ProjectionExpr = union(enum) {
     star, // *
     /// An aggregate such as `COUNT(*)` or `SUM(price)`. See [`AggregateCall`].
     aggregate: AggregateCall, // e.g., COUNT(*), SUM(price)
+    /// A per-row render of a registered row-facing view UDF (embed-wasm.md M7, section 12.4):
+    /// `SELECT viewname() FROM t` calls the wasm view against each row and emits its returned
+    /// fragment (typically HTML). The value is the registered view's name.
+    render: []const u8,
 };
 
 /// An aggregate invocation in the `SELECT` list, e.g. `COUNT(DISTINCT id)`.

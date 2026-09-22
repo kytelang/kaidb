@@ -1032,11 +1032,22 @@ Test and hardening plan:
   runtime safety, including use-after-free poisoning, on the optimized codegen path). _Remaining:_
   the official WebAssembly conformance suite, which needs vendoring a WAST runner (a separate,
   larger task), and a cross-process primary/replica differential harness.
-- **M7: hypermedia from the database (KYX).** The apex use-case of section 12.4: a KYX view
-  compiled into a wasm guest, invoked over a scan to return rendered HTML fragments through
-  the response frame with a text/html payload tag, plus the option to persist a rendered
-  fragment as a computed column. Needs M0, the row-facing ABI of M3, and a KYX guest support
-  library. This is the differentiator; the earlier milestones are built with it in view.
+- **M7: hypermedia from the database (KYX).** _Done (kaidb side)._ The apex use-case of section
+  12.4. On the kaidb side a KYX view is a row-facing `RETURNS TEXT` UDF: it reads the current
+  row through the M3 column ABI and returns an HTML `<tr>` fragment. Both delivery paths work:
+  - **Live render:** `SELECT viewname() FROM t` invokes the view against each scanned row and
+    emits its fragment as the cell (a new `render` projection variant, wired into the
+    non-aggregate projection drain; projection pushdown is forced to the whole row so the view
+    sees every column). The database returns rendered HTML, not columns.
+  - **Persisted render (compute-once):** `CREATE TABLE ... (html TEXT AS viewname())` renders
+    the fragment at insert time and stores it as ordinary durable column data (M7 composed with
+    M4 and M3), so a read serves the markup with no compute at all.
+  The view is deterministic, metered, and sandboxed (sections 5 and 7), and KYX's own escaping
+  makes the fragment injection-safe. A hand-authored view module gates this end to end; a
+  compiler path that emits the view from real KYX source (M0-a already proved Kyte strings
+  compile to and run as wasm) and a distinct text/html wire payload tag (the fragment is carried
+  as a TEXT column today) are the remaining pieces. This is the differentiator; the earlier
+  milestones were built with it in view.
 
 ## 16. Open questions and risks
 

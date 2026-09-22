@@ -1141,6 +1141,16 @@ pub fn evalExpr(expr: *const ast.Expr, row: Row) bool {
     return eval3(expr, RowResolver{ .row = row }) == .true;
 }
 
+/// Evaluates a scalar expression against a combined [`Row`], returning its value or `null`.
+///
+/// The [`RowResolver`] counterpart of [`evalScalarJson`]: unlike [`getVal`] (which resolves only
+/// a bare column), this runs the full [`evalScalar`] path, so a `func_call` is dispatched through
+/// [`evalFunc`], including a registered wasm scalar or row-facing UDF. Used by the projection
+/// render path (embed-wasm.md M7) to invoke a row-facing view UDF against each scanned row.
+pub fn evalScalarRow(expr: *const ast.Expr, row: Row) ?Scalar {
+    return evalScalar(expr, RowResolver{ .row = row });
+}
+
 /// Like [`evalExpr`] but evaluates the predicate against a single JSON object via
 /// [`JsonResolver`], for row-at-a-time checks that are not shaped as a [`Row`].
 pub fn evalExprJson(expr: *const ast.Expr, row: TableRow) bool {

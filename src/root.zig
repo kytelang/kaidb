@@ -6779,3 +6779,69 @@ test "wasm custom aggregate via SQL: CREATE AGGREGATE + SELECT AGG(col), with GR
     defer allocator.free(after);
     try std.testing.expectEqualStrings("NULL", after);
 }
+
+test "wasm KYX view via SQL: live render per row and persisted-render computed column (M7)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_wasm_view.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+    defer Io.Dir.deleteTree(.cwd(), io, "udf") catch {};
+
+    const Database = @import("schema.zig").Database;
+    var db = try Database.open(allocator, io, db_path, 64, null);
+    defer db.close();
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+    var exec = QueryExecutor.init(allocator, db);
+    defer exec.deinit();
+
+    const run = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+    };
+
+    // A KYX view is a row-facing RETURNS TEXT UDF: it reads the row's columns through the M3 col
+    // ABI and returns an HTML <tr> fragment. Registered exactly like any wasm function.
+    const wasm = @embedFile("wasm/testdata_view_row.wasm");
+    const hex = comptime std.fmt.bytesToHex(wasm, .lower);
+    try run.q(&exec, allocator, "CREATE FUNCTION PRODUCTROW RETURNS TEXT LANGUAGE wasm AS '" ++ hex ++ "'");
+    try run.q(&exec, allocator, "CREATE TABLE products (name TEXT PRIMARY KEY, price INT)");
+    try run.q(&exec, allocator, "INSERT INTO products (name, price) VALUES ('Hammer', 1299)");
+    try run.q(&exec, allocator, "INSERT INTO products (name, price) VALUES ('Nail', 5)");
+
+    // Live render: the database returns rendered HTML per row, not columns (embed-wasm.md 12.4).
+    {
+        const res = try exec.execute(.{ .sql = "SELECT PRODUCTROW() FROM products" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+        try std.testing.expectEqual(@as(usize, 2), res.rows.len);
+        var saw_hammer = false;
+        var saw_nail = false;
+        for (res.rows) |r| {
+            if (std.mem.eql(u8, r[0], "<tr><td>Hammer</td><td class=\"num\">1299</td></tr>")) saw_hammer = true;
+            if (std.mem.eql(u8, r[0], "<tr><td>Nail</td><td class=\"num\">5</td></tr>")) saw_nail = true;
+        }
+        try std.testing.expect(saw_hammer and saw_nail);
+    }
+
+    // Persisted render (compute-once): a computed column renders the fragment at insert time and
+    // stores it as ordinary durable column data (M4 + M3 + M7 composed), so a read serves the
+    // HTML with no compute at all.
+    try run.q(&exec, allocator, "CREATE TABLE cards (name TEXT PRIMARY KEY, price INT, html TEXT AS PRODUCTROW())");
+    try run.q(&exec, allocator, "INSERT INTO cards (name, price) VALUES ('Wrench', 42)");
+    {
+        // Read via full scan to avoid the unrelated project-non-PK-filter-PK first-query quirk
+        // noted under M4.
+        const res = try exec.execute(.{ .sql = "SELECT name, html FROM cards" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+        try std.testing.expectEqual(@as(usize, 1), res.rows.len);
+        try std.testing.expectEqualStrings("Wrench", res.rows[0][0]);
+        try std.testing.expectEqualStrings("<tr><td>Wrench</td><td class=\"num\">42</td></tr>", res.rows[0][1]);
+    }
+}

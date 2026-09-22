@@ -762,23 +762,28 @@ pub const Parser = struct {
                 self.eat();
                 var name = self.sliceText(tok);
                 if (self.current().type == .LPAREN) {
-                    // `ident(col)` in a projection is a custom wasm aggregate (embed-wasm.md M5):
-                    // kaidb has no scalar-expression projections, so a function call here can only
-                    // be a registered aggregate. The executor resolves `name` in the wasm-aggregate
-                    // registry; an unknown name is a run-time error, not a parse error.
+                    // A function call in a projection (kaidb has no scalar-expression projections):
+                    //   `ident()`    -> a per-row wasm view render (embed-wasm.md M7).
+                    //   `ident(col)` -> a custom wasm aggregate (embed-wasm.md M5).
+                    // Both resolve their name in a wasm registry at execution; an unknown name is a
+                    // run-time result (NULL), not a parse error. Names are upper-cased to match the
+                    // registry keys, so calls are case-insensitive.
                     self.eat();
-                    const arg_tok = try self.expect(.IDENTIFIER);
-                    var arg_name = self.sliceText(arg_tok);
-                    if (self.current().type == .DOT) {
-                        self.eat();
-                        const c2 = try self.expect(.IDENTIFIER);
-                        arg_name = try std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ arg_name, self.sliceText(c2) });
-                    }
-                    _ = try self.expect(.RPAREN);
-                    // Upper-case the aggregate name to match the registry key (CREATE AGGREGATE
-                    // registers under the upper-cased name), so the call is case-insensitive.
                     const uname = try std.ascii.allocUpperString(self.arena.allocator(), name);
-                    expr = .{ .aggregate = .{ .kind = .WASM, .wasm_name = uname, .argument = .{ .column = arg_name } } };
+                    if (self.current().type == .RPAREN) {
+                        self.eat();
+                        expr = .{ .render = uname };
+                    } else {
+                        const arg_tok = try self.expect(.IDENTIFIER);
+                        var arg_name = self.sliceText(arg_tok);
+                        if (self.current().type == .DOT) {
+                            self.eat();
+                            const c2 = try self.expect(.IDENTIFIER);
+                            arg_name = try std.fmt.allocPrint(self.arena.allocator(), "{s}.{s}", .{ arg_name, self.sliceText(c2) });
+                        }
+                        _ = try self.expect(.RPAREN);
+                        expr = .{ .aggregate = .{ .kind = .WASM, .wasm_name = uname, .argument = .{ .column = arg_name } } };
+                    }
                 } else {
                     if (self.current().type == .DOT) {
                         self.eat();

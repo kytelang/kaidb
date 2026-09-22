@@ -95,6 +95,25 @@ test "row-facing TEXT UDF: col_bytes into guest memory, returned as a string" {
     try std.testing.expectEqualStrings("hello", out[0..r.str_len]);
 }
 
+test "KYX view: a row-facing UDF renders an HTML fragment from the row (M7)" {
+    const alloc = std.testing.allocator;
+    var fn_ = try udf.WasmScalarFn.init(alloc, @embedFile("testdata_view_row.wasm"), .{});
+    defer fn_.deinit();
+    try std.testing.expect(fn_.row_facing);
+    fn_.returns_string = true;
+
+    // The view reads column 0 (name) and column 1 (price) as text and assembles a <tr> fragment.
+    const row = MockRow{ .ints = &.{ 0, 0 }, .texts = &.{ "Hammer", "1299" } };
+    var rc = row.ctx();
+    var out: [256]u8 = undefined;
+    const r = try fn_.callRow(&rc, out[0..]);
+    try std.testing.expect(r == .str_len);
+    try std.testing.expectEqualStrings(
+        "<tr><td>Hammer</td><td class=\"num\">1299</td></tr>",
+        out[0..r.str_len],
+    );
+}
+
 test "custom aggregate: accumulate across rows, finalise the group result" {
     const alloc = std.testing.allocator;
     var af = try udf.WasmAggFn.init(alloc, @embedFile("testdata_agg_sum.wasm"), .{});

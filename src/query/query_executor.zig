@@ -4570,6 +4570,7 @@ pub const QueryExecutor = struct {
                     const header = switch (proj.expr) {
                         .star => "*",
                         .column => |col| col,
+                        .render => |view_name| view_name,
                         .aggregate => |agg| switch (agg.kind) {
                             .COUNT => "COUNT",
                             .SUM => "SUM",
@@ -4694,6 +4695,8 @@ pub const QueryExecutor = struct {
                                 .aggregate => |agg| try self.formatAggregate(agg, grp.aggs[i]),
                                 .column => try self.allocator.dupe(u8, grp.col_vals[i]),
                                 .star => try self.allocator.dupe(u8, ""),
+                                // A per-row view render is not meaningful in a grouped result.
+                                .render => try self.allocator.dupe(u8, ""),
                             };
                         }
                         try rows.append(self.allocator, cells);
@@ -4948,6 +4951,22 @@ pub const QueryExecutor = struct {
                             .column => |col| {
                                 const val = query_iter.getVal(&ast.Expr{ .column_ref = col }, row);
                                 const cell = if (val) |v| try self.scalarText(v) else try self.allocator.dupe(u8, "NULL");
+                                try row_cells.append(self.allocator, cell);
+                            },
+                            .render => |view_name| {
+                                // KYX view render (embed-wasm.md M7, section 12.4): invoke the
+                                // registered row-facing view UDF against this row and emit its
+                                // returned fragment (HTML) as the cell. The view reads the row's
+                                // columns through the M3 col ABI; `evalScalarRow` routes the
+                                // zero-argument call through `evalFunc`, which dispatches the
+                                // row-facing UDF against `row`.
+                                var no_args = [_]*ast.Expr{};
+                                const fc_expr = ast.Expr{ .func_call = .{ .name = view_name, .args = no_args[0..] } };
+                                const v = query_iter.evalScalarRow(&fc_expr, row);
+                                const cell = if (v) |vv| switch (vv) {
+                                    .string => |s| try self.allocator.dupe(u8, s),
+                                    else => try self.scalarText(vv),
+                                } else try self.allocator.dupe(u8, "NULL");
                                 try row_cells.append(self.allocator, cell);
                             },
                             .aggregate => |agg| {
@@ -7422,6 +7441,9 @@ pub const QueryExecutor = struct {
         for (sel.projections) |p| switch (p.expr) {
             .column => |c| ns.add(c),
             .star => return null,
+            // A wasm view reads columns on demand by position (embed-wasm.md M7), so the executor
+            // cannot statically know which it needs: force the whole row, like `*`.
+            .render => return null,
             .aggregate => |agg| switch (agg.argument) {
                 .star => {}, // COUNT(*) reads no column
                 .column => |c| ns.add(c),
