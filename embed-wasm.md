@@ -1073,6 +1073,87 @@ Test and hardening plan:
   ever wants the self-hosted backend for faster debug builds, the WASM path needs a fallback
   dispatch (a plain switch) behind a build flag. Not needed now, noted.
 
+## 18. Production-hardening candidates
+
+M1 through M7, plus stored procedures (`CALL`) and DML triggers, are functionally complete and
+gated. What follows is the honest list of what must harden before this subsystem is a
+production feature, ranked by how load-bearing it is. Nothing here is a functional gap in what
+was built; these are the durability, concurrency, security, and resource-safety properties a
+shipped feature needs.
+
+**P0, correctness and durability blockers:**
+
+1. **Catalog/WAL persistence, not loose files.** Functions, aggregates, procedures (`.wasm` /
+   `.twasm` / `.wagg` / `.wproc`) and triggers (`.wtrig`) persist as loose files under
+   `<base_dir>/udf/`, outside the catalog, the WAL, and doublewrite. So registration is not
+   crash-consistent (a crash between the in-memory register and the file write diverges them),
+   not transactional (a rolled-back statement still leaves the file), and not replicated
+   (followers never receive a UDF or trigger over the WAL ship path). The design (section 9,
+   item 1) already calls for module source to live in the catalog, WAL-backed and
+   doublewrite-protected. This is the single biggest item: it is a durability and HA
+   correctness gap, and the `.wtrig` binary format additionally has no version tag or checksum.
+2. **Concurrency: guard the registries and the global registry pointer.** DDL
+   (`CREATE`/`DROP FUNCTION`/`AGGREGATE`/`PROCEDURE`/`TRIGGER`, `registerTrigger`) mutates the
+   in-memory registries and the trigger list with no lock, while queries read them
+   concurrently. A `StringHashMap` resize during a concurrent read invalidates the borrowed
+   `*WasmScalarFn`. And `query_iter.active_wasm_registry` is a process-global set at the top of
+   every `execute`; two executor threads stomp it. Both need the catalog latch (DDL takes it
+   exclusive, reads shared) and the registry pointer needs to move onto the executor/request,
+   not a global. This is a soundness and crash risk under the threaded server.
+3. **Trigger recursion and fan-out limits.** A trigger firing a function that (once in-process
+   DML lands, section 11) inserts into another table can fire another trigger, unbounded. Even
+   today, nothing caps trigger depth or the number of triggers per event. A per-statement
+   trigger-depth guard and a documented ceiling are required before triggers are safe on a
+   busy table.
+
+**P1, resource safety and security:**
+
+4. **Authorization on UDF/trigger DDL.** Any user who can run DDL can register a function and a
+   `BEFORE INSERT` trigger, which is a persistent, always-on code-execution hook on every write
+   to a table. With no privilege check this is a privilege-escalation vector. kaidb already has
+   `GRANT`/`REVOKE`; `CREATE FUNCTION`/`PROCEDURE`/`TRIGGER` must require a dedicated privilege.
+5. **Aggregate instance cap and per-statement fuel.** A `GROUP BY` over a wasm aggregate
+   heap-allocates one `Aggregator` per group, uncapped: a query with millions of groups
+   allocates millions of guest instances. And fuel is per-call only, so a UDF over 10M rows
+   runs 10M independently-budgeted calls with no total ceiling. Both need a per-statement bound.
+6. **Result-buffer truncation.** String and HTML results are copied into a fixed 512-byte
+   thread-local scratch buffer and silently truncated past that (`fn_scratch_a`/`b` in
+   `iterator.zig`). A KYX fragment longer than 512 bytes is silently cut. This needs a growable
+   result buffer or an explicit over-cap error, not silent truncation.
+7. **Module-size and registry-count limits.** Nothing bounds a registered module's size (a huge
+   module can exhaust memory at decode) or the number of registered UDFs (unbounded registry
+   growth). Both need configured caps enforced at `CREATE`.
+
+**P1, correctness completeness:**
+
+8. **Fire UPDATE and DELETE triggers.** Triggers are parsed and persisted for all three events,
+   but only INSERT is fired today. A `BEFORE UPDATE`/`DELETE` validation trigger silently does
+   nothing, which is a correctness and security surprise. The UPDATE and DELETE executor paths
+   need the same `fireRowTriggers` hook (with OLD-row context for DELETE and OLD/NEW for
+   UPDATE).
+9. **Positional row ABI versus schema evolution.** The row ABI is positional (`col_i64(0)`), so
+   a UDF is bound to a specific column layout. `ALTER TABLE ADD`/`DROP COLUMN` silently shifts
+   the indices, so a view, filter, or trigger reads the wrong column with no error. Bind columns
+   by name, or stamp a schema version the UDF is validated against.
+10. **`CALL` and procedures are inert.** A procedure cannot perform DML and `CALL` accepts only
+    literal arguments, because the in-process query host imports (section 11) are not built. An
+    `AFTER` trigger has the same limit: it can read the row and veto (BEFORE) but cannot act.
+    Until section 11 lands, procedures and AFTER triggers are validation/compute only, which
+    should be stated in user docs.
+
+**P2, observability and validation:**
+
+11. **System catalog views.** There is no `sys.*` view listing registered functions,
+    aggregates, procedures, or triggers (the design's `kaidb_functions` table). Operators cannot
+    introspect what code is registered and firing.
+12. **Surface persistence failures.** A failed `.w*` write is logged as a warning, so a
+    `CREATE` that "succeeded" but did not persist silently fails to survive a restart. Once
+    persistence moves into the WAL (item 1) this closes; until then it should at least warn the
+    client.
+13. **Extend fuzzing and the WASM conformance suite.** The M6 fuzzer covers the engine
+    (decode/validate/execute); it does not yet cover the trigger and procedure SQL paths, and
+    the official WebAssembly conformance suite (a vendored WAST runner) is still outstanding.
+
 ## 17. Licence and attribution
 
 The forked engine files retain Malcolm Still's copyright header and the MIT licence text.
