@@ -107,6 +107,22 @@ const StopWatch = @import("utils").StopWatch;
 const txn_mod = @import("../concurrency/transaction.zig");
 const command_mod = @import("../proto/command.zig");
 
+/// Wasm subsystem hardening limits (wasm-hardening.md P0-3, P1-5).
+/// Maximum trigger nesting depth. A trigger cannot yet cause another DML statement (in-process
+/// query imports are unbuilt), so today the depth is always 1; this is defensive fan-out /
+/// future-recursion insurance so a trigger web can never blow the stack.
+const MAX_TRIGGER_DEPTH: u32 = 8;
+/// Maximum wasm aggregator instances a single statement may spin up (one per group), so a GROUP BY
+/// with a pathological number of groups cannot allocate unbounded guest instances.
+const MAX_WASM_AGG_INSTANCES: usize = 100_000;
+
+/// Per-thread trigger nesting depth (one statement runs on one thread; see the thread-local
+/// registry pointer in iterator.zig). Incremented while a trigger's function runs.
+threadlocal var wasm_trigger_depth: u32 = 0;
+/// Per-statement count of wasm aggregator instances created, reset at the start of each aggregate
+/// query block and checked against [`MAX_WASM_AGG_INSTANCES`].
+threadlocal var wasm_agg_created: usize = 0;
+
 /// Transaction isolation level for a session, selected by
 /// `SET TRANSACTION ISOLATION LEVEL`.
 ///
@@ -4618,6 +4634,8 @@ pub const QueryExecutor = struct {
                     break :blk false;
                 };
                 if (is_agg_query) {
+                    // Reset the per-statement wasm-aggregator instance count (wasm-hardening.md P1-5).
+                    wasm_agg_created = 0;
                     var g_arena = std.heap.ArenaAllocator.init(self.allocator);
                     defer g_arena.deinit();
                     const ga = g_arena.allocator();
@@ -6479,9 +6497,13 @@ pub const QueryExecutor = struct {
             const v = query_iter.getVal(&ast.Expr{ .column_ref = col }, row) orelse return;
             if (v == .null) return;
             if (acc.wasm_agg == null) {
+                // Per-statement instance cap (wasm-hardening.md P1-5): a pathological number of
+                // groups cannot spin up unbounded guest instances.
+                if (wasm_agg_created >= MAX_WASM_AGG_INSTANCES) return error.TooManyAggregateInstances;
                 const name = agg.wasm_name orelse return;
                 const wfn = self.db.wasm_aggregates.get(name) orelse return;
                 acc.wasm_agg = try wfn.newAggregator();
+                wasm_agg_created += 1;
             }
             const iv: i64 = switch (v) {
                 .integer => |x| x,
@@ -7120,6 +7142,12 @@ pub const QueryExecutor = struct {
         timing: ast.TriggerTiming,
         tr: query_iter.TableRow,
     ) !bool {
+        // Trigger-depth guard (wasm-hardening.md P0-3): bound nesting so a trigger web can never
+        // run away or blow the stack.
+        wasm_trigger_depth += 1;
+        defer wasm_trigger_depth -= 1;
+        if (wasm_trigger_depth > MAX_TRIGGER_DEPTH) return error.TriggerRecursionTooDeep;
+
         query_iter.active_wasm_registry = &self.db.wasm_functions;
         var data_slice = [1]query_iter.TableRow{tr};
         var tables_slice = [1][]const u8{table.name};

@@ -46,10 +46,11 @@ concurrency, security, and resource-safety properties a shipped feature needs. I
    pointer. A fuller refactor that carries the registry on the executor or request (rather than
    any ambient thread-local) is still worthwhile but no longer a correctness blocker.
 
-3. **Trigger recursion and fan-out limits.** Nothing caps trigger depth or the number of triggers
-   per event. Once in-process DML lands (design section 11), a trigger that inserts into another
-   table can fire another trigger, unbounded. A per-statement trigger-depth guard and a documented
-   ceiling are required before triggers are safe on a busy table.
+3. **Trigger recursion and fan-out limits.** _Done (guard in place)._ A thread-local trigger-depth
+   counter bounds nesting at `MAX_TRIGGER_DEPTH` (8) and returns `error.TriggerRecursionTooDeep`
+   past it. A trigger cannot yet cause another DML statement (in-process query imports are
+   unbuilt), so the depth is 1 today; this is the guard that keeps a future trigger web from
+   running away or blowing the stack when in-process DML lands.
 
 ### P1, resource safety and security
 
@@ -58,10 +59,11 @@ concurrency, security, and resource-safety properties a shipped feature needs. I
    a table. With no privilege check this is a privilege-escalation vector. kaidb already has
    `GRANT` / `REVOKE`; UDF and trigger DDL must require a dedicated privilege.
 
-5. **Aggregate instance cap and per-statement fuel.** A `GROUP BY` over a wasm aggregate
-   heap-allocates one aggregator instance per group, uncapped: a query with millions of groups
-   allocates millions of guest instances. And fuel is per-call only, so a UDF over 10M rows runs
-   10M independently-budgeted calls with no total ceiling. Both need a per-statement bound.
+5. **Aggregate instance cap and per-statement fuel.** _Instance cap done._ A per-statement counter
+   bounds wasm aggregator instances at `MAX_WASM_AGG_INSTANCES` (100k) and returns
+   `error.TooManyAggregateInstances` past it, so a `GROUP BY` with a pathological number of groups
+   cannot allocate unbounded guest instances. A per-statement fuel ceiling (fuel is still per-call,
+   so a UDF over 10M rows runs 10M independently-budgeted calls) remains.
 
 6. **Result-buffer truncation.** _Done._ The thread-local string-result scratch buffers were
    raised to 64 KiB so realistic text and HTML fragments are not truncated, and the copy in
