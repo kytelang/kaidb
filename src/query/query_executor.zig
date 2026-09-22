@@ -4036,9 +4036,14 @@ pub const QueryExecutor = struct {
                             };
                         },
                         else => {
+                            // Registering wasm code (CREATE/DROP FUNCTION/AGGREGATE/PROCEDURE/
+                            // TRIGGER) falls through to `.admin` here, because a registered trigger
+                            // is a persistent code-execution hook on every write to a table
+                            // (wasm-hardening.md P1-4). CALL only invokes an already-registered
+                            // procedure, so it needs `.write` (a procedure may mutate), not admin.
                             const perm_type: @import("../concurrency/security.zig").PermissionType = switch (stmt) {
                                 .export_stmt => .read,
-                                .import_stmt => .write,
+                                .import_stmt, .call => .write,
                                 else => .admin,
                             };
                             self.db.security_manager.checkPermission(&session, perm_type) catch {

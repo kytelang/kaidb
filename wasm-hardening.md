@@ -20,7 +20,7 @@ concurrency, security, and resource-safety properties a shipped feature needs. I
 | Per-call resource metering | Done; no per-statement or per-query ceiling |
 | Persistence of modules and triggers | File-backed (`.wasm` / `.twasm` / `.wagg` / `.wproc` / `.wtrig`), reloaded on open. NOT catalog / WAL / doublewrite, NOT replicated |
 | Concurrency (registry mutation vs concurrent reads) | Mutation-vs-read is serialised by the database `rw_lock` (DDL exclusive, reads shared); the registry pointer is now `threadlocal` (P0-2 done). Moving it fully off ambient state remains |
-| Authorization on UDF / trigger DDL | None |
+| Authorization on UDF / trigger DDL | When security is enabled, registering a function / aggregate / procedure / trigger requires `.admin`; `CALL` requires `.write`. No finer-grained per-object privilege yet. When security is disabled (default embedded mode) all DDL is open, as it is for every statement |
 | Trigger events | INSERT, UPDATE, and DELETE all fire (BEFORE can veto). Recursion/fan-out limits still pending |
 
 ## Ranked hardening candidates
@@ -54,10 +54,15 @@ concurrency, security, and resource-safety properties a shipped feature needs. I
 
 ### P1, resource safety and security
 
-4. **Authorization on UDF / trigger DDL.** Any user who can run DDL can register a function and a
-   `BEFORE INSERT` trigger, which is a persistent, always-on code-execution hook on every write to
-   a table. With no privilege check this is a privilege-escalation vector. kaidb already has
-   `GRANT` / `REVOKE`; UDF and trigger DDL must require a dedicated privilege.
+4. **Authorization on UDF / trigger DDL.** _Done (via the existing model), refined._ When the
+   security manager is enabled and users exist, every statement is authorised against the session,
+   and `CREATE` / `DROP FUNCTION` / `AGGREGATE` / `PROCEDURE` / `TRIGGER` fall through to the
+   `.admin` requirement, so a non-admin cannot register a function or a trigger (which would be a
+   persistent code-execution hook). `CALL` was relaxed from `.admin` to `.write`, since invoking an
+   already-registered procedure is a normal privileged-write operation, not an administrative one.
+   A finer-grained per-object `EXECUTE` privilege (call this specific procedure) and a dedicated
+   `CREATE FUNCTION` privilege distinct from full admin are the remaining refinement. Note that in
+   the default embedded mode (security disabled) all DDL is open, as it is for every statement.
 
 5. **Aggregate instance cap and per-statement fuel.** _Instance cap done._ A per-statement counter
    bounds wasm aggregator instances at `MAX_WASM_AGG_INSTANCES` (100k) and returns
