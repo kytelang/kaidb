@@ -3889,6 +3889,25 @@ pub const Database = struct {
             F{ .name = "max_length", .type = i32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
             F{ .name = "is_nullable", .type = u32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
         });
+
+        // Introspection over the registered WebAssembly objects (wasm-hardening.md P2-11), so an
+        // operator can see what code is registered and firing. Materialised from the in-memory
+        // registries by `QueryExecutor.buildCatalogRows`.
+        try self.registerSyntheticTable("sys.wasm_functions", &.{
+            F{ .name = "name", .type = text, .size = 4, .offset = 0, .is_primary_key = true, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "kind", .type = text, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "returns_text", .type = u32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "row_facing", .type = u32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "source_bytes", .type = u32t, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+        });
+
+        try self.registerSyntheticTable("sys.wasm_triggers", &.{
+            F{ .name = "name", .type = text, .size = 4, .offset = 0, .is_primary_key = true, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "table_name", .type = text, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "timing", .type = text, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "event", .type = text, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+            F{ .name = "function_name", .type = text, .size = 4, .offset = 0, .is_primary_key = false, .is_auto_increment = false, .is_nullable = false, .default_value = null },
+        });
     }
 
     /// Creates a user table: a new tree, catalog rows, WAL records, and caches.

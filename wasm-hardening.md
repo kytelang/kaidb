@@ -103,8 +103,11 @@ concurrency, security, and resource-safety properties a shipped feature needs. I
 
 ### P2, observability and validation
 
-11. **System catalog views.** There is no `sys.*` view listing registered functions, aggregates,
-    procedures, or triggers. Operators cannot introspect what code is registered and firing.
+11. **System catalog views.** _Done._ `sys.wasm_functions` lists every registered scalar function,
+    aggregate, and procedure (name, kind, returns_text, row_facing, source_bytes) and
+    `sys.wasm_triggers` lists every trigger (name, table, timing, event, function), so an operator
+    can see what code is registered and firing. Both are in-memory synthetic catalog views
+    materialised from the registries, queryable with ordinary SQL.
 
 12. **Surface persistence failures.** A failed persistence write is logged as a warning, so a
     `CREATE` that "succeeded" but did not persist silently fails to survive a restart. Once

@@ -7066,3 +7066,72 @@ test "wasm trigger via SQL: BEFORE UPDATE and BEFORE DELETE veto" {
         try std.testing.expectEqualStrings("MISSING", a1); // now deleted
     }
 }
+
+test "wasm introspection: sys.wasm_functions and sys.wasm_triggers list registered objects (P2-11)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_wasm_sysviews.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+    defer Io.Dir.deleteTree(.cwd(), io, "udf") catch {};
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+    var db = try Database.open(allocator, io, db_path, 64, null);
+    defer db.close();
+    var exec = QueryExecutor.init(allocator, db);
+    defer exec.deinit();
+
+    const fn_hex = comptime std.fmt.bytesToHex(@embedFile("query/testdata_udf.wasm"), .lower);
+    const agg_hex = comptime std.fmt.bytesToHex(@embedFile("wasm/testdata_agg_sum.wasm"), .lower);
+    const trig_hex = comptime std.fmt.bytesToHex(@embedFile("wasm/testdata_trig_check.wasm"), .lower);
+
+    const h = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+    };
+
+    try h.q(&exec, allocator, "CREATE FUNCTION DBL LANGUAGE wasm AS '" ++ fn_hex ++ "'");
+    try h.q(&exec, allocator, "CREATE AGGREGATE MYSUM LANGUAGE wasm AS '" ++ agg_hex ++ "'");
+    try h.q(&exec, allocator, "CREATE PROCEDURE DBLPROC LANGUAGE wasm AS '" ++ fn_hex ++ "'");
+    try h.q(&exec, allocator, "CREATE FUNCTION CHECKAMOUNT LANGUAGE wasm AS '" ++ trig_hex ++ "'");
+    try h.q(&exec, allocator, "CREATE TABLE orders (id INT PRIMARY KEY, amount INT)");
+    try h.q(&exec, allocator, "CREATE TRIGGER guard BEFORE INSERT ON orders EXECUTE FUNCTION CHECKAMOUNT()");
+
+    // sys.wasm_functions lists the two functions, the aggregate, and the procedure by kind.
+    {
+        const res = try exec.execute(.{ .sql = "SELECT name, kind FROM sys.wasm_functions" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+        try std.testing.expectEqual(@as(usize, 4), res.rows.len);
+        var funcs: usize = 0;
+        var aggs: usize = 0;
+        var procs: usize = 0;
+        for (res.rows) |r| {
+            if (std.mem.eql(u8, r[1], "function")) funcs += 1;
+            if (std.mem.eql(u8, r[1], "aggregate")) aggs += 1;
+            if (std.mem.eql(u8, r[1], "procedure")) procs += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), funcs); // DBL, CHECKAMOUNT
+        try std.testing.expectEqual(@as(usize, 1), aggs); // MYSUM
+        try std.testing.expectEqual(@as(usize, 1), procs); // DBLPROC
+    }
+
+    // sys.wasm_triggers lists the one trigger with its timing/event/table/function.
+    {
+        const res = try exec.execute(.{ .sql = "SELECT name, table_name, timing, event, function_name FROM sys.wasm_triggers" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+        try std.testing.expectEqual(@as(usize, 1), res.rows.len);
+        try std.testing.expectEqualStrings("GUARD", res.rows[0][0]);
+        try std.testing.expectEqualStrings("orders", res.rows[0][1]);
+        try std.testing.expectEqualStrings("BEFORE", res.rows[0][2]);
+        try std.testing.expectEqualStrings("INSERT", res.rows[0][3]);
+        try std.testing.expectEqualStrings("CHECKAMOUNT", res.rows[0][4]);
+    }
+}

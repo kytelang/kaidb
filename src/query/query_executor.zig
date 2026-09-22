@@ -6911,7 +6911,9 @@ pub const QueryExecutor = struct {
             std.mem.eql(u8, name, "sys.indexes") or
             std.mem.eql(u8, name, "sys.columns") or
             std.mem.eql(u8, name, "sys.schemas") or
-            std.mem.eql(u8, name, "sys.types");
+            std.mem.eql(u8, name, "sys.types") or
+            std.mem.eql(u8, name, "sys.wasm_functions") or
+            std.mem.eql(u8, name, "sys.wasm_triggers");
     }
 
     /// Resolves a table id to its name via the in-memory catalog, or null if none.
@@ -7281,6 +7283,56 @@ pub const QueryExecutor = struct {
                 try obj.put(self.allocator, "name", query_iter.Cell{ .text = tr.name });
                 try obj.put(self.allocator, "max_length", query_iter.Cell{ .int = tr.max_len });
                 try obj.put(self.allocator, "is_nullable", query_iter.Cell{ .int = 1 });
+                try out.append(self.allocator, try self.tableRowFromCellMap(table_meta, &obj));
+            }
+        } else if (std.mem.eql(u8, table_name, "sys.wasm_functions")) {
+            // One row per registered wasm scalar function, aggregate, and procedure
+            // (wasm-hardening.md P2-11).
+            var fit = self.db.wasm_functions.map.iterator();
+            while (fit.next()) |kv| {
+                const f = &kv.value_ptr.func;
+                var obj: CatalogCellMap = .empty;
+                defer obj.deinit(self.allocator);
+                try obj.put(self.allocator, "name", query_iter.Cell{ .text = kv.key_ptr.* });
+                try obj.put(self.allocator, "kind", query_iter.Cell{ .text = "function" });
+                try obj.put(self.allocator, "returns_text", query_iter.Cell{ .int = if (f.returns_string) 1 else 0 });
+                try obj.put(self.allocator, "row_facing", query_iter.Cell{ .int = if (f.row_facing) 1 else 0 });
+                try obj.put(self.allocator, "source_bytes", query_iter.Cell{ .int = @intCast(f.bytes.len) });
+                try out.append(self.allocator, try self.tableRowFromCellMap(table_meta, &obj));
+            }
+            var ait = self.db.wasm_aggregates.map.iterator();
+            while (ait.next()) |kv| {
+                var obj: CatalogCellMap = .empty;
+                defer obj.deinit(self.allocator);
+                try obj.put(self.allocator, "name", query_iter.Cell{ .text = kv.key_ptr.* });
+                try obj.put(self.allocator, "kind", query_iter.Cell{ .text = "aggregate" });
+                try obj.put(self.allocator, "returns_text", query_iter.Cell{ .int = 0 });
+                try obj.put(self.allocator, "row_facing", query_iter.Cell{ .int = 0 });
+                try obj.put(self.allocator, "source_bytes", query_iter.Cell{ .int = @intCast(kv.value_ptr.func.bytes.len) });
+                try out.append(self.allocator, try self.tableRowFromCellMap(table_meta, &obj));
+            }
+            var pit = self.db.wasm_procedures.map.iterator();
+            while (pit.next()) |kv| {
+                const f = &kv.value_ptr.func;
+                var obj: CatalogCellMap = .empty;
+                defer obj.deinit(self.allocator);
+                try obj.put(self.allocator, "name", query_iter.Cell{ .text = kv.key_ptr.* });
+                try obj.put(self.allocator, "kind", query_iter.Cell{ .text = "procedure" });
+                try obj.put(self.allocator, "returns_text", query_iter.Cell{ .int = 0 });
+                try obj.put(self.allocator, "row_facing", query_iter.Cell{ .int = if (f.row_facing) 1 else 0 });
+                try obj.put(self.allocator, "source_bytes", query_iter.Cell{ .int = @intCast(f.bytes.len) });
+                try out.append(self.allocator, try self.tableRowFromCellMap(table_meta, &obj));
+            }
+        } else if (std.mem.eql(u8, table_name, "sys.wasm_triggers")) {
+            // One row per registered DML trigger (wasm-hardening.md P2-11).
+            for (self.db.wasm_triggers.items) |t| {
+                var obj: CatalogCellMap = .empty;
+                defer obj.deinit(self.allocator);
+                try obj.put(self.allocator, "name", query_iter.Cell{ .text = t.name });
+                try obj.put(self.allocator, "table_name", query_iter.Cell{ .text = t.table_name });
+                try obj.put(self.allocator, "timing", query_iter.Cell{ .text = @tagName(t.timing) });
+                try obj.put(self.allocator, "event", query_iter.Cell{ .text = @tagName(t.event) });
+                try obj.put(self.allocator, "function_name", query_iter.Cell{ .text = t.function_name });
                 try out.append(self.allocator, try self.tableRowFromCellMap(table_meta, &obj));
             }
         } else { // sys.columns: one row per column of every table (MSSQL sys.columns shape)
