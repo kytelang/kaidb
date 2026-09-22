@@ -5586,6 +5586,10 @@ pub const QueryExecutor = struct {
 
                 var rows_updated: u64 = 0;
                 for (tasks.items) |task| {
+                    // BEFORE UPDATE triggers may veto the new row version.
+                    if (!try self.fireRowTriggers(table_meta, .UPDATE, .BEFORE, &task.row_obj)) {
+                        return QueryResponse{ .error_message = try self.allocator.dupe(u8, "UPDATE rejected by BEFORE trigger") };
+                    }
                     try self.writeNewVersion(table_tree, upd.table_name, task.key, task.row_obj, true);
                     rows_updated += 1;
 
@@ -5619,6 +5623,9 @@ pub const QueryExecutor = struct {
                             try self.db.updateIndexRootPageId(idx.name, idx_tree.root_page_id, current_tx);
                         }
                     }
+                    // AFTER UPDATE triggers run for their side effect on the new row version.
+                    _ = self.fireRowTriggers(table_meta, .UPDATE, .AFTER, &task.row_obj) catch |err|
+                        std.log.warn("AFTER UPDATE trigger on {s} failed: {any}", .{ upd.table_name, err });
                 }
                 // A successful update re-inserts index entries for the new row
                 // version and can leave the pre-update entry behind, so the
@@ -5664,7 +5671,13 @@ pub const QueryExecutor = struct {
                         if (try self.getVisibleVersion(table_meta, val, false, current_tx)) |visible_row| {
                             defer self.freeTableRow(visible_row);
                             try self.validateForeignKeyConstraintsForDelete(table_meta.id, visible_row);
+                            // BEFORE DELETE triggers may veto, reading the OLD row.
+                            if (!try self.fireRowTriggersRow(table_meta, .DELETE, .BEFORE, visible_row)) {
+                                return QueryResponse{ .error_message = try self.allocator.dupe(u8, "DELETE rejected by BEFORE trigger") };
+                            }
                             try self.deleteRowVersion(table_tree, del.table_name, pk_val);
+                            _ = self.fireRowTriggersRow(table_meta, .DELETE, .AFTER, visible_row) catch |err|
+                                std.log.warn("AFTER DELETE trigger on {s} failed: {any}", .{ del.table_name, err });
                             rows_deleted = 1;
                         }
                     }
@@ -5685,6 +5698,15 @@ pub const QueryExecutor = struct {
                                 if (!evaluateExpr(we, visible_row)) continue;
                             }
                             try self.validateForeignKeyConstraintsForDelete(table_meta.id, visible_row);
+                            // BEFORE DELETE triggers may veto, reading the OLD row. The AFTER trigger
+                            // is fired here too (at match time): this two-phase delete frees the row
+                            // before the delete loop below, and an AFTER DELETE trigger is read-only
+                            // today, so firing it while the OLD row is still in hand is equivalent.
+                            if (!try self.fireRowTriggersRow(table_meta, .DELETE, .BEFORE, visible_row)) {
+                                return QueryResponse{ .error_message = try self.allocator.dupe(u8, "DELETE rejected by BEFORE trigger") };
+                            }
+                            _ = self.fireRowTriggersRow(table_meta, .DELETE, .AFTER, visible_row) catch |err|
+                                std.log.warn("AFTER DELETE trigger on {s} failed: {any}", .{ del.table_name, err });
                             try keys_to_delete.append(self.allocator, try self.allocator.dupe(u8, cell.key));
                         }
                     }
@@ -7049,6 +7071,18 @@ pub const QueryExecutor = struct {
     /// function's result vetoes the operation: a `0` result or a trap returns `false`, so the
     /// caller aborts the DML. An `AFTER` trigger runs for its side effect and never vetoes (a trap
     /// is logged). Returns `true` when the operation may proceed.
+    /// Whether any trigger is registered for `(table, event, timing)`. Cheap check used to skip
+    /// the (relatively expensive) typed-row build and evaluation when nothing would fire.
+    fn hasTrigger(self: *QueryExecutor, table_name: []const u8, event: ast.TriggerEvent, timing: ast.TriggerTiming) bool {
+        for (self.db.wasm_triggers.items) |t| {
+            if (t.event == event and t.timing == timing and std.mem.eql(u8, t.table_name, table_name)) return true;
+        }
+        return false;
+    }
+
+    /// Fires the DML triggers for `(table, event, timing)` against a text-valued cell map (the row
+    /// an INSERT or UPDATE is writing). Coerces the map to a typed row and delegates to
+    /// [`runRowTriggers`]. Returns `true` when the operation may proceed.
     fn fireRowTriggers(
         self: *QueryExecutor,
         table: Table,
@@ -7056,19 +7090,37 @@ pub const QueryExecutor = struct {
         timing: ast.TriggerTiming,
         new_data: *const CatalogCellMap,
     ) !bool {
-        // Fast path: no triggers for this table at all.
-        var any = false;
-        for (self.db.wasm_triggers.items) |t| {
-            if (t.event == event and t.timing == timing and std.mem.eql(u8, t.table_name, table.name)) {
-                any = true;
-                break;
-            }
-        }
-        if (!any) return true;
-
-        query_iter.active_wasm_registry = &self.db.wasm_functions;
+        if (!self.hasTrigger(table.name, event, timing)) return true;
         const tr = try self.typedTableRow(table, new_data);
         defer query_iter.freeTableRow(self.allocator, tr);
+        return self.runRowTriggers(table, event, timing, tr);
+    }
+
+    /// Fires the DML triggers for `(table, event, timing)` against an already-typed row (the OLD
+    /// row a DELETE is removing). Same veto semantics as [`fireRowTriggers`].
+    fn fireRowTriggersRow(
+        self: *QueryExecutor,
+        table: Table,
+        event: ast.TriggerEvent,
+        timing: ast.TriggerTiming,
+        tr: query_iter.TableRow,
+    ) !bool {
+        if (!self.hasTrigger(table.name, event, timing)) return true;
+        return self.runRowTriggers(table, event, timing, tr);
+    }
+
+    /// The trigger evaluation core (embed-wasm.md): runs each bound wasm function against `tr`. A
+    /// row-facing function reads columns through the M3 col ABI; a plain scalar function is called
+    /// with no arguments. For a `BEFORE` trigger the result vetoes the operation (a `0` result or a
+    /// trap returns `false`); an `AFTER` trigger runs for its side effect and never vetoes.
+    fn runRowTriggers(
+        self: *QueryExecutor,
+        table: Table,
+        event: ast.TriggerEvent,
+        timing: ast.TriggerTiming,
+        tr: query_iter.TableRow,
+    ) !bool {
+        query_iter.active_wasm_registry = &self.db.wasm_functions;
         var data_slice = [1]query_iter.TableRow{tr};
         var tables_slice = [1][]const u8{table.name};
         const row = query_iter.Row{ .tables = tables_slice[0..], .data = data_slice[0..] };

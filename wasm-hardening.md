@@ -21,7 +21,7 @@ concurrency, security, and resource-safety properties a shipped feature needs. I
 | Persistence of modules and triggers | File-backed (`.wasm` / `.twasm` / `.wagg` / `.wproc` / `.wtrig`), reloaded on open. NOT catalog / WAL / doublewrite, NOT replicated |
 | Concurrency (registry mutation vs concurrent reads) | Mutation-vs-read is serialised by the database `rw_lock` (DDL exclusive, reads shared); the registry pointer is now `threadlocal` (P0-2 done). Moving it fully off ambient state remains |
 | Authorization on UDF / trigger DDL | None |
-| Trigger events | INSERT fires; UPDATE / DELETE are parsed and persisted but not fired |
+| Trigger events | INSERT, UPDATE, and DELETE all fire (BEFORE can veto). Recursion/fan-out limits still pending |
 
 ## Ranked hardening candidates
 
@@ -76,10 +76,12 @@ concurrency, security, and resource-safety properties a shipped feature needs. I
 
 ### P1, correctness completeness
 
-8. **Fire UPDATE and DELETE triggers.** Triggers are parsed and persisted for all three events,
-   but only INSERT is fired. A `BEFORE UPDATE` / `DELETE` validation trigger silently does
-   nothing, which is a correctness and security surprise. The UPDATE and DELETE executor paths
-   need the same firing hook, with OLD-row context for DELETE and OLD / NEW for UPDATE.
+8. **Fire UPDATE and DELETE triggers.** _Done._ The UPDATE path fires BEFORE/AFTER triggers
+   against the NEW row (a BEFORE veto aborts the update); the DELETE path fires them against the
+   OLD row (a BEFORE veto aborts the delete). AFTER on the scan-based delete fires at match time
+   because the two-phase delete frees the row before the delete loop and an AFTER DELETE trigger
+   is read-only today; this moves post-delete when in-process DML lands. Full OLD/NEW pairs for an
+   UPDATE trigger (it currently sees only the NEW row) are a later refinement.
 
 9. **Positional row ABI versus schema evolution.** The row ABI is positional (`col_i64(0)`), so a
    UDF is bound to a specific column layout. `ALTER TABLE ADD` / `DROP COLUMN` silently shifts the

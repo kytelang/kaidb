@@ -6983,3 +6983,86 @@ test "wasm trigger via SQL: BEFORE INSERT veto and persistence across restart" {
         try h.q(&exec, allocator, "INSERT INTO orders (id, amount) VALUES (4, 9999)");
     }
 }
+
+test "wasm trigger via SQL: BEFORE UPDATE and BEFORE DELETE veto" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_wasm_trig_ud.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+    defer Io.Dir.deleteTree(.cwd(), io, "udf") catch {};
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+    var db = try Database.open(allocator, io, db_path, 64, null);
+    defer db.close();
+    var exec = QueryExecutor.init(allocator, db);
+    defer exec.deinit();
+
+    // CHECKAMOUNT reads column 1 (amount) and returns 1 (allow) when amount < 1000, else 0 (veto).
+    const wasm = @embedFile("wasm/testdata_trig_check.wasm");
+    const hex = comptime std.fmt.bytesToHex(wasm, .lower);
+
+    const h = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+        fn errs(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message != null);
+        }
+        fn amountOf(e: *QueryExecutor, a: std.mem.Allocator, id: []const u8) ![]const u8 {
+            const res = try e.execute(.{ .sql = "SELECT id, amount FROM orders" });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+            for (res.rows) |r| {
+                if (std.mem.eql(u8, r[0], id)) return a.dupe(u8, r[1]);
+            }
+            return a.dupe(u8, "MISSING");
+        }
+    };
+
+    try h.q(&exec, allocator, "CREATE FUNCTION CHECKAMOUNT LANGUAGE wasm AS '" ++ hex ++ "'");
+    try h.q(&exec, allocator, "CREATE TABLE orders (id INT PRIMARY KEY, amount INT)");
+    // No INSERT trigger here, so an over-limit row can be seeded for the DELETE-veto case.
+    try h.q(&exec, allocator, "INSERT INTO orders (id, amount) VALUES (1, 2000)");
+    try h.q(&exec, allocator, "INSERT INTO orders (id, amount) VALUES (2, 100)");
+
+    // BEFORE UPDATE veto: setting amount to an over-limit value is rejected; a within-limit
+    // update is allowed.
+    try h.q(&exec, allocator, "CREATE TRIGGER uguard BEFORE UPDATE ON orders EXECUTE FUNCTION CHECKAMOUNT()");
+    try h.errs(&exec, allocator, "UPDATE orders SET amount = 5000 WHERE id = 2");
+    {
+        const a2 = try h.amountOf(&exec, allocator, "2");
+        defer allocator.free(a2);
+        try std.testing.expectEqualStrings("100", a2); // unchanged, the update was vetoed
+    }
+    try h.q(&exec, allocator, "UPDATE orders SET amount = 300 WHERE id = 2");
+    {
+        const a2 = try h.amountOf(&exec, allocator, "2");
+        defer allocator.free(a2);
+        try std.testing.expectEqualStrings("300", a2);
+    }
+
+    // BEFORE DELETE veto: deleting the over-limit row (id 1, amount 2000) is rejected by the
+    // trigger reading the OLD row; after DROP it is allowed.
+    try h.q(&exec, allocator, "CREATE TRIGGER dguard BEFORE DELETE ON orders EXECUTE FUNCTION CHECKAMOUNT()");
+    try h.errs(&exec, allocator, "DELETE FROM orders WHERE id = 1");
+    {
+        const a1 = try h.amountOf(&exec, allocator, "1");
+        defer allocator.free(a1);
+        try std.testing.expectEqualStrings("2000", a1); // still present, delete was vetoed
+    }
+    try h.q(&exec, allocator, "DROP TRIGGER dguard");
+    try h.q(&exec, allocator, "DELETE FROM orders WHERE id = 1");
+    {
+        const a1 = try h.amountOf(&exec, allocator, "1");
+        defer allocator.free(a1);
+        try std.testing.expectEqualStrings("MISSING", a1); // now deleted
+    }
+}
