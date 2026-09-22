@@ -831,17 +831,26 @@ hostile.
 
 Test and hardening plan:
 
-- Fork zware's `test/testrunner` and run the official WebAssembly test suite (minus the
-  rejected proposals) in kaidb CI.
-- Fork and extend the fuzzer, wired into `gate.sh`, over decode, validate, lower, and
-  execute, with an adversarial corpus (infinite loops, memory bombs, deep recursion, huge
-  branch tables, lying pointers). Every input must terminate in a trap or a valid result,
-  never in a crash, hang, or leak.
-- Run the whole subsystem under ASAN in CI.
-- A **determinism differential test**: run each corpus module twice (and across a simulated
-  primary and replica) and assert bit-identical output, including float results.
-- A **replay test**: apply a UDF-bearing workload, crash, recover, and assert the recovered
-  derived data matches.
+- _Remaining:_ fork zware's `test/testrunner` and run the official WebAssembly test suite
+  (minus the rejected proposals) in kaidb CI. This needs a WAST parser/runner and is a
+  separate, larger task.
+- _Done:_ a fuzzer wired into `gate.sh` (`src/wasm/fuzz_test.zig`) over decode, validate, and
+  execute, with an adversarial corpus (infinite loops, a memory bomb, deep recursion). Every
+  input terminates in a trap or a valid result, never in a crash, hang, or leak: the fuel
+  budget and memory-page cap bound time and space, and the leak-checking test allocator bounds
+  memory. A fixed PRNG seed makes any failure reproducible. Lying-pointer inputs are already
+  covered by the bounds-safety tests in `udf_test.zig` (the host bounds-checks every guest
+  pointer before use, section 6.4). Huge branch tables are a corpus addition for later.
+- _Done:_ the subsystem runs under the safety-checked optimized build (`zig test -OReleaseSafe`)
+  in `gate.sh`, Zig's ASAN-equivalent for pure-Zig code (bounds, overflow, and use-after-free
+  poisoning on the release codegen path).
+- _Done:_ a **determinism differential test** runs a float module (including a NaN path) across
+  independent instances and independent re-decodes and asserts bit-identical output. A
+  cross-process primary/replica harness remains.
+- _Done:_ a **replay test** re-decodes a module from its stored source bytes (simulating
+  recovery) and asserts the replayed derived value matches what was recorded before. A
+  full crash/recover of persisted derived data is bounded by kaidb's separate row-durability
+  behaviour (noted under M4).
 
 ## 14. Performance tuning
 
@@ -1009,12 +1018,20 @@ Test and hardening plan:
   end-to-end SQL tests (whole-table, per-group, case-insensitive, DROP). Remaining: `merge`
   (only needed for parallel/partitioned aggregation), a wasm aggregate in HAVING, and
   non-integer accumulator values.
-- **M6: hardening to production.** _Started:_ the engine's own suites (metering, determinism,
-  marshalling, and an adversarial-input test that feeds garbage, empty, truncated, and
-  infinite-recursion modules and asserts they are rejected or trapped, never crash) are wired
-  into `gate.sh` so the sandbox guarantees are gated on every run. _Remaining:_ the official
-  WebAssembly test suite in CI, a fuzzer over decode/validate/execute, ASAN over the VM, and
-  the determinism-differential and replay tests.
+- **M6: hardening to production.** _Largely done._ The engine's own suites (metering,
+  determinism, marshalling, and an adversarial-input test) are gated in `gate.sh`, and M6 adds
+  `src/wasm/fuzz_test.zig`: a fuzzer over decode/validate/execute (thousands of random-byte
+  inputs, thousands of single-bit mutations of a valid module, and an adversarial corpus of
+  unbounded recursion and a `memory.grow` bomb), plus determinism-differential and replay
+  tests. The fuzzer's seed is fixed so a failure reproduces; the leak-checking test allocator,
+  the per-call fuel budget, and the memory-page cap enforce "never leak / hang / blow memory"
+  by construction. The determinism test asserts float results (including the canonical NaN) are
+  bit-identical across independent instances and re-decodes; the replay test re-decodes a module
+  from its stored bytes and asserts the derived value reproduces. The whole engine suite also
+  runs under `zig test -OReleaseSafe` in `gate.sh` (Zig's ASAN-equivalent for pure-Zig code:
+  runtime safety, including use-after-free poisoning, on the optimized codegen path). _Remaining:_
+  the official WebAssembly conformance suite, which needs vendoring a WAST runner (a separate,
+  larger task), and a cross-process primary/replica differential harness.
 - **M7: hypermedia from the database (KYX).** The apex use-case of section 12.4: a KYX view
   compiled into a wasm guest, invoked over a scan to return rendered HTML fragments through
   the response frame with a text/html payload tag, plus the option to persist a rendered

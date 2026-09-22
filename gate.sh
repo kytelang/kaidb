@@ -20,11 +20,22 @@ if [ $fail -eq 0 ]; then
 fi
 
 if [ $fail -eq 0 ]; then
-  step "zig test (wasm engine: metering, determinism, marshalling, hardening)"
+  step "zig test (wasm engine: metering, determinism, marshalling, hardening, fuzz)"
   # The embedded WebAssembly engine's own suites are standalone files (they import only the
   # engine, not the whole DB). Run each explicitly so the sandbox guarantees are gated.
-  for t in smoke_test udf_test registry_test; do
+  # fuzz_test is the M6 fuzzer + determinism-differential + replay suite (embed-wasm.md section 13).
+  for t in smoke_test udf_test registry_test fuzz_test; do
     zig test "src/wasm/$t.zig" || fail=1
+  done
+fi
+
+if [ $fail -eq 0 ]; then
+  step "zig test -OReleaseSafe (wasm engine under the safety-checked optimized build)"
+  # Zig's ASAN-equivalent for pure-Zig code: ReleaseSafe keeps runtime safety (bounds, overflow,
+  # undefined-memory poisoning that catches use-after-free) while optimizing, so the sandbox and
+  # the fuzzer are exercised on the release codegen path, not just Debug. (embed-wasm.md M6.)
+  for t in smoke_test udf_test registry_test fuzz_test; do
+    zig test -OReleaseSafe "src/wasm/$t.zig" || fail=1
   done
 fi
 
