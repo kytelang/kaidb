@@ -118,8 +118,25 @@ concurrency, security, and resource-safety properties a shipped feature needs. I
     (decode / validate / execute); it does not yet cover the trigger and procedure SQL paths, and
     the official WebAssembly conformance suite (a vendored WAST runner) is still outstanding.
 
-## Suggested order of work
+## Progress
 
-The two changes that most move the subsystem from "works in a single-connection demo" to "safe
-under a real server" are **P0-1 (move persistence into the catalog and WAL)** and **P0-2 (registry
-concurrency)**. Everything else is valuable but layers on top of those two.
+Implemented and gated so far: P0-2 (threadlocal registry pointer; rw_lock already serialises
+mutation vs read), P0-3 (trigger-depth guard), P1-4 (admin authorises UDF/trigger DDL, CALL needs
+write), P1-5 instance cap, P1-6 (result-buffer error instead of truncation), P1-7 (module-size and
+registry-count caps), P1-8 (UPDATE and DELETE triggers fire), and P2-11 (`sys.wasm_functions` /
+`sys.wasm_triggers` views).
+
+Remaining, in rough priority order:
+
+1. **P0-1: move persistence into the catalog and WAL** (the largest item, and the one that most
+   moves the subsystem toward production: it makes registration crash-consistent, transactional,
+   and replicated). This deserves its own focused pass.
+2. **P1-9: bind the row ABI by name or stamp a schema version** so `ALTER TABLE` cannot silently
+   shift column indices under a UDF. This is a design choice (a name-based ABI change versus a
+   version stamp), not a quick edit.
+3. **P1-5 (remaining): a per-statement fuel ceiling** on top of the per-call budget.
+4. **P1-10 and the in-process query interface (design section 11)**, which unlocks DML from
+   procedures and AFTER triggers.
+5. **P2-12 (surface persistence failures) and P2-13 (fuzz the SQL trigger/procedure paths, vendor
+   the WebAssembly conformance suite).** P2-12 largely closes once P0-1 folds persistence into the
+   WAL.
