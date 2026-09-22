@@ -71,6 +71,16 @@ pub const Statement = union(enum) {
     create_aggregate: CreateAggregateStmt,
     /// A `DROP AGGREGATE name`.
     drop_aggregate: DropAggregateStmt,
+    /// A `CREATE PROCEDURE ... LANGUAGE wasm AS '<hex>'`.
+    create_procedure: CreateProcedureStmt,
+    /// A `DROP PROCEDURE name`.
+    drop_procedure: DropProcedureStmt,
+    /// A `CALL name(args)` invocation of a stored procedure.
+    call: CallStmt,
+    /// A `CREATE TRIGGER ...` binding a wasm function to a table DML event.
+    create_trigger: CreateTriggerStmt,
+    /// A `DROP TRIGGER name`.
+    drop_trigger: DropTriggerStmt,
     /// A `DROP TABLE`. See [`DropTableStmt`].
     drop_table: DropTableStmt,
     /// A `DROP INDEX`. See [`DropIndexStmt`].
@@ -450,6 +460,52 @@ pub const CreateAggregateStmt = struct {
 
 /// `DROP AGGREGATE name` unregisters a wasm aggregate.
 pub const DropAggregateStmt = struct {
+    name: []const u8,
+};
+
+/// A `CREATE PROCEDURE name [LANGUAGE wasm] AS '<hex>'`: registers a wasm stored procedure,
+/// invoked with `CALL name(args)`. Unlike a function it is not usable in an expression and
+/// returns an integer status rather than a value or HTML.
+pub const CreateProcedureStmt = struct {
+    /// The procedure name (upper-cased by the executor to match `CALL` sites).
+    name: []const u8,
+    /// The wasm module bytes as a hex string (borrowed from the SQL text).
+    wasm_hex: []const u8,
+};
+
+/// `DROP PROCEDURE name` unregisters a wasm stored procedure.
+pub const DropProcedureStmt = struct {
+    name: []const u8,
+};
+
+/// A `CALL name(arg, ...)` invocation of a stored procedure. Arguments are ordinary scalar
+/// expressions (usually literals); the procedure runs sandboxed and returns an integer status.
+pub const CallStmt = struct {
+    name: []const u8,
+    args: []*Expr,
+};
+
+/// When a trigger fires relative to the row change.
+pub const TriggerTiming = enum(u8) { BEFORE, AFTER };
+
+/// The DML event a trigger fires on.
+pub const TriggerEvent = enum(u8) { INSERT, UPDATE, DELETE };
+
+/// A `CREATE TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON table EXECUTE FUNCTION fn()`:
+/// binds a registered row-facing wasm function to a table's DML event. A `BEFORE` trigger may
+/// veto the operation (the function returning 0, or trapping, rejects the row); an `AFTER`
+/// trigger runs for its side effect and its result is ignored.
+pub const CreateTriggerStmt = struct {
+    name: []const u8,
+    timing: TriggerTiming,
+    event: TriggerEvent,
+    table_name: []const u8,
+    /// The registered wasm function the trigger runs (upper-cased to match the registry key).
+    function_name: []const u8,
+};
+
+/// `DROP TRIGGER name` removes a trigger.
+pub const DropTriggerStmt = struct {
     name: []const u8,
 };
 

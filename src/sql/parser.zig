@@ -583,8 +583,32 @@ pub const Parser = struct {
             .BACKUP => try self.parseBackup(),
             .GRANT => try self.parseGrant(),
             .REVOKE => try self.parseRevoke(),
-            else => error.UnexpectedToken,
+            // CALL is not a reserved keyword; it arrives as an identifier at statement start.
+            else => {
+                if (tok.type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(tok), "CALL"))
+                    return try self.parseCall();
+                return error.UnexpectedToken;
+            },
         };
+    }
+
+    /// Parses `CALL name(arg, ...)`: a stored-procedure invocation. Arguments are ordinary scalar
+    /// expressions. The name is upper-cased to match the procedure registry key.
+    fn parseCall(self: *Parser) !ast.Statement {
+        self.eat(); // CALL
+        const name_tok = try self.expect(.IDENTIFIER);
+        const name = try std.ascii.allocUpperString(self.arena.allocator(), self.sliceText(name_tok));
+        _ = try self.expect(.LPAREN);
+        var args = std.ArrayList(*ast.Expr).empty;
+        if (self.current().type != .RPAREN) {
+            try args.append(self.arena.allocator(), try self.parseExpr());
+            while (self.current().type == .COMMA) {
+                self.eat();
+                try args.append(self.arena.allocator(), try self.parseExpr());
+            }
+        }
+        _ = try self.expect(.RPAREN);
+        return .{ .call = .{ .name = name, .args = try args.toOwnedSlice(self.arena.allocator()) } };
     }
 
     /// Parses `BEGIN [TRANSACTION]`, opening a transaction.
@@ -1094,15 +1118,95 @@ pub const Parser = struct {
             },
             .USER => try self.parseCreateUser(),
             .ROLE => try self.parseCreateRole(),
-            // FUNCTION and AGGREGATE are not reserved keywords, so they arrive as identifiers.
+            // FUNCTION, AGGREGATE, PROCEDURE, and TRIGGER are not reserved keywords, so they
+            // arrive as identifiers.
             else => {
                 if (tok.type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(tok), "FUNCTION"))
                     return try self.parseCreateFunction();
                 if (tok.type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(tok), "AGGREGATE"))
                     return try self.parseCreateAggregate();
+                if (tok.type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(tok), "PROCEDURE"))
+                    return try self.parseCreateProcedure();
+                if (tok.type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(tok), "TRIGGER"))
+                    return try self.parseCreateTrigger();
                 return error.UnexpectedToken;
             },
         };
+    }
+
+    /// Parses `CREATE PROCEDURE name [LANGUAGE wasm] AS '<hex>'`.
+    fn parseCreateProcedure(self: *Parser) !ast.Statement {
+        self.eat(); // PROCEDURE
+        const name_tok = try self.expect(.IDENTIFIER);
+        const name = self.sliceText(name_tok);
+        if (self.current().type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(self.current()), "LANGUAGE")) {
+            self.eat(); // LANGUAGE
+            self.eat(); // the language name (e.g. wasm)
+        }
+        _ = try self.expect(.AS);
+        const bytes_tok = try self.expect(.STRING);
+        const wasm_hex = self.cleanString(self.sliceText(bytes_tok));
+        return .{ .create_procedure = .{ .name = name, .wasm_hex = wasm_hex } };
+    }
+
+    /// Parses `CREATE TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON table EXECUTE FUNCTION
+    /// fn()`. `BEFORE`/`AFTER`, the event, `EXECUTE`, `FUNCTION`, and the row keyword are matched
+    /// by case-insensitive text since none are reserved words. `FOR EACH ROW` is accepted and
+    /// ignored (row-level is the only mode).
+    fn parseCreateTrigger(self: *Parser) !ast.Statement {
+        self.eat(); // TRIGGER
+        const name_tok = try self.expect(.IDENTIFIER);
+        const name = self.sliceText(name_tok);
+
+        const timing_tok = try self.expect(.IDENTIFIER);
+        const timing: ast.TriggerTiming = if (std.ascii.eqlIgnoreCase(self.sliceText(timing_tok), "BEFORE"))
+            .BEFORE
+        else if (std.ascii.eqlIgnoreCase(self.sliceText(timing_tok), "AFTER"))
+            .AFTER
+        else
+            return error.UnexpectedToken;
+
+        const event_tok = self.current();
+        const event: ast.TriggerEvent = switch (event_tok.type) {
+            .INSERT => .INSERT,
+            .UPDATE => .UPDATE,
+            .DELETE => .DELETE,
+            else => return error.UnexpectedToken,
+        };
+        self.eat(); // the event keyword
+
+        _ = try self.expect(.ON);
+        const table_tok = try self.expect(.IDENTIFIER);
+        const table_name = self.sliceText(table_tok);
+
+        // Optional `FOR EACH ROW` (all contextual identifiers), accepted and ignored.
+        if (self.current().type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(self.current()), "FOR")) {
+            self.eat(); // FOR
+            _ = try self.expect(.IDENTIFIER); // EACH
+            _ = try self.expect(.IDENTIFIER); // ROW
+        }
+
+        // `EXECUTE FUNCTION fn ( )` (also accept the Postgres `EXECUTE PROCEDURE` spelling).
+        const exec_tok = try self.expect(.IDENTIFIER);
+        if (!std.ascii.eqlIgnoreCase(self.sliceText(exec_tok), "EXECUTE")) return error.UnexpectedToken;
+        const kw_tok = try self.expect(.IDENTIFIER);
+        if (!std.ascii.eqlIgnoreCase(self.sliceText(kw_tok), "FUNCTION") and
+            !std.ascii.eqlIgnoreCase(self.sliceText(kw_tok), "PROCEDURE")) return error.UnexpectedToken;
+        const fn_tok = try self.expect(.IDENTIFIER);
+        const fn_name = self.sliceText(fn_tok);
+        // Optional trailing `()`.
+        if (self.current().type == .LPAREN) {
+            self.eat();
+            _ = try self.expect(.RPAREN);
+        }
+
+        return .{ .create_trigger = .{
+            .name = name,
+            .timing = timing,
+            .event = event,
+            .table_name = table_name,
+            .function_name = fn_name,
+        } };
     }
 
     /// Parses `CREATE AGGREGATE name [LANGUAGE wasm] AS '<hex>'` (embed-wasm.md M5). The wasm
@@ -1194,6 +1298,16 @@ pub const Parser = struct {
                     self.eat(); // AGGREGATE
                     const ag_tok = try self.expect(.IDENTIFIER);
                     return .{ .drop_aggregate = .{ .name = self.sliceText(ag_tok) } };
+                }
+                if (tok.type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(tok), "PROCEDURE")) {
+                    self.eat(); // PROCEDURE
+                    const pr_tok = try self.expect(.IDENTIFIER);
+                    return .{ .drop_procedure = .{ .name = self.sliceText(pr_tok) } };
+                }
+                if (tok.type == .IDENTIFIER and std.ascii.eqlIgnoreCase(self.sliceText(tok), "TRIGGER")) {
+                    self.eat(); // TRIGGER
+                    const tr_tok = try self.expect(.IDENTIFIER);
+                    return .{ .drop_trigger = .{ .name = self.sliceText(tr_tok) } };
                 }
                 return error.UnexpectedToken;
             },

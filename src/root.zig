@@ -6845,3 +6845,141 @@ test "wasm KYX view via SQL: live render per row and persisted-render computed c
         try std.testing.expectEqualStrings("<tr><td>Wrench</td><td class=\"num\">42</td></tr>", res.rows[0][1]);
     }
 }
+
+test "wasm stored procedure via SQL: CREATE PROCEDURE + CALL returns a status, DROP" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_wasm_proc.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+    defer Io.Dir.deleteTree(.cwd(), io, "udf") catch {};
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+
+    // A stored procedure is a wasm module invoked with CALL; here it doubles its argument and
+    // returns it as the status (same module the M1 scalar test uses).
+    const wasm = @embedFile("query/testdata_udf.wasm");
+    const hex = comptime std.fmt.bytesToHex(wasm, .lower);
+
+    const h = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+        fn oneCell(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) ![]const u8 {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+            try std.testing.expectEqual(@as(usize, 1), res.rows.len);
+            return a.dupe(u8, res.rows[0][0]);
+        }
+    };
+
+    // Session 1: register and CALL, then confirm the procedure persisted across a restart.
+    {
+        var db = try Database.open(allocator, io, db_path, 64, null);
+        defer db.close();
+        var exec = QueryExecutor.init(allocator, db);
+        defer exec.deinit();
+        try h.q(&exec, allocator, "CREATE PROCEDURE DBLPROC LANGUAGE wasm AS '" ++ hex ++ "'");
+        const s = try h.oneCell(&exec, allocator, "CALL DBLPROC(21)");
+        defer allocator.free(s);
+        try std.testing.expectEqualStrings("42", s);
+        // Case-insensitive CALL resolves the same procedure.
+        const s2 = try h.oneCell(&exec, allocator, "call dblproc(50)");
+        defer allocator.free(s2);
+        try std.testing.expectEqualStrings("100", s2);
+    }
+    {
+        var db = try Database.open(allocator, io, db_path, 64, null);
+        defer db.close();
+        var exec = QueryExecutor.init(allocator, db);
+        defer exec.deinit();
+        // Reloaded from disk: still callable.
+        const s = try h.oneCell(&exec, allocator, "CALL DBLPROC(7)");
+        defer allocator.free(s);
+        try std.testing.expectEqualStrings("14", s);
+        // DROP removes it; a subsequent CALL is an error, not a crash.
+        try h.q(&exec, allocator, "DROP PROCEDURE DBLPROC");
+        const res = try exec.execute(.{ .sql = "CALL DBLPROC(1)" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message != null);
+    }
+}
+
+test "wasm trigger via SQL: BEFORE INSERT veto and persistence across restart" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_wasm_trig.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+    defer Io.Dir.deleteTree(.cwd(), io, "udf") catch {};
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+
+    // The trigger function reads column 1 (amount) via the row ABI and returns 0 to veto a
+    // negative amount, 1 to allow.
+    const wasm = @embedFile("wasm/testdata_trig_check.wasm");
+    const hex = comptime std.fmt.bytesToHex(wasm, .lower);
+
+    const h = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+        fn count(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !usize {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+            return res.rows.len;
+        }
+    };
+
+    {
+        var db = try Database.open(allocator, io, db_path, 64, null);
+        defer db.close();
+        var exec = QueryExecutor.init(allocator, db);
+        defer exec.deinit();
+        try h.q(&exec, allocator, "CREATE FUNCTION CHECKAMOUNT LANGUAGE wasm AS '" ++ hex ++ "'");
+        try h.q(&exec, allocator, "CREATE TABLE orders (id INT PRIMARY KEY, amount INT)");
+        try h.q(&exec, allocator, "CREATE TRIGGER guard BEFORE INSERT ON orders EXECUTE FUNCTION CHECKAMOUNT()");
+
+        // A within-limit amount is accepted.
+        try h.q(&exec, allocator, "INSERT INTO orders (id, amount) VALUES (1, 100)");
+
+        // An over-limit amount (>= 1000) is vetoed by the BEFORE trigger: the INSERT errors and
+        // no row lands.
+        {
+            const res = try exec.execute(.{ .sql = "INSERT INTO orders (id, amount) VALUES (2, 5000)" });
+            defer freeResp(allocator, res);
+            try std.testing.expect(res.error_message != null);
+        }
+        try std.testing.expectEqual(@as(usize, 1), try h.count(&exec, allocator, "SELECT id FROM orders"));
+    }
+
+    // Reopen: the trigger definition reloaded from disk still guards inserts.
+    {
+        var db = try Database.open(allocator, io, db_path, 64, null);
+        defer db.close();
+        var exec = QueryExecutor.init(allocator, db);
+        defer exec.deinit();
+        try std.testing.expect(db.wasm_triggers.items.len == 1);
+        {
+            const res = try exec.execute(.{ .sql = "INSERT INTO orders (id, amount) VALUES (3, 9999)" });
+            defer freeResp(allocator, res);
+            try std.testing.expect(res.error_message != null);
+        }
+        // DROP TRIGGER removes the guard; an over-limit amount is then allowed.
+        try h.q(&exec, allocator, "DROP TRIGGER guard");
+        try std.testing.expect(db.wasm_triggers.items.len == 0);
+        try h.q(&exec, allocator, "INSERT INTO orders (id, amount) VALUES (4, 9999)");
+    }
+}

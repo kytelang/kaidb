@@ -4381,6 +4381,12 @@ pub const QueryExecutor = struct {
                     return err;
                 };
 
+                // BEFORE INSERT triggers may veto the row (a bound function returning 0 or trapping
+                // rejects the insert).
+                if (!try self.fireRowTriggers(table_meta, .INSERT, .BEFORE, &row_obj)) {
+                    return QueryResponse{ .error_message = try self.allocator.dupe(u8, "INSERT rejected by BEFORE trigger") };
+                }
+
                 try self.writeNewVersion(table_tree, ins.table_name, final_pk, row_obj, false);
 
                 for (self.db.catalog.indexes.items) |idx| {
@@ -4413,6 +4419,11 @@ pub const QueryExecutor = struct {
                         try self.db.updateIndexRootPageId(idx.name, idx_tree.root_page_id, self.current_tx_id.?);
                     }
                 }
+
+                // AFTER INSERT triggers run for their side effect once the row is written; the
+                // result is ignored (an AFTER trigger cannot veto).
+                _ = self.fireRowTriggers(table_meta, .INSERT, .AFTER, &row_obj) catch |err|
+                    std.log.warn("AFTER INSERT trigger on {s} failed: {any}", .{ ins.table_name, err });
 
                 inserted += 1;
                 }
@@ -5747,6 +5758,57 @@ pub const QueryExecutor = struct {
                 self.db.removeWasmAggregate(upper);
                 return QueryResponse{ .rows_affected = 1 };
             },
+            .create_procedure => |cp| {
+                // Register a wasm stored procedure, invoked with CALL. Scalar-style (reuses the
+                // function wrapper), upper-cased so CALL sites match. Persisted as `.wproc`.
+                const hex = cp.wasm_hex;
+                if (hex.len % 2 != 0)
+                    return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CREATE PROCEDURE: odd-length hex module") };
+                const bytes = try self.allocator.alloc(u8, hex.len / 2);
+                defer self.allocator.free(bytes);
+                _ = std.fmt.hexToBytes(bytes, hex) catch
+                    return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CREATE PROCEDURE: invalid hex module") };
+                const upper = try std.ascii.allocUpperString(self.allocator, cp.name);
+                defer self.allocator.free(upper);
+                self.db.wasm_procedures.register(upper, bytes, .{}, false) catch
+                    return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CREATE PROCEDURE: module failed to decode or validate") };
+                self.db.persistWasmProcedure(upper, bytes) catch |err|
+                    std.log.warn("CREATE PROCEDURE {s}: persistence failed: {any}", .{ upper, err });
+                return QueryResponse{ .rows_affected = 1 };
+            },
+            .drop_procedure => |dp| {
+                const upper = try std.ascii.allocUpperString(self.allocator, dp.name);
+                defer self.allocator.free(upper);
+                _ = self.db.wasm_procedures.drop(upper);
+                self.db.removeWasmProcedure(upper);
+                return QueryResponse{ .rows_affected = 1 };
+            },
+            .call => |c| return self.executeCall(c),
+            .create_trigger => |ct| {
+                // A trigger binds a registered wasm function to a table's DML event. The function
+                // must already exist (CREATE FUNCTION); it is upper-cased to match the registry.
+                const upper_fn = try std.ascii.allocUpperString(self.allocator, ct.function_name);
+                defer self.allocator.free(upper_fn);
+                if (self.db.wasm_functions.get(upper_fn) == null)
+                    return QueryResponse{ .error_message = try std.fmt.allocPrint(self.allocator, "CREATE TRIGGER: function '{s}' is not registered", .{upper_fn}) };
+                const upper_name = try std.ascii.allocUpperString(self.allocator, ct.name);
+                defer self.allocator.free(upper_name);
+                self.db.registerTrigger(.{
+                    .name = upper_name,
+                    .timing = ct.timing,
+                    .event = ct.event,
+                    .table_name = ct.table_name,
+                    .function_name = upper_fn,
+                }) catch |err|
+                    return QueryResponse{ .error_message = try std.fmt.allocPrint(self.allocator, "CREATE TRIGGER failed: {any}", .{err}) };
+                return QueryResponse{ .rows_affected = 1 };
+            },
+            .drop_trigger => |dt| {
+                const upper = try std.ascii.allocUpperString(self.allocator, dt.name);
+                defer self.allocator.free(upper);
+                self.db.unregisterTrigger(upper);
+                return QueryResponse{ .rows_affected = 1 };
+            },
             .drop_table => |dt| {
                 try self.db.dropTable(dt.table_name, self.current_tx_id.?);
                 return QueryResponse{ .rows_affected = 1 };
@@ -6882,15 +6944,17 @@ pub const QueryExecutor = struct {
     ///
     /// The wasm registry is already bound to `query_iter.active_wasm_registry` for the life of the
     /// statement (set in `execute`), so no extra threading is needed here.
-    fn computeGeneratedCell(self: *QueryExecutor, table: Table, expr_text: []const u8, new_data: *const CatalogCellMap) ![]const u8 {
-        // Build a TYPED row view over the sibling cells. The insert/update cell map stores every
-        // value as text, but the evaluator (and a wasm UDF over it) must see a column's declared
-        // type: `DBL(x)` on an INT column has to pass an integer, not a string, or the UDF's
-        // parameter arity would not match. So coerce each text cell to its column's type here.
+    /// Build a TYPED [`query_iter.TableRow`] over an insert/update cell map. The map stores every
+    /// value as text, but an evaluator (and a wasm UDF over it) must see a column's declared type:
+    /// `DBL(x)` on an INT column has to pass an integer, not a string, or the UDF's parameter arity
+    /// would not match. So each text cell is coerced to its column's type here, in schema order.
+    /// The returned row owns its cell text and its `names`/`cells` arrays; free it with
+    /// [`query_iter.freeTableRow`]. Shared by the generated-column and trigger paths.
+    fn typedTableRow(self: *QueryExecutor, table: Table, new_data: *const CatalogCellMap) !query_iter.TableRow {
         const names = try self.allocator.alloc([]const u8, table.columns.len);
-        defer self.allocator.free(names);
+        errdefer self.allocator.free(names);
         const cells = try self.allocator.alloc(query_iter.Cell, table.columns.len);
-        defer {
+        errdefer {
             for (cells) |c| switch (c) {
                 .text => |t| self.allocator.free(t),
                 else => {},
@@ -6914,7 +6978,14 @@ pub const QueryExecutor = struct {
                 };
             };
         }
-        const row = query_iter.TableRow{ .names = names, .cells = cells, .owns_names = false };
+        // owns_names=true so `freeTableRow` frees the `names` array we allocated (the name byte
+        // slices inside it are schema-stable and stay borrowed).
+        return .{ .names = names, .cells = cells, .owns_names = true };
+    }
+
+    fn computeGeneratedCell(self: *QueryExecutor, table: Table, expr_text: []const u8, new_data: *const CatalogCellMap) ![]const u8 {
+        const row = try self.typedTableRow(table, new_data);
+        defer query_iter.freeTableRow(self.allocator, row);
 
         var parser = Parser.init(self.allocator, expr_text) catch return self.allocator.dupe(u8, "NULL");
         defer parser.deinit();
@@ -6928,6 +6999,94 @@ pub const QueryExecutor = struct {
             .float => |f| try std.fmt.allocPrint(self.allocator, "{d}", .{f}),
             .string => |s| try self.allocator.dupe(u8, s),
         };
+    }
+
+    /// Executes `CALL name(args)`: runs a registered wasm stored procedure sandboxed and metered
+    /// and returns its integer status as a one-column ("status") one-row result. Arguments must be
+    /// literals (int/float/text); a procedure does not read the row, so there is no row context.
+    fn executeCall(self: *QueryExecutor, c: ast.CallStmt) !QueryResponse {
+        query_iter.active_wasm_registry = &self.db.wasm_functions;
+        const wfn = self.db.wasm_procedures.get(c.name) orelse
+            return QueryResponse{ .error_message = try std.fmt.allocPrint(self.allocator, "CALL: procedure '{s}' is not registered", .{c.name}) };
+
+        const WasmArg = wasm_udf.WasmScalarFn.Arg;
+        var arg_buf: [8]WasmArg = undefined;
+        if (c.args.len > arg_buf.len)
+            return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CALL: too many arguments") };
+        for (c.args, 0..) |a, i| {
+            arg_buf[i] = switch (a.*) {
+                .literal_int => |v| .{ .int = v },
+                .literal_float => |v| .{ .int = std.math.lossyCast(i64, v) },
+                .literal_text => |s| .{ .str = s },
+                else => return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CALL: only literal arguments are supported") },
+            };
+        }
+        var out_buf: [512]u8 = undefined;
+        const res = wfn.call(arg_buf[0..c.args.len], out_buf[0..]) catch |err|
+            return QueryResponse{ .error_message = try std.fmt.allocPrint(self.allocator, "CALL: procedure trapped or failed: {any}", .{err}) };
+        const status: i64 = switch (res) {
+            .int => |v| v,
+            .str_len => 0,
+        };
+
+        const cols = try self.allocator.alloc([]const u8, 1);
+        cols[0] = try self.allocator.dupe(u8, "status");
+        const ctypes = try self.allocator.alloc(ColumnType, 1);
+        ctypes[0] = .INT64;
+        const cell = try std.fmt.allocPrint(self.allocator, "{d}", .{status});
+        const row0 = try self.allocator.alloc([]const u8, 1);
+        row0[0] = cell;
+        const rows = try self.allocator.alloc([]const []const u8, 1);
+        rows[0] = row0;
+        return QueryResponse{ .columns = cols, .column_types = ctypes, .rows = rows, .rows_affected = 1 };
+    }
+
+    /// Fires the DML triggers registered for `(table, event, timing)` against the affected row.
+    ///
+    /// The row's cells (`new_data`, text-valued) are coerced to a typed row and each trigger's
+    /// bound wasm function is run against it (a row-facing function reads columns through the M3
+    /// col ABI; a plain scalar function is called with no arguments). For a `BEFORE` trigger the
+    /// function's result vetoes the operation: a `0` result or a trap returns `false`, so the
+    /// caller aborts the DML. An `AFTER` trigger runs for its side effect and never vetoes (a trap
+    /// is logged). Returns `true` when the operation may proceed.
+    fn fireRowTriggers(
+        self: *QueryExecutor,
+        table: Table,
+        event: ast.TriggerEvent,
+        timing: ast.TriggerTiming,
+        new_data: *const CatalogCellMap,
+    ) !bool {
+        // Fast path: no triggers for this table at all.
+        var any = false;
+        for (self.db.wasm_triggers.items) |t| {
+            if (t.event == event and t.timing == timing and std.mem.eql(u8, t.table_name, table.name)) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) return true;
+
+        query_iter.active_wasm_registry = &self.db.wasm_functions;
+        const tr = try self.typedTableRow(table, new_data);
+        defer query_iter.freeTableRow(self.allocator, tr);
+        var data_slice = [1]query_iter.TableRow{tr};
+        var tables_slice = [1][]const u8{table.name};
+        const row = query_iter.Row{ .tables = tables_slice[0..], .data = data_slice[0..] };
+
+        for (self.db.wasm_triggers.items) |t| {
+            if (t.event != event or t.timing != timing or !std.mem.eql(u8, t.table_name, table.name)) continue;
+            var no_args = [_]*ast.Expr{};
+            const fc_expr = ast.Expr{ .func_call = .{ .name = t.function_name, .args = no_args[0..] } };
+            const v = query_iter.evalScalarRow(&fc_expr, row);
+            const status: i64 = if (v) |vv| switch (vv) {
+                .integer => |iv| iv,
+                .bool => |b| @intFromBool(b),
+                .null => 0, // a trap or an unknown function reads as NULL -> treat as a veto
+                else => 1,
+            } else 0;
+            if (timing == .BEFORE and status == 0) return false; // vetoed
+        }
+        return true;
     }
 
     fn buildCatalogRows(self: *QueryExecutor, table_meta: Table, table_name: []const u8) ![]query_iter.TableRow {

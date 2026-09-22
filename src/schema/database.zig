@@ -126,6 +126,17 @@ const GroupLock = @import("utils").sync.GroupLock;
 const TransactionManager = @import("../concurrency/transaction.zig").TransactionManager;
 const WasmRegistry = @import("../wasm/registry.zig").Registry;
 const WasmAggRegistry = @import("../wasm/registry.zig").AggRegistry;
+
+/// A registered DML trigger: a wasm function bound to a table's INSERT/UPDATE/DELETE event, with
+/// a timing (BEFORE/AFTER). All strings are heap-owned; freed in [`Database.close`]. Persisted as
+/// a `.wtrig` file so it survives a restart.
+pub const TriggerDef = struct {
+    name: []const u8,
+    timing: ast.TriggerTiming,
+    event: ast.TriggerEvent,
+    table_name: []const u8,
+    function_name: []const u8,
+};
 /// The write-ahead log; durability and the source stream for replication.
 const WriteAheadLog = @import("../durability/write_ahead_log.zig").WriteAheadLog;
 
@@ -235,6 +246,13 @@ pub const Database = struct {
     /// (embed-wasm.md M5). The aggregate operator spins a per-group instance from this. In-memory;
     /// file-backed persistence mirrors the scalar registry (see [`Database.loadWasmFunctions`]).
     wasm_aggregates: WasmAggRegistry,
+    /// Registry of wasm stored procedures registered with `CREATE PROCEDURE ... LANGUAGE wasm`,
+    /// invoked with `CALL`. Same shape as a scalar function (it holds a `WasmScalarFn`) but a
+    /// separate namespace so a procedure and a function may share a name. File-backed (`.wproc`).
+    wasm_procedures: WasmRegistry,
+    /// Registered DML triggers (`CREATE TRIGGER`), each binding a wasm function to a table event.
+    /// Fired from the executor's INSERT/UPDATE/DELETE paths. In-memory; file-backed (`.wtrig`).
+    wasm_triggers: std.ArrayListUnmanaged(TriggerDef) = .empty,
     /// Object name → root page id for every table, including `sys.*` tables.
     /// Keys are owned (duped) copies freed on teardown.
     table_roots: std.StringHashMap(u64),
@@ -382,6 +400,7 @@ pub const Database = struct {
             .catalog = catalog.SystemCatalog.init(allocator),
             .wasm_functions = WasmRegistry.init(allocator),
             .wasm_aggregates = WasmAggRegistry.init(allocator),
+            .wasm_procedures = WasmRegistry.init(allocator),
             .table_roots = std.StringHashMap(u64).init(allocator),
             .index_roots = std.StringHashMap(u64).init(allocator),
             .table_trees = std.StringHashMap(*BPlusTree).init(allocator),
@@ -720,6 +739,99 @@ pub const Database = struct {
         std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
     }
 
+    /// Persist a wasm stored-procedure module so it survives a restart. Mirrors
+    /// [`persistWasmFunction`], writing a `.wproc` file into the same `udf` directory.
+    pub fn persistWasmProcedure(self: *Database, name: []const u8, bytes: []const u8) !void {
+        if (self.base_dir.len == 0) return;
+        const io = self.pool.pager.io;
+        var dbuf: [512]u8 = undefined;
+        const dir = try std.fmt.bufPrint(&dbuf, "{s}/udf", .{self.base_dir});
+        std.Io.Dir.createDirPath(.cwd(), io, dir) catch {};
+        var pbuf: [700]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pbuf, "{s}/{s}.wproc", .{ dir, name });
+        const f = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, bytes);
+    }
+
+    /// Remove a persisted wasm stored-procedure module (best-effort).
+    pub fn removeWasmProcedure(self: *Database, name: []const u8) void {
+        if (self.base_dir.len == 0) return;
+        const io = self.pool.pager.io;
+        var pbuf: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pbuf, "{s}/udf/{s}.wproc", .{ self.base_dir, name }) catch return;
+        std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
+    }
+
+    /// Register a DML trigger in memory and persist it (a `.wtrig` file). Replaces any existing
+    /// trigger of the same name. All strings are duped into the database allocator. The persisted
+    /// form is `[timing u8][event u8][table_len u32][table][fn_len u32][fn]`; the file stem is the
+    /// trigger name.
+    pub fn registerTrigger(self: *Database, def: TriggerDef) !void {
+        // Replace an existing same-named trigger.
+        self.unregisterTrigger(def.name);
+        const owned = TriggerDef{
+            .name = try self.allocator.dupe(u8, def.name),
+            .timing = def.timing,
+            .event = def.event,
+            .table_name = try self.allocator.dupe(u8, def.table_name),
+            .function_name = try self.allocator.dupe(u8, def.function_name),
+        };
+        errdefer {
+            self.allocator.free(owned.name);
+            self.allocator.free(owned.table_name);
+            self.allocator.free(owned.function_name);
+        }
+        try self.wasm_triggers.append(self.allocator, owned);
+        self.persistTrigger(owned) catch |err|
+            std.log.warn("CREATE TRIGGER {s}: persistence failed: {any}", .{ owned.name, err });
+    }
+
+    /// Remove a trigger from memory (and its `.wtrig` file). Best-effort; no error if absent.
+    pub fn unregisterTrigger(self: *Database, name: []const u8) void {
+        var i: usize = 0;
+        while (i < self.wasm_triggers.items.len) {
+            const t = self.wasm_triggers.items[i];
+            if (std.mem.eql(u8, t.name, name)) {
+                self.allocator.free(t.name);
+                self.allocator.free(t.table_name);
+                self.allocator.free(t.function_name);
+                _ = self.wasm_triggers.orderedRemove(i);
+            } else i += 1;
+        }
+        if (self.base_dir.len == 0) return;
+        const io = self.pool.pager.io;
+        var pbuf: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pbuf, "{s}/udf/{s}.wtrig", .{ self.base_dir, name }) catch return;
+        std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
+    }
+
+    fn persistTrigger(self: *Database, def: TriggerDef) !void {
+        if (self.base_dir.len == 0) return;
+        const io = self.pool.pager.io;
+        var dbuf: [512]u8 = undefined;
+        const dir = try std.fmt.bufPrint(&dbuf, "{s}/udf", .{self.base_dir});
+        std.Io.Dir.createDirPath(.cwd(), io, dir) catch {};
+
+        var body = std.ArrayList(u8).empty;
+        defer body.deinit(self.allocator);
+        try body.append(self.allocator, @intFromEnum(def.timing));
+        try body.append(self.allocator, @intFromEnum(def.event));
+        var lb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &lb, @intCast(def.table_name.len), .little);
+        try body.appendSlice(self.allocator, &lb);
+        try body.appendSlice(self.allocator, def.table_name);
+        std.mem.writeInt(u32, &lb, @intCast(def.function_name.len), .little);
+        try body.appendSlice(self.allocator, &lb);
+        try body.appendSlice(self.allocator, def.function_name);
+
+        var pbuf: [700]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pbuf, "{s}/{s}.wtrig", .{ dir, def.name });
+        const f = try std.Io.Dir.createFile(.cwd(), io, path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, body.items);
+    }
+
     /// Reload persisted wasm UDFs into the registry on open (called after loadCatalog). A
     /// missing directory means none were registered; a bad module file is skipped, not fatal.
     /// The `.twasm`/`.wasm` extension restores whether the UDF returns text.
@@ -735,14 +847,23 @@ pub const Database = struct {
             if (entry.kind != .file) continue;
             var returns_string = false;
             var stem: []const u8 = undefined;
-            var is_agg = false;
+            const Kind = enum { func, agg, proc, trig };
+            var kind: Kind = .func;
             if (std.mem.endsWith(u8, entry.name, ".twasm")) {
                 returns_string = true;
                 stem = entry.name[0 .. entry.name.len - ".twasm".len];
             } else if (std.mem.endsWith(u8, entry.name, ".wagg")) {
                 // A custom wasm aggregate (embed-wasm.md M5); restore into the aggregate registry.
-                is_agg = true;
+                kind = .agg;
                 stem = entry.name[0 .. entry.name.len - ".wagg".len];
+            } else if (std.mem.endsWith(u8, entry.name, ".wproc")) {
+                // A wasm stored procedure; restore into the procedure registry.
+                kind = .proc;
+                stem = entry.name[0 .. entry.name.len - ".wproc".len];
+            } else if (std.mem.endsWith(u8, entry.name, ".wtrig")) {
+                // A DML trigger definition; restore into the in-memory trigger list.
+                kind = .trig;
+                stem = entry.name[0 .. entry.name.len - ".wtrig".len];
             } else if (std.mem.endsWith(u8, entry.name, ".wasm")) {
                 stem = entry.name[0 .. entry.name.len - ".wasm".len];
             } else continue;
@@ -750,12 +871,47 @@ pub const Database = struct {
             const path = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir, entry.name }) catch continue;
             const bytes = std.Io.Dir.readFileAlloc(.cwd(), io, path, self.allocator, .unlimited) catch continue;
             defer self.allocator.free(bytes);
-            if (is_agg) {
-                self.wasm_aggregates.register(stem, bytes, .{}) catch continue;
-            } else {
-                self.wasm_functions.register(stem, bytes, .{}, returns_string) catch continue;
+            switch (kind) {
+                .agg => self.wasm_aggregates.register(stem, bytes, .{}) catch continue,
+                .proc => self.wasm_procedures.register(stem, bytes, .{}, false) catch continue,
+                .func => self.wasm_functions.register(stem, bytes, .{}, returns_string) catch continue,
+                .trig => self.loadTriggerRecord(stem, bytes) catch continue,
             }
         }
+    }
+
+    /// Reconstructs a [`TriggerDef`] from a persisted `.wtrig` record (see [`persistTrigger`]) and
+    /// appends it to the in-memory trigger list. The stem is the trigger name.
+    fn loadTriggerRecord(self: *Database, name: []const u8, bytes: []const u8) !void {
+        if (bytes.len < 2 + 4) return error.CorruptTrigger;
+        var off: usize = 0;
+        const timing: ast.TriggerTiming = @enumFromInt(bytes[off]);
+        off += 1;
+        const event: ast.TriggerEvent = @enumFromInt(bytes[off]);
+        off += 1;
+        const tlen = std.mem.readInt(u32, bytes[off..][0..4], .little);
+        off += 4;
+        if (off + tlen + 4 > bytes.len) return error.CorruptTrigger;
+        const table_name = bytes[off .. off + tlen];
+        off += tlen;
+        const flen = std.mem.readInt(u32, bytes[off..][0..4], .little);
+        off += 4;
+        if (off + flen > bytes.len) return error.CorruptTrigger;
+        const fn_name = bytes[off .. off + flen];
+
+        const owned = TriggerDef{
+            .name = try self.allocator.dupe(u8, name),
+            .timing = timing,
+            .event = event,
+            .table_name = try self.allocator.dupe(u8, table_name),
+            .function_name = try self.allocator.dupe(u8, fn_name),
+        };
+        errdefer {
+            self.allocator.free(owned.name);
+            self.allocator.free(owned.table_name);
+            self.allocator.free(owned.function_name);
+        }
+        try self.wasm_triggers.append(self.allocator, owned);
     }
 
     /// Cleanly shuts the database down and destroys it.
@@ -821,6 +977,13 @@ pub const Database = struct {
         self.master_tree.deinit();
         self.wasm_functions.deinit();
         self.wasm_aggregates.deinit();
+        self.wasm_procedures.deinit();
+        for (self.wasm_triggers.items) |t| {
+            self.allocator.free(t.name);
+            self.allocator.free(t.table_name);
+            self.allocator.free(t.function_name);
+        }
+        self.wasm_triggers.deinit(self.allocator);
         self.catalog.deinit();
         var table_it = self.table_roots.keyIterator();
         while (table_it.next()) |k| {
