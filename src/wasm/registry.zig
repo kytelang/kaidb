@@ -39,6 +39,10 @@ pub const Registry = struct {
     /// bad module is rejected at registration, not at call time. Replacing an existing name
     /// deinits the old function and bumps the version.
     pub fn register(self: *Registry, name: []const u8, wasm_bytes: []const u8, policy: udf.Policy, returns_string: bool) !void {
+        // Registry-count cap (embed-wasm.md hardening P1-7): reject a NEW name once the registry is
+        // full; replacing an existing name is always allowed.
+        if (self.map.getPtr(name) == null and self.map.count() >= udf.MAX_REGISTERED) return error.TooManyRegistered;
+
         var new_fn = try udf.WasmScalarFn.init(self.alloc, wasm_bytes, policy);
         errdefer new_fn.deinit();
         new_fn.returns_string = returns_string;
@@ -108,6 +112,8 @@ pub const AggRegistry = struct {
     /// Register (or replace) a wasm aggregate. Decode and export validation happen here, so a
     /// module missing accumulate/finalise is rejected at registration.
     pub fn register(self: *AggRegistry, name: []const u8, wasm_bytes: []const u8, policy: udf.Policy) !void {
+        if (self.map.getPtr(name) == null and self.map.count() >= udf.MAX_REGISTERED) return error.TooManyRegistered;
+
         var new_fn = try udf.WasmAggFn.init(self.alloc, wasm_bytes, policy);
         errdefer new_fn.deinit();
 

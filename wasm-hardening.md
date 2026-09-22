@@ -19,7 +19,7 @@ concurrency, security, and resource-safety properties a shipped feature needs. I
 | Fuzzing of decode / validate / execute | Done, gated; SQL trigger/proc paths and the official WASM conformance suite are not yet fuzzed |
 | Per-call resource metering | Done; no per-statement or per-query ceiling |
 | Persistence of modules and triggers | File-backed (`.wasm` / `.twasm` / `.wagg` / `.wproc` / `.wtrig`), reloaded on open. NOT catalog / WAL / doublewrite, NOT replicated |
-| Concurrency (registry mutation vs concurrent reads) | Not locked; a process-global registry pointer is shared across threads |
+| Concurrency (registry mutation vs concurrent reads) | Mutation-vs-read is serialised by the database `rw_lock` (DDL exclusive, reads shared); the registry pointer is now `threadlocal` (P0-2 done). Moving it fully off ambient state remains |
 | Authorization on UDF / trigger DDL | None |
 | Trigger events | INSERT fires; UPDATE / DELETE are parsed and persisted but not fired |
 
@@ -36,13 +36,15 @@ concurrency, security, and resource-safety properties a shipped feature needs. I
    catalog, WAL-backed and doublewrite-protected. This is the single biggest item. The `.wtrig`
    binary format additionally has no version tag or checksum.
 
-2. **Concurrency: guard the registries and the global registry pointer.** DDL
-   (`CREATE` / `DROP FUNCTION` / `AGGREGATE` / `PROCEDURE` / `TRIGGER`, and trigger registration)
-   mutates the in-memory registries and the trigger list with no lock, while queries read them
-   concurrently. A `StringHashMap` resize during a concurrent read invalidates the borrowed
-   function pointer. And `active_wasm_registry` is a process global set at the top of every
-   `execute`; two executor threads stomp it. Both need the catalog latch (DDL exclusive, reads
-   shared) and the registry pointer needs to move onto the executor or request, not a global.
+2. **Concurrency: guard the registries and the global registry pointer.** _Done._ Verified that
+   the mutation-versus-read race cannot occur: DDL (`CREATE` / `DROP FUNCTION` / `AGGREGATE` /
+   `PROCEDURE` / `TRIGGER`, and trigger registration) runs as a write and holds the database
+   `rw_lock` exclusively, while a query reading a registry holds it shared, and the two are
+   mutually exclusive, so a `StringHashMap` resize can never invalidate a borrowed function
+   pointer mid-read. The remaining bug was `active_wasm_registry`, a process global that two
+   executor threads could stomp; it is now `threadlocal`, so each thread sets and reads its own
+   pointer. A fuller refactor that carries the registry on the executor or request (rather than
+   any ambient thread-local) is still worthwhile but no longer a correctness blocker.
 
 3. **Trigger recursion and fan-out limits.** Nothing caps trigger depth or the number of triggers
    per event. Once in-process DML lands (design section 11), a trigger that inserts into another
@@ -61,14 +63,16 @@ concurrency, security, and resource-safety properties a shipped feature needs. I
    allocates millions of guest instances. And fuel is per-call only, so a UDF over 10M rows runs
    10M independently-budgeted calls with no total ceiling. Both need a per-statement bound.
 
-6. **Result-buffer truncation.** String and HTML results are copied into a fixed 512-byte
-   thread-local scratch buffer and silently truncated past that. A KYX fragment longer than 512
-   bytes is silently cut. This needs a growable result buffer or an explicit over-cap error, not
-   silent truncation.
+6. **Result-buffer truncation.** _Done._ The thread-local string-result scratch buffers were
+   raised to 64 KiB so realistic text and HTML fragments are not truncated, and the copy in
+   `WasmScalarFn.call` / `callRow` now returns `error.OutputTooLarge` for a result that does not
+   fit, so an over-cap result fails loudly instead of returning silently truncated bytes. A fully
+   growable, unbounded result buffer is a later refinement.
 
-7. **Module-size and registry-count limits.** Nothing bounds a registered module's size (a huge
-   module can exhaust memory at decode) or the number of registered UDFs. Both need configured
-   caps enforced at `CREATE`.
+7. **Module-size and registry-count limits.** _Done._ A module larger than `MAX_MODULE_BYTES`
+   (4 MiB) is rejected in `WasmScalarFn.init` / `WasmAggFn.init` before decode, and a registry that
+   already holds `MAX_REGISTERED` (1024) entries rejects a new name (replacing an existing name is
+   always allowed). Making the caps configurable from server config is a later refinement.
 
 ### P1, correctness completeness
 

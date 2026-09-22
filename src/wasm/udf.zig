@@ -23,6 +23,12 @@ pub const Policy = struct {
     memory_pages: u32 = 256, // 16 MiB
 };
 
+/// Registration-time resource limits (embed-wasm.md hardening P1-7). A module larger than this,
+/// or a registry that already holds this many entries, is rejected at `CREATE` so a hostile or
+/// runaway client cannot exhaust host memory at decode time or grow a registry without bound.
+pub const MAX_MODULE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB of wasm is already a very large UDF
+pub const MAX_REGISTERED: usize = 1024; // per registry (functions, aggregates, procedures)
+
 /// A decoded wasm module registered as a scalar function. Immutable after `init`, so one
 /// `WasmScalarFn` can be shared across kaidb's query threads and reused for every row.
 pub const WasmScalarFn = struct {
@@ -51,6 +57,7 @@ pub const WasmScalarFn = struct {
     pub const Result = union(enum) { int: i64, str_len: usize };
 
     pub fn init(alloc: std.mem.Allocator, wasm_bytes: []const u8, policy: Policy) !WasmScalarFn {
+        if (wasm_bytes.len > MAX_MODULE_BYTES) return error.ModuleTooLarge;
         const owned = try alloc.dupe(u8, wasm_bytes);
         errdefer alloc.free(owned);
 
@@ -163,9 +170,11 @@ pub const WasmScalarFn = struct {
         const mem = try instance.getMemory(0);
         const buf = mem.memory();
         if (@as(usize, rptr) + rlen > buf.len) return error.OutOfBoundsMemoryAccess;
-        const copy_len = @min(@as(usize, rlen), out_buf.len);
-        @memcpy(out_buf[0..copy_len], buf[rptr .. rptr + copy_len]);
-        return .{ .str_len = copy_len };
+        // Never silently truncate a string result (embed-wasm.md hardening P1-6): a result that
+        // does not fit the caller's buffer is an explicit error, not corrupt truncated bytes.
+        if (@as(usize, rlen) > out_buf.len) return error.OutputTooLarge;
+        @memcpy(out_buf[0..rlen], buf[rptr .. rptr + rlen]);
+        return .{ .str_len = rlen };
     }
 
     /// Call a row-facing UDF against the current scan row (embed-wasm.md M3, the pull model of
@@ -205,9 +214,11 @@ pub const WasmScalarFn = struct {
         const mem = try instance.getMemory(0);
         const buf = mem.memory();
         if (@as(usize, rptr) + rlen > buf.len) return error.OutOfBoundsMemoryAccess;
-        const copy_len = @min(@as(usize, rlen), out_buf.len);
-        @memcpy(out_buf[0..copy_len], buf[rptr .. rptr + copy_len]);
-        return .{ .str_len = copy_len };
+        // Never silently truncate a string result (embed-wasm.md hardening P1-6): a result that
+        // does not fit the caller's buffer is an explicit error, not corrupt truncated bytes.
+        if (@as(usize, rlen) > out_buf.len) return error.OutputTooLarge;
+        @memcpy(out_buf[0..rlen], buf[rptr .. rptr + rlen]);
+        return .{ .str_len = rlen };
     }
 
     /// The exported entry points a string-taking UDF module must provide.
@@ -295,6 +306,7 @@ pub const WasmAggFn = struct {
     pub const FIN_ENTRY = "kaidb_agg_finalize";
 
     pub fn init(alloc: std.mem.Allocator, wasm_bytes: []const u8, policy: Policy) !WasmAggFn {
+        if (wasm_bytes.len > MAX_MODULE_BYTES) return error.ModuleTooLarge;
         const owned = try alloc.dupe(u8, wasm_bytes);
         errdefer alloc.free(owned);
 

@@ -95,6 +95,31 @@ test "row-facing TEXT UDF: col_bytes into guest memory, returned as a string" {
     try std.testing.expectEqualStrings("hello", out[0..r.str_len]);
 }
 
+test "hardening P1-7: an oversized module is rejected at init" {
+    const alloc = std.testing.allocator;
+    // A buffer just over the module-size cap is rejected before decode, so a hostile client cannot
+    // exhaust host memory at registration time.
+    const big = try alloc.alloc(u8, udf.MAX_MODULE_BYTES + 1);
+    defer alloc.free(big);
+    @memset(big, 0);
+    try std.testing.expectError(error.ModuleTooLarge, udf.WasmScalarFn.init(alloc, big, .{}));
+    try std.testing.expectError(error.ModuleTooLarge, udf.WasmAggFn.init(alloc, big, .{}));
+}
+
+test "hardening P1-6: an over-cap string result errors instead of truncating" {
+    const alloc = std.testing.allocator;
+    var fn_ = try udf.WasmScalarFn.init(alloc, @embedFile("testdata_view_row.wasm"), .{});
+    defer fn_.deinit();
+    fn_.returns_string = true;
+
+    // The view renders ~48 bytes; a tiny output buffer must yield an explicit error, never a
+    // silently truncated fragment.
+    const row = MockRow{ .ints = &.{ 0, 0 }, .texts = &.{ "Hammer", "1299" } };
+    var rc = row.ctx();
+    var tiny: [8]u8 = undefined;
+    try std.testing.expectError(error.OutputTooLarge, fn_.callRow(&rc, tiny[0..]));
+}
+
 test "KYX view: a row-facing UDF renders an HTML fragment from the row (M7)" {
     const alloc = std.testing.allocator;
     var fn_ = try udf.WasmScalarFn.init(alloc, @embedFile("testdata_view_row.wasm"), .{});

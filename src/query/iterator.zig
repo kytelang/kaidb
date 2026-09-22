@@ -72,11 +72,16 @@ const ast = @import("../sql/ast.zig");
 const WasmRegistry = @import("../wasm/registry.zig").Registry;
 
 /// The active wasm UDF registry for scalar-function evaluation (embed-wasm.md M1). Set once by
-/// the database that owns the registry; read (never written) during query evaluation, so it is
-/// safe for concurrent readers. This module-level pointer follows the same pattern iterator.zig
-/// already uses for scalar-function scratch state, and avoids threading a registry through every
-/// operator. A registered name takes precedence over a built-in scalar of the same name.
-pub var active_wasm_registry: ?*WasmRegistry = null;
+/// the database that owns the registry (embed-wasm.md, hardening P0-2). It is set by the executor
+/// at the top of each statement and read during evaluation on the SAME thread, so it is
+/// `threadlocal`: two executor threads (the threaded server) each get their own pointer and cannot
+/// stomp each other's, which a process-global `var` allowed. Concurrent mutation of the registry
+/// itself versus a read is separately prevented by the database `rw_lock` (DDL runs exclusive,
+/// queries shared), so a `StringHashMap` resize can never race a borrowed function pointer. This
+/// follows the same thread-local pattern iterator.zig already uses for the scalar-function scratch
+/// buffers, and avoids threading a registry through every operator. A registered name takes
+/// precedence over a built-in scalar of the same name.
+pub threadlocal var active_wasm_registry: ?*WasmRegistry = null;
 
 /// The exported entry point a wasm scalar UDF module must provide (the ABI convention). A
 /// Kyte/Rust/C guest names its scalar function this; the SQL name maps to the module via the
@@ -543,13 +548,18 @@ fn evalScalar(expr: *const ast.Expr, ctx: anytype) ?Scalar {
     }
 }
 
+/// Size of each thread-local string-result scratch buffer. A wasm UDF or KYX view fragment is
+/// copied into one of these; sized generously (64 KiB) so realistic text and HTML results are not
+/// truncated (embed-wasm.md hardening P1-6). A result larger than this is rejected by
+/// `WasmScalarFn.call`/`callRow` with `error.OutputTooLarge`, never silently cut.
+const FN_SCRATCH_LEN: usize = 64 * 1024;
 /// One of two thread-local scratch buffers backing string functions
-/// (`UPPER`/`LOWER`) so the result can be returned as a borrowed slice without
-/// allocating. See [`fn_scratch_toggle`] for why there are two.
-threadlocal var fn_scratch_a: [512]u8 = undefined;
+/// (`UPPER`/`LOWER`) and wasm string/HTML results, so the value can be returned as a borrowed
+/// slice without allocating. See [`fn_scratch_toggle`] for why there are two.
+threadlocal var fn_scratch_a: [FN_SCRATCH_LEN]u8 = undefined;
 /// The second thread-local string-function scratch buffer; paired with
 /// [`fn_scratch_a`] and alternated via [`fn_scratch_toggle`].
-threadlocal var fn_scratch_b: [512]u8 = undefined;
+threadlocal var fn_scratch_b: [FN_SCRATCH_LEN]u8 = undefined;
 /// Alternates which of [`fn_scratch_a`]/[`fn_scratch_b`] the next string
 /// function writes into, so two such results can be live at once (for example
 /// both sides of `UPPER(a) = UPPER(b)`) without the second clobbering the first.
