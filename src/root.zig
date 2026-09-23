@@ -7208,3 +7208,120 @@ test "wasm replication: a CREATE FUNCTION and its DROP reach a follower (P0-1 fo
     try std.testing.expect(follower.wasm_functions.get("DBL") == null);
     try std.testing.expectEqual(@as(usize, 0), try h.count(&fex, allocator, "SELECT x FROM t WHERE DBL(x) = 42"));
 }
+
+// Build a simple-query ('Q') wire request frame for `sql`: [type:1]['Q'][len:u32 BE][str16 sql],
+// where str16 is a u16 BE length prefix plus the bytes. Caller frees.
+fn buildQueryFrame(a: std.mem.Allocator, sql: []const u8) ![]u8 {
+    const plen: usize = 2 + sql.len; // str16 payload
+    const flen: usize = 4 + plen; // len counts itself + payload
+    const f = try a.alloc(u8, 1 + flen);
+    f[0] = 'Q';
+    std.mem.writeInt(u32, f[1..5], @intCast(flen), .big);
+    std.mem.writeInt(u16, f[5..7], @intCast(sql.len), .big);
+    @memcpy(f[7..], sql);
+    return f;
+}
+
+// Walk a response blob of [type:1][len:u32 BE][payload] frames, collecting the type bytes.
+fn frameTypes(a: std.mem.Allocator, resp: []const u8) !std.ArrayList(u8) {
+    var types = std.ArrayList(u8).empty;
+    var pos: usize = 0;
+    while (pos + 5 <= resp.len) {
+        const t = resp[pos];
+        const flen = std.mem.readInt(u32, resp[pos + 1 ..][0..4], .big);
+        try types.append(a, t);
+        pos += 1 + @as(usize, flen);
+    }
+    return types;
+}
+
+test "wasm in-process: kaidb_exec runs a nested frame under the caller's transaction (embed-wasm 11)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_inproc_exec.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+    var db = try Database.open(allocator, io, db_path, 64, null);
+    defer db.close();
+    var exec = QueryExecutor.init(allocator, db);
+    defer exec.deinit();
+
+    const h = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+        fn count(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !usize {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+            return res.rows.len;
+        }
+    };
+
+    try h.q(&exec, allocator, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+
+    // Open an explicit transaction, then drive DML + a read through runNestedFrame exactly as the
+    // kaidb_exec host import will. The nested statements run under this same transaction.
+    try h.q(&exec, allocator, "BEGIN");
+    try std.testing.expect(exec.current_tx_id != null);
+
+    var out: [4096]u8 = undefined;
+
+    // Nested INSERT: succeeds and reports a CommandComplete ('C'=67), no ErrorResponse ('E'=69).
+    {
+        const frame = try buildQueryFrame(allocator, "INSERT INTO t (id, v) VALUES (1, 100)");
+        defer allocator.free(frame);
+        const n = exec.runNestedFrame(frame, &out);
+        try std.testing.expect(n > 0);
+        var types = try frameTypes(allocator, out[0..@intCast(n)]);
+        defer types.deinit(allocator);
+        try std.testing.expect(std.mem.indexOfScalar(u8, types.items, 'C') != null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, types.items, 'E') == null);
+    }
+
+    // Nested SELECT: the row inserted above (same, uncommitted transaction) is visible
+    // (read-your-writes) — a RowDescription ('T'=84) and a DataRow ('D'=68) carrying "100".
+    {
+        const frame = try buildQueryFrame(allocator, "SELECT id, v FROM t");
+        defer allocator.free(frame);
+        const n = exec.runNestedFrame(frame, &out);
+        try std.testing.expect(n > 0);
+        const resp = out[0..@intCast(n)];
+        var types = try frameTypes(allocator, resp);
+        defer types.deinit(allocator);
+        try std.testing.expect(std.mem.indexOfScalar(u8, types.items, 'T') != null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, types.items, 'D') != null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, types.items, 'E') == null);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "100") != null);
+    }
+
+    // A too-small output buffer returns the negative needed length (grow-and-retry), not a trap.
+    {
+        const frame = try buildQueryFrame(allocator, "SELECT id, v FROM t");
+        defer allocator.free(frame);
+        var tiny: [8]u8 = undefined;
+        const n = exec.runNestedFrame(frame, &tiny);
+        try std.testing.expect(n < 0);
+    }
+
+    // Commit the outer transaction; the nested INSERT is now durable and visible autocommit.
+    try h.q(&exec, allocator, "COMMIT");
+    try std.testing.expectEqual(@as(usize, 1), try h.count(&exec, allocator, "SELECT id FROM t"));
+
+    // A malformed frame is reported as an ErrorResponse, never a crash.
+    {
+        const bad = [_]u8{ 'Q', 0, 0, 0, 2 }; // len 2 < 4
+        const n = exec.runNestedFrame(&bad, &out);
+        try std.testing.expect(n > 0);
+        var types = try frameTypes(allocator, out[0..@intCast(n)]);
+        defer types.deinit(allocator);
+        try std.testing.expect(std.mem.indexOfScalar(u8, types.items, 'E') != null);
+    }
+}

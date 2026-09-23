@@ -88,7 +88,9 @@ const OpKind = @import("../common/common.zig").OpKind;
 const hexEncode = @import("../concurrency/security.zig").hexEncode;
 const query_iter = @import("iterator.zig");
 const wasm_udf = @import("../wasm/udf.zig");
+const wasm_host = @import("../wasm/host.zig");
 const oidmap = @import("../proto/oidmap.zig");
+const wire = @import("../proto/wire.zig");
 
 /// Owned text render of an evaluator scalar, matching the former all-text row
 /// representation (`{d}` numerics, `true`/`false`, raw string, `NULL`). Used by
@@ -116,9 +118,19 @@ const MAX_TRIGGER_DEPTH: u32 = 8;
 /// with a pathological number of groups cannot allocate unbounded guest instances.
 const MAX_WASM_AGG_INSTANCES: usize = 100_000;
 
+/// Maximum in-process query nesting an in-process guest may drive through `kaidb_exec`
+/// (embed-wasm.md 11.6). A guest query can itself run another guest (a trigger), and each
+/// re-entrant statement bumps this; past the cap the nested call returns an error frame rather than
+/// recursing into the native stack. Independent of [`MAX_TRIGGER_DEPTH`], which bounds trigger
+/// firing specifically.
+const MAX_WASM_EXEC_DEPTH: u32 = 16;
+
 /// Per-thread trigger nesting depth (one statement runs on one thread; see the thread-local
 /// registry pointer in iterator.zig). Incremented while a trigger's function runs.
 threadlocal var wasm_trigger_depth: u32 = 0;
+/// Per-thread in-process query nesting depth (embed-wasm.md 11.6). Incremented across a nested
+/// `kaidb_exec`; checked against [`MAX_WASM_EXEC_DEPTH`].
+threadlocal var wasm_exec_depth: u32 = 0;
 /// Per-statement count of wasm aggregator instances created, reset at the start of each aggregate
 /// query block and checked against [`MAX_WASM_AGG_INSTANCES`].
 threadlocal var wasm_agg_created: usize = 0;
@@ -4119,6 +4131,168 @@ pub const QueryExecutor = struct {
                 return QueryResponse{ .error_message = try self.allocator.dupe(u8, msg) };
             };
         }
+    }
+
+    // --- In-process query entry (embed-wasm.md section 11) ---------------------------------------
+    //
+    // A stored procedure, function, or trigger running as a wasm guest inside kaidb reads and writes
+    // data through the same driver, whose wasm=true transport hands a fully-framed wire request to
+    // the `kaidb_exec` host import. `kaidb_exec` calls `runNestedFrame` on THIS executor, so the
+    // nested statement runs on the calling thread under the caller's transaction: no network, no new
+    // transaction, read-your-writes visibility over the caller's uncommitted rows.
+
+    /// What a nested frame resolves to before encoding: a full query response, or an error to report
+    /// as an `ErrorResponse` frame (the string is `SQLSTATE:message`).
+    const NestedOutcome = union(enum) {
+        resp: QueryResponse,
+        err: []const u8,
+    };
+
+    /// Run one wire request frame on this executor under the current transaction and encode the
+    /// response frame set into `out`. Returns the response length if it fits `out`, or the negative
+    /// of the length needed so the guest grows its buffer and retries (the guest-provided-buffer ABI
+    /// of embed-wasm.md 11.4). Never traps: every failure becomes an `ErrorResponse` frame.
+    pub fn runNestedFrame(self: *QueryExecutor, req: []const u8, out: []u8) i32 {
+        // A guest query can itself run another guest; bound the re-entrancy (embed-wasm.md 11.6).
+        if (wasm_exec_depth >= MAX_WASM_EXEC_DEPTH) {
+            return encodeNestedInto(self.allocator, out, .{ .err = "54001:in-process query nesting too deep" });
+        }
+        wasm_exec_depth += 1;
+        defer wasm_exec_depth -= 1;
+
+        // Frame header: [type:1][len:u32 BE][payload]; `len` counts itself (4) plus the payload.
+        if (req.len < 5) return encodeNestedInto(self.allocator, out, .{ .err = "08P01:truncated request frame" });
+        const t = req[0];
+        const flen: u32 = (@as(u32, req[1]) << 24) | (@as(u32, req[2]) << 16) | (@as(u32, req[3]) << 8) | @as(u32, req[4]);
+        if (flen < 4) return encodeNestedInto(self.allocator, out, .{ .err = "08P01:malformed request frame length" });
+        const total: usize = 1 + @as(usize, flen);
+        if (total > req.len) return encodeNestedInto(self.allocator, out, .{ .err = "08P01:short request frame" });
+        // v1 ABI: only the simple-query frame ('Q' = 81) is serviced in-process.
+        if (t != 'Q') return encodeNestedInto(self.allocator, out, .{ .err = "0A000:only simple-query frames are supported in-process" });
+        const payload = req[5..total];
+        const sql = wire.decodeQuery(payload) catch return encodeNestedInto(self.allocator, out, .{ .err = "08P01:could not decode query frame" });
+
+        // Save/restore the executor's per-statement scratch a nested statement must not inherit or
+        // clobber. The allocator is saved/restored by `execute` itself; transaction-level state
+        // (current_tx_id, snapshot, savepoints) is deliberately shared so the nested statement runs
+        // in the caller's transaction.
+        const saved_base = self.base_searcher;
+        const saved_cols = self.scan_needed_cols;
+        const saved_deadline = self.deadline_ms;
+        self.base_searcher = null;
+        self.scan_needed_cols = null;
+        defer {
+            self.base_searcher = saved_base;
+            self.scan_needed_cols = saved_cols;
+            self.deadline_ms = saved_deadline;
+        }
+
+        const resp = self.execute(.{ .sql = sql }) catch |err| {
+            var buf: [160]u8 = undefined;
+            const m = std.fmt.bufPrint(&buf, "XX000:in-process execution error: {s}", .{@errorName(err)}) catch "XX000:in-process execution error";
+            return encodeNestedInto(self.allocator, out, .{ .err = m });
+        };
+        defer freeNestedResponse(self.allocator, resp);
+        return encodeNestedInto(self.allocator, out, .{ .resp = resp });
+    }
+
+    /// Build the [`wasm_host.ExecCtx`] that routes a guest's `kaidb_exec` back into this executor.
+    pub fn inProcExecCtx(self: *QueryExecutor) wasm_host.ExecCtx {
+        return .{ .ptr = self, .run_frame = nestedFrameThunk };
+    }
+
+    /// The vtable adapter: recover the executor from the opaque context and run the frame.
+    fn nestedFrameThunk(ptr: *anyopaque, req: []const u8, out: []u8) i32 {
+        const self: *QueryExecutor = @alignCast(@ptrCast(ptr));
+        return self.runNestedFrame(req, out);
+    }
+
+    /// Encode a [`NestedOutcome`] into `out`, returning its length, or the negative of the length
+    /// needed when it does not fit (`std.math.minInt(i32)` on a hard encode failure). Every outcome
+    /// is terminated by a `ReadyForQuery` so the driver's response loop ends cleanly.
+    fn encodeNestedInto(a: Allocator, out: []u8, outcome: NestedOutcome) i32 {
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(a);
+        encodeNestedFrames(a, &buf, outcome) catch return std.math.minInt(i32);
+        if (buf.items.len > out.len) {
+            if (buf.items.len > std.math.maxInt(i32)) return std.math.minInt(i32);
+            return -@as(i32, @intCast(buf.items.len));
+        }
+        @memcpy(out[0..buf.items.len], buf.items);
+        return @intCast(buf.items.len);
+    }
+
+    /// Append the wire response frames for an outcome, mirroring the socket server's `runSql`
+    /// encoding (`RowDescription` + `DataRow*` + `CommandComplete`, or `ErrorResponse`), then a
+    /// terminating `ReadyForQuery`. An `err` string is `SQLSTATE:message`.
+    fn encodeNestedFrames(a: Allocator, buf: *std.ArrayList(u8), outcome: NestedOutcome) !void {
+        switch (outcome) {
+            .err => |e| {
+                const colon = std.mem.indexOfScalar(u8, e, ':') orelse 5;
+                const code = e[0..colon];
+                const msg = if (colon + 1 <= e.len) e[colon + 1 ..] else e;
+                const f = try wire.encodeError(a, "ERROR", code, msg);
+                defer a.free(f);
+                try buf.appendSlice(a, f);
+            },
+            .resp => |resp| {
+                if (resp.error_message) |m| {
+                    const f = try wire.encodeError(a, "ERROR", "XX000", m);
+                    defer a.free(f);
+                    try buf.appendSlice(a, f);
+                } else if (resp.columns.len > 0) {
+                    const fields = try a.alloc(wire.FieldDesc, resp.columns.len);
+                    defer a.free(fields);
+                    for (resp.columns, 0..) |name, i| {
+                        const ct: ColumnType = if (i < resp.column_types.len) resp.column_types[i] else .TEXT;
+                        fields[i] = oidmap.fieldDesc(name, ct, @intCast(i));
+                    }
+                    const rd = try wire.encodeRowDescription(a, fields);
+                    defer a.free(rd);
+                    try buf.appendSlice(a, rd);
+
+                    const vals = try a.alloc(?[]const u8, resp.columns.len);
+                    defer a.free(vals);
+                    for (resp.rows) |row| {
+                        for (0..resp.columns.len) |i| vals[i] = if (i < row.len) row[i] else null;
+                        const dr = try wire.encodeDataRow(a, vals);
+                        defer a.free(dr);
+                        try buf.appendSlice(a, dr);
+                    }
+                    const tag = try std.fmt.allocPrint(a, "SELECT {d}", .{resp.rows.len});
+                    defer a.free(tag);
+                    const cc = try wire.encodeCommandComplete(a, tag);
+                    defer a.free(cc);
+                    try buf.appendSlice(a, cc);
+                } else {
+                    const tag = try std.fmt.allocPrint(a, "OK {d}", .{resp.rows_affected});
+                    defer a.free(tag);
+                    const cc = try wire.encodeCommandComplete(a, tag);
+                    defer a.free(cc);
+                    try buf.appendSlice(a, cc);
+                }
+            },
+        }
+        const z = try wire.encodeReady(a, .idle);
+        defer a.free(z);
+        try buf.appendSlice(a, z);
+    }
+
+    /// Deep-free a [`QueryResponse`] returned by a nested `execute` (mirrors the server's
+    /// `freeResponse`: the `len > 0` guards match the executor leaving empty-dimension slices
+    /// dangling rather than allocated).
+    fn freeNestedResponse(a: Allocator, resp: QueryResponse) void {
+        if (resp.error_message) |m| a.free(m);
+        for (resp.columns) |c| a.free(c);
+        if (resp.columns.len > 0) a.free(resp.columns);
+        // Unlike the server's freeResponse (whose session allocator is arena-reclaimed), this runs
+        // under the caller's real allocator, so the owned column-type slice must be freed too.
+        if (resp.column_types.len > 0) a.free(resp.column_types);
+        for (resp.rows) |row| {
+            for (row) |cell| a.free(cell);
+            a.free(row);
+        }
+        if (resp.rows.len > 0) a.free(resp.rows);
     }
 
     /// Acquires the correct locks for a statement, then dispatches to

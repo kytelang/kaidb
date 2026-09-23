@@ -74,6 +74,31 @@ pub const RowCtx = struct {
     }
 };
 
+/// The in-process query context an in-process guest sees (embed-wasm.md section 11). A stored
+/// procedure, function, or trigger running as a guest inside kaidb reads and writes data by handing
+/// a fully-framed wire request to `kaidb_exec` and reading the response back. Like [`RowCtx`], this
+/// is a vtable so the engine (this module) stays decoupled from kaidb's query layer: the executor
+/// (`query_executor.zig`) supplies the concrete `run_frame`, which decodes the request frame, runs
+/// it under the caller's transaction, and encodes the response.
+///
+/// The ABI uses a guest-provided response buffer: `run_frame(req, out)` returns the response length
+/// if it fits `out`, or the negative of the needed length so the guest grows its buffer and retries.
+/// This keeps the whole call a single non-re-entrant host trap (the host never calls back into the
+/// guest to allocate), only ever reading and writing bounds-checked linear memory.
+pub const ExecCtx = struct {
+    ptr: *anyopaque,
+    run_frame: *const fn (ptr: *anyopaque, req: []const u8, out: []u8) i32,
+
+    pub fn runFrame(self: *const ExecCtx, req: []const u8, out: []u8) i32 {
+        return self.run_frame(self.ptr, req, out);
+    }
+};
+
+/// The in-process query host import name (in [`NAMESPACE`]):
+///   (import "kaidb" "kaidb_exec" (func (param i32 i32 i32 i32) (result i32)))
+/// params: req_ptr, req_len, resp_ptr, resp_cap; result: response length, or -(needed length).
+pub const EXEC_IMPORT = "kaidb_exec";
+
 /// The module namespace every row-facing import must live in.
 pub const NAMESPACE = "kaidb";
 
@@ -81,7 +106,7 @@ pub const NAMESPACE = "kaidb";
 /// `NAMESPACE` and nothing else; an import outside this set is rejected at registration
 /// (`udf.zig`), which is how the sandbox keeps clocks, randomness, WASI, and every other
 /// nondeterministic or escape-prone host call off the table (section 7).
-pub const ALLOWED = [_][]const u8{ "col_count", "col_i64", "col_f64", "col_is_null", "col_bytes" };
+pub const ALLOWED = [_][]const u8{ "col_count", "col_i64", "col_f64", "col_is_null", "col_bytes", EXEC_IMPORT };
 
 /// Whether `name` is an allowlisted row-facing host import.
 pub fn isAllowed(name: []const u8) bool {
@@ -107,8 +132,45 @@ pub fn expose(store: *zware.Store, rc: *const RowCtx) !void {
     try store.exposeHostFunction(NAMESPACE, "col_bytes", hostColBytes, ctx, &i32x2, &.{.I32});
 }
 
+/// Expose the in-process query host import `kaidb_exec` on `store`, bound to `ec`. Called by the
+/// in-process call path (`udf.zig`) before instantiating a guest that may issue queries, so its
+/// `kaidb.kaidb_exec` import resolves. Composes with [`expose`]: a guest that is both row-facing and
+/// in-process gets both sets, and zware wires only the imports the module actually declares.
+pub fn exposeExec(store: *zware.Store, ec: *const ExecCtx) !void {
+    const ctx: usize = @intFromPtr(ec);
+    const i32x4 = [_]zware.ValType{ .I32, .I32, .I32, .I32 };
+    try store.exposeHostFunction(NAMESPACE, EXEC_IMPORT, hostExec, ctx, &i32x4, &.{.I32});
+}
+
 fn ctxOf(context: usize) *const RowCtx {
     return @ptrFromInt(context);
+}
+
+fn execCtxOf(context: usize) *const ExecCtx {
+    return @ptrFromInt(context);
+}
+
+/// `kaidb_exec(req_ptr, req_len, resp_ptr, resp_cap) -> i32`. Reads the request frame out of guest
+/// memory (bounds-checked, section 6.4), runs it via the `ExecCtx` on the calling thread and
+/// transaction, and writes the response into the guest-provided `[resp_ptr, resp_cap)` window.
+/// Returns the response length, or the negative of the length needed when it does not fit (the guest
+/// grows and retries). The host never calls back into the guest, so this is a single, non-re-entrant
+/// host trap over bounds-checked linear memory.
+fn hostExec(vm: *VirtualMachine, context: usize) WasmError!void {
+    const ec = execCtxOf(context);
+    // Params pushed left-to-right (req_ptr, req_len, resp_ptr, resp_cap), so pop in reverse.
+    const resp_cap = vm.popOperand(u32);
+    const resp_ptr = vm.popOperand(u32);
+    const req_len = vm.popOperand(u32);
+    const req_ptr = vm.popOperand(u32);
+    const mem = try vm.inst.getMemory(0);
+    const buf = mem.memory();
+    if (@as(usize, req_ptr) + req_len > buf.len) return error.OutOfBoundsMemoryAccess;
+    if (@as(usize, resp_ptr) + resp_cap > buf.len) return error.OutOfBoundsMemoryAccess;
+    const req = buf[req_ptr .. req_ptr + req_len];
+    const out = buf[resp_ptr .. resp_ptr + resp_cap];
+    const n = ec.runFrame(req, out);
+    try vm.pushOperand(i32, n);
 }
 
 fn hostColCount(vm: *VirtualMachine, context: usize) WasmError!void {
