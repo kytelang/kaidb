@@ -723,12 +723,13 @@ the executor **while the outer INSERT is mid-flight and holding locks**. The rul
   cycles and returns `error.TriggerRecursionTooDeep`. A parallel `wasm_exec_depth` bounds plain
   `kaidb_exec` nesting that does not pass through a trigger, so a runaway procedure recursing through
   `kaidb_exec` is bounded too, before the native stack is at risk.
-- **BEFORE triggers become write-capable, gated by phase.** With in-process DML available, a BEFORE
-  trigger *can* now issue writes. The safe v1 allows reads and writes to *other* tables and rejects a
-  write to the table whose DML is in flight (it would recurse the trigger and fight the outer row
-  image). AFTER triggers may write freely within the same txn. This supersedes the current
-  "procedures and AFTER triggers are validation and compute only" note and should be stated in the
-  user docs when it lands.
+- **BEFORE triggers are write-capable.** _Implemented._ With in-process DML available, a BEFORE
+  trigger issues reads and writes through `kaidb_exec`, including on the very table whose DML is in
+  flight: per-(thread, txn) `GroupLock` re-entrancy lets the nested statement borrow the outer's
+  hold, and an INSERT on a triggered table takes the lock EXCLUSIVE so the borrow is safe under
+  concurrency. A BEFORE trigger still does not see the not-yet-inserted row (MVCC visibility), and a
+  nested statement that re-fires a trigger is bounded by the depth guards. This supersedes the older
+  "procedures and AFTER triggers are validation and compute only" note.
 
 ### 11.7 Authorisation is inherited, never re-supplied
 
@@ -1244,18 +1245,18 @@ Test and hardening plan:
   replica mid-upgrade, the persisted cache is per-node regenerable (fine), but we must
   confirm that UDF output stays bit-identical across engine versions, or gate UDF execution
   on a matched engine version during rolling upgrades.
-- **In-process re-entrancy.** _Implemented and gated for the procedure path; one sub-case remains._
-  `kaidb_exec` from an in-process guest re-enters the executor on the same thread inside the guest's
-  transaction (`runNestedFrame`): the nested statement runs under the outer `current_tx_id`, so MVCC
-  gives it read-your-writes (a BEFORE trigger does not see the pending row); the non-reentrant db
-  `rw_lock` is acquired only at the top level (`wasm_exec_depth == 0`), so a nested statement runs
-  under the lock the outer already holds instead of self-deadlocking; per-statement executor scratch
-  is saved and restored around the nested run; and depth is bounded by `wasm_trigger_depth` plus
-  `wasm_exec_depth`. A stored procedure calling `kaidb_exec` to do DML is gated end to end (a CALL
-  holds no per-table `GroupLock`, so its nested statement takes its own freely). The remaining
-  sub-case is a BEFORE trigger writing the very table whose DML is in flight: that needs
-  per-(thread, txn) `GroupLock` re-entrancy (the outer INSERT holds the table's write lock), which
-  is not yet built, so v1 rejects it.
+- **In-process re-entrancy.** _Implemented and gated._ `kaidb_exec` from an in-process guest
+  re-enters the executor on the same thread inside the guest's transaction (`runNestedFrame`): the
+  nested statement runs under the outer `current_tx_id`, so MVCC gives it read-your-writes (a BEFORE
+  trigger does not see the pending row); the non-reentrant db `rw_lock` is acquired only at the top
+  level (`wasm_exec_depth == 0`), so a nested statement runs under the lock the outer already holds;
+  per-statement executor scratch is saved and restored around the nested run; and depth is bounded by
+  `wasm_trigger_depth` plus `wasm_exec_depth`. Per-table `GroupLock`s are now re-entrant per
+  (thread, txn): the executor tracks the locks held on the thread and a nested statement borrows a
+  hold an enclosing statement already has instead of re-acquiring. To keep the borrow safe under
+  concurrency, an INSERT on a table that has an INSERT trigger takes the lock EXCLUSIVE rather than
+  WRITE. A stored procedure doing DML through `kaidb_exec` and a BEFORE trigger writing the very
+  table whose DML is in flight are both gated end to end.
 - **Self-hosted backend.** The tail-call requirement pins us to the LLVM backend. If kaidb
   ever wants the self-hosted backend for faster debug builds, the WASM path needs a fallback
   dispatch (a plain switch) behind a build flag. Not needed now, noted.
