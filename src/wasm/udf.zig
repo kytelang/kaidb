@@ -177,6 +177,66 @@ pub const WasmScalarFn = struct {
         return .{ .str_len = rlen };
     }
 
+    /// The in-process call (embed-wasm.md section 11): like [`call`], but the guest additionally
+    /// imports `kaidb.kaidb_exec` and may issue queries against the engine through `ec`, which runs
+    /// them on the calling thread under the caller's transaction. Used by `CALL` so a stored
+    /// procedure can read and write data. Arguments are marshalled exactly as in [`call`]; unlike
+    /// `call` this path does NOT reject host imports (that is the point), but the only import
+    /// exposed is `kaidb_exec`, so a module importing anything else fails to instantiate.
+    pub fn callInProc(self: *WasmScalarFn, args: []const Arg, out_buf: []u8, ec: *const host.ExecCtx) !Result {
+        var store = zware.Store.init(self.alloc);
+        defer store.deinit();
+
+        // Expose kaidb_exec BEFORE instantiate so the guest's import binds to it.
+        try host.exposeExec(&store, ec);
+
+        var instance = zware.Instance.init(self.alloc, &store, self.module);
+        try instance.instantiate();
+        defer instance.deinit();
+
+        instance.fuel_budget = self.policy.fuel;
+        try instance.limitMemoryPages(self.policy.memory_pages);
+
+        // Build the wasm parameter slots, allocating+writing each string into guest memory (as in `call`).
+        var in_buf: [16]u64 = undefined;
+        var n: usize = 0;
+        for (args) |a| switch (a) {
+            .int => |v| {
+                if (n >= in_buf.len) return error.TooManyArgs;
+                in_buf[n] = @bitCast(v);
+                n += 1;
+            },
+            .str => |s| {
+                if (n + 2 > in_buf.len) return error.TooManyArgs;
+                var ai = [1]u64{@bitCast(@as(i64, @intCast(s.len)))};
+                var ao = [1]u64{0};
+                try instance.invoke(ALLOC_ENTRY, ai[0..], ao[0..], .{});
+                const ptr: u32 = @truncate(ao[0]);
+                const mem = try instance.getMemory(0);
+                const buf = mem.memory();
+                if (@as(usize, ptr) + s.len > buf.len) return error.OutOfBoundsMemoryAccess;
+                @memcpy(buf[ptr .. ptr + s.len], s);
+                in_buf[n] = ptr;
+                in_buf[n + 1] = @intCast(s.len);
+                n += 2;
+            },
+        };
+
+        var out = [1]u64{0};
+        try instance.invoke(ENTRY, in_buf[0..n], out[0..], .{});
+
+        if (!self.returns_string) return .{ .int = @bitCast(out[0]) };
+
+        const rptr: u32 = @truncate(out[0] >> 32);
+        const rlen: u32 = @truncate(out[0]);
+        const mem = try instance.getMemory(0);
+        const buf = mem.memory();
+        if (@as(usize, rptr) + rlen > buf.len) return error.OutOfBoundsMemoryAccess;
+        if (@as(usize, rlen) > out_buf.len) return error.OutputTooLarge;
+        @memcpy(out_buf[0..rlen], buf[rptr .. rptr + rlen]);
+        return .{ .str_len = rlen };
+    }
+
     /// Call a row-facing UDF against the current scan row (embed-wasm.md M3, the pull model of
     /// section 6.3). Unlike `call`, the arguments are not marshalled up front: the guest reads
     /// whichever columns it needs through the `kaidb.*` host imports, which read `rc` (the bound

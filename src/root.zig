@@ -7325,3 +7325,61 @@ test "wasm in-process: kaidb_exec runs a nested frame under the caller's transac
         try std.testing.expect(std.mem.indexOfScalar(u8, types.items, 'E') != null);
     }
 }
+
+test "wasm in-process guest: a CALLed procedure inserts via kaidb_exec (embed-wasm 11 end to end)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_inproc_proc.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+    var db = try Database.open(allocator, io, db_path, 64, null);
+    defer db.close();
+    var exec = QueryExecutor.init(allocator, db);
+    defer exec.deinit();
+
+    const h = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+    };
+
+    // The procedure guest imports kaidb_exec and, when CALLed, issues an INSERT through it.
+    const proc_hex = comptime std.fmt.bytesToHex(@embedFile("wasm/testdata_proc_insert.wasm"), .lower);
+    try h.q(&exec, allocator, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    try h.q(&exec, allocator, "CREATE PROCEDURE DOINS LANGUAGE wasm AS '" ++ proc_hex ++ "'");
+
+    // The table is empty until the procedure runs.
+    {
+        const res = try exec.execute(.{ .sql = "SELECT id, v FROM t" });
+        defer freeResp(allocator, res);
+        try std.testing.expectEqual(@as(usize, 0), res.rows.len);
+    }
+
+    // CALL DOINS(): the guest's kaidb_exec runs the INSERT under the CALL's transaction, which then
+    // autocommits. The status cell is the host's response length, a non-negative number.
+    {
+        const res = try exec.execute(.{ .sql = "CALL DOINS()" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+        try std.testing.expectEqual(@as(usize, 1), res.rows.len);
+        const status = try std.fmt.parseInt(i64, res.rows[0][0], 10);
+        try std.testing.expect(status >= 0); // a positive response length means the reply fit
+    }
+
+    // The row the guest inserted through kaidb_exec is now committed and visible.
+    {
+        const res = try exec.execute(.{ .sql = "SELECT id, v FROM t" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+        try std.testing.expectEqual(@as(usize, 1), res.rows.len);
+        try std.testing.expectEqualStrings("7", res.rows[0][0]);
+        try std.testing.expectEqualStrings("700", res.rows[0][1]);
+    }
+}

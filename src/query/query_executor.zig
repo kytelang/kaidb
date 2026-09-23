@@ -4306,6 +4306,27 @@ pub const QueryExecutor = struct {
     /// exclusive for UPDATE/DELETE (they scan). If the per-table lock cannot be
     /// obtained it falls back to the coarse exclusive db lock. Multi-table reads
     /// take the db lock shared; multi-table writes and DDL take it exclusive.
+    // The database-wide `rw_lock` is not re-entrant. A nested in-process statement (embed-wasm.md
+    // 11.6) runs on the same thread while the outer statement already holds `rw_lock` (a CALL holds
+    // it exclusively for the whole procedure, the strongest mode), so the nested statement must NOT
+    // re-acquire it or it self-deadlocks. These wrappers acquire/release only at the top level
+    // (`wasm_exec_depth == 0`); `wasm_exec_depth` is constant across a single executeStatement, so
+    // each lock is paired with a matching unlock. Per-table `GroupLock`s are still taken normally by
+    // the nested statement: the CALL holds none, so there is no self-conflict (a trigger writing the
+    // table it guards, which would conflict, is rejected in v1).
+    fn rwLock(self: *QueryExecutor, io: Io) void {
+        if (wasm_exec_depth == 0) self.db.rw_lock.lock(io);
+    }
+    fn rwUnlock(self: *QueryExecutor, io: Io) void {
+        if (wasm_exec_depth == 0) self.db.rw_lock.unlock(io);
+    }
+    fn rwLockShared(self: *QueryExecutor, io: Io) void {
+        if (wasm_exec_depth == 0) self.db.rw_lock.lockShared(io);
+    }
+    fn rwUnlockShared(self: *QueryExecutor, io: Io) void {
+        if (wasm_exec_depth == 0) self.db.rw_lock.unlockShared(io);
+    }
+
     fn executeStatement(self: *QueryExecutor, stmt: ast.Statement) !QueryResponse {
         const io = self.db.pool.pager.io;
         const is_read = switch (stmt) {
@@ -4326,12 +4347,12 @@ pub const QueryExecutor = struct {
 
         if (single_table) |tname| {
             const tl = self.db.tableLock(tname) catch {
-                self.db.rw_lock.lock(io);
-                defer self.db.rw_lock.unlock(io);
+                self.rwLock(io);
+                defer self.rwUnlock(io);
                 return try self.executeStatementInternal(stmt);
             };
-            self.db.rw_lock.lockShared(io);
-            defer self.db.rw_lock.unlockShared(io);
+            self.rwLockShared(io);
+            defer self.rwUnlockShared(io);
             switch (stmt) {
                 .insert => {
                     tl.lockWrite(io);
@@ -4352,12 +4373,12 @@ pub const QueryExecutor = struct {
         }
 
         if (is_read) {
-            self.db.rw_lock.lockShared(io);
-            defer self.db.rw_lock.unlockShared(io);
+            self.rwLockShared(io);
+            defer self.rwUnlockShared(io);
             return try self.executeStatementInternal(stmt);
         } else {
-            self.db.rw_lock.lock(io);
-            defer self.db.rw_lock.unlock(io);
+            self.rwLock(io);
+            defer self.rwUnlock(io);
             return try self.executeStatementInternal(stmt);
         }
     }
@@ -7246,8 +7267,12 @@ pub const QueryExecutor = struct {
                 else => return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CALL: only literal arguments are supported") },
             };
         }
+        // A procedure runs in-process (embed-wasm.md section 11): it may issue queries through the
+        // `kaidb_exec` host import, which re-enters THIS executor under the caller's transaction.
+        // A procedure that imports nothing still runs fine (zware wires only declared imports).
         var out_buf: [512]u8 = undefined;
-        const res = wfn.call(arg_buf[0..c.args.len], out_buf[0..]) catch |err|
+        var ec = self.inProcExecCtx();
+        const res = wfn.callInProc(arg_buf[0..c.args.len], out_buf[0..], &ec) catch |err|
             return QueryResponse{ .error_message = try std.fmt.allocPrint(self.allocator, "CALL: procedure trapped or failed: {any}", .{err}) };
         const status: i64 = switch (res) {
             .int => |v| v,
