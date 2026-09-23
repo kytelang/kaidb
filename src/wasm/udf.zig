@@ -281,6 +281,43 @@ pub const WasmScalarFn = struct {
         return .{ .str_len = rlen };
     }
 
+    /// Row-facing call that ALSO lets the guest issue queries (embed-wasm.md section 11): like
+    /// [`callRow`], but `kaidb_exec` is additionally exposed and bound to `ec`, so a trigger's
+    /// function can read and write data (which re-enters the executor under the caller's
+    /// transaction). Used by the trigger-fire path when an in-process ExecCtx is active; a trigger
+    /// that only reads columns still works (it just does not import kaidb_exec).
+    pub fn callRowInProc(self: *WasmScalarFn, rc: *const RowCtx, out_buf: []u8, ec: *const host.ExecCtx) !Result {
+        var store = zware.Store.init(self.alloc);
+        defer store.deinit();
+
+        // Expose both the column host functions and kaidb_exec BEFORE instantiate so the guest's
+        // imports bind. zware wires only the imports the module actually declares.
+        try host.expose(&store, rc);
+        try host.exposeExec(&store, ec);
+
+        var instance = zware.Instance.init(self.alloc, &store, self.module);
+        try instance.instantiate();
+        defer instance.deinit();
+
+        instance.fuel_budget = self.policy.fuel;
+        try instance.limitMemoryPages(self.policy.memory_pages);
+
+        var no_args = [0]u64{};
+        var out = [1]u64{0};
+        try instance.invoke(ENTRY, no_args[0..], out[0..], .{});
+
+        if (!self.returns_string) return .{ .int = @bitCast(out[0]) };
+
+        const rptr: u32 = @truncate(out[0] >> 32);
+        const rlen: u32 = @truncate(out[0]);
+        const mem = try instance.getMemory(0);
+        const buf = mem.memory();
+        if (@as(usize, rptr) + rlen > buf.len) return error.OutOfBoundsMemoryAccess;
+        if (@as(usize, rlen) > out_buf.len) return error.OutputTooLarge;
+        @memcpy(out_buf[0..rlen], buf[rptr .. rptr + rlen]);
+        return .{ .str_len = rlen };
+    }
+
     /// The exported entry points a string-taking UDF module must provide.
     pub const ENTRY = "kaidb_udf";
     pub const ALLOC_ENTRY = "kaidb_alloc";

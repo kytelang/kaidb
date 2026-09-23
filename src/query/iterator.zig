@@ -83,6 +83,12 @@ const WasmRegistry = @import("../wasm/registry.zig").Registry;
 /// precedence over a built-in scalar of the same name.
 pub threadlocal var active_wasm_registry: ?*WasmRegistry = null;
 
+/// The in-process query context for a row-facing wasm function that may issue queries (embed-wasm.md
+/// section 11). Set (thread-locally, same pattern as [`active_wasm_registry`]) by the trigger-fire
+/// path while a trigger runs, so the trigger's function can call `kaidb_exec`; null everywhere else,
+/// so an ordinary row-facing UDF gets the read-only column ABI and nothing more.
+pub threadlocal var active_exec_ctx: ?*const @import("../wasm/host.zig").ExecCtx = null;
+
 /// The exported entry point a wasm scalar UDF module must provide (the ABI convention). A
 /// Kyte/Rust/C guest names its scalar function this; the SQL name maps to the module via the
 /// registry, and the module's callable is always this export.
@@ -678,7 +684,12 @@ fn evalFunc(fc: ast.FuncCall, ctx: anytype) ?Scalar {
                 var rc = tableRowCtx(&tr);
                 const out_buf: []u8 = if (fn_scratch_toggle) fn_scratch_b[0..] else fn_scratch_a[0..];
                 fn_scratch_toggle = !fn_scratch_toggle;
-                const res = wfn.callRow(&rc, out_buf) catch return null;
+                // When an in-process ExecCtx is active (a trigger is firing), expose kaidb_exec so the
+                // function can read/write data; otherwise it gets the read-only column ABI only.
+                const res = if (active_exec_ctx) |ec|
+                    wfn.callRowInProc(&rc, out_buf, ec) catch return null
+                else
+                    wfn.callRow(&rc, out_buf) catch return null;
                 return switch (res) {
                     .int => |iv| .{ .integer = iv },
                     .str_len => |len| .{ .string = out_buf[0..len] },

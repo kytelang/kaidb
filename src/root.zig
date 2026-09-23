@@ -7383,3 +7383,54 @@ test "wasm in-process guest: a CALLed procedure inserts via kaidb_exec (embed-wa
         try std.testing.expectEqualStrings("700", res.rows[0][1]);
     }
 }
+
+test "wasm in-process trigger: a BEFORE INSERT trigger writes its own table via kaidb_exec (GroupLock re-entrancy)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_inproc_trig.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+    var db = try Database.open(allocator, io, db_path, 64, null);
+    defer db.close();
+    var exec = QueryExecutor.init(allocator, db);
+    defer exec.deinit();
+
+    const h = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+    };
+
+    // The trigger function issues "UPDATE t SET flag = 9 WHERE id = 1" through kaidb_exec, then
+    // returns 1 to allow the insert. It runs while the outer INSERT holds t's table lock, so the
+    // nested UPDATE exercises per-(thread,txn) GroupLock re-entrancy.
+    const trig_hex = comptime std.fmt.bytesToHex(@embedFile("wasm/testdata_trig_exec.wasm"), .lower);
+    try h.q(&exec, allocator, "CREATE TABLE t (id INT PRIMARY KEY, flag INT)");
+    try h.q(&exec, allocator, "INSERT INTO t (id, flag) VALUES (1, 0)");
+    try h.q(&exec, allocator, "CREATE FUNCTION TRIGUPD LANGUAGE wasm AS '" ++ trig_hex ++ "'");
+    try h.q(&exec, allocator, "CREATE TRIGGER g BEFORE INSERT ON t EXECUTE FUNCTION TRIGUPD()");
+
+    // Inserting a second row fires the trigger; its nested UPDATE (same table, re-entrant lock)
+    // must not deadlock, and the insert is allowed.
+    try h.q(&exec, allocator, "INSERT INTO t (id, flag) VALUES (2, 0)");
+
+    // Row 1's flag was set to 9 by the trigger's nested UPDATE; row 2 was inserted (flag 0). Both
+    // committed with the outer statement's transaction.
+    {
+        const res = try exec.execute(.{ .sql = "SELECT id, flag FROM t ORDER BY id" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+        try std.testing.expectEqual(@as(usize, 2), res.rows.len);
+        try std.testing.expectEqualStrings("1", res.rows[0][0]);
+        try std.testing.expectEqualStrings("9", res.rows[0][1]);
+        try std.testing.expectEqualStrings("2", res.rows[1][0]);
+        try std.testing.expectEqualStrings("0", res.rows[1][1]);
+    }
+}

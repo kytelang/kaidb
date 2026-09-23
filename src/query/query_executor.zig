@@ -131,6 +131,42 @@ threadlocal var wasm_trigger_depth: u32 = 0;
 /// Per-thread in-process query nesting depth (embed-wasm.md 11.6). Incremented across a nested
 /// `kaidb_exec`; checked against [`MAX_WASM_EXEC_DEPTH`].
 threadlocal var wasm_exec_depth: u32 = 0;
+
+/// Per-thread stack of per-table `GroupLock`s currently held by an enclosing statement (embed-wasm.md
+/// 11.6). An in-process nested statement (a trigger's `kaidb_exec`) targeting a table an outer
+/// statement already locked must BORROW that hold, not re-acquire the non-reentrant `GroupLock` on
+/// the same thread. Held as opaque pointers, compared by identity (`tableLock` interns one lock per
+/// table). Bounded by the nesting caps, so a small fixed stack suffices.
+const MAX_HELD_TABLE_LOCKS = 64;
+threadlocal var held_table_locks: [MAX_HELD_TABLE_LOCKS]*const anyopaque = undefined;
+threadlocal var held_table_locks_n: usize = 0;
+
+/// The `GroupLock` granularity a single-table statement needs.
+const TableLockMode = enum { read, write, exclusive };
+
+fn tableLockHeld(key: *const anyopaque) bool {
+    var i: usize = 0;
+    while (i < held_table_locks_n) : (i += 1) if (held_table_locks[i] == key) return true;
+    return false;
+}
+fn pushTableLock(key: *const anyopaque) void {
+    if (held_table_locks_n < MAX_HELD_TABLE_LOCKS) {
+        held_table_locks[held_table_locks_n] = key;
+        held_table_locks_n += 1;
+    }
+}
+fn popTableLock(key: *const anyopaque) void {
+    var i = held_table_locks_n;
+    while (i > 0) {
+        i -= 1;
+        if (held_table_locks[i] == key) {
+            var j = i;
+            while (j + 1 < held_table_locks_n) : (j += 1) held_table_locks[j] = held_table_locks[j + 1];
+            held_table_locks_n -= 1;
+            return;
+        }
+    }
+}
 /// Per-statement count of wasm aggregator instances created, reset at the start of each aggregate
 /// query block and checked against [`MAX_WASM_AGG_INSTANCES`].
 threadlocal var wasm_agg_created: usize = 0;
@@ -4327,6 +4363,16 @@ pub const QueryExecutor = struct {
         if (wasm_exec_depth == 0) self.db.rw_lock.unlockShared(io);
     }
 
+    /// Whether any registered trigger fires on `event` for `table_name` (either timing). Used to
+    /// decide whether an INSERT must take the table lock exclusively so a trigger's nested DML can
+    /// borrow the hold (embed-wasm.md 11.6).
+    fn tableHasTriggerFor(self: *QueryExecutor, table_name: []const u8, event: ast.TriggerEvent) bool {
+        for (self.db.wasm_triggers.items) |t| {
+            if (t.event == event and std.mem.eql(u8, t.table_name, table_name)) return true;
+        }
+        return false;
+    }
+
     fn executeStatement(self: *QueryExecutor, stmt: ast.Statement) !QueryResponse {
         const io = self.db.pool.pager.io;
         const is_read = switch (stmt) {
@@ -4353,23 +4399,39 @@ pub const QueryExecutor = struct {
             };
             self.rwLockShared(io);
             defer self.rwUnlockShared(io);
-            switch (stmt) {
-                .insert => {
-                    tl.lockWrite(io);
-                    defer tl.unlockWrite(io);
-                    return try self.executeStatementInternal(stmt);
-                },
-                .update, .delete => {
-                    tl.lockExclusive(io);
-                    defer tl.unlockExclusive(io);
-                    return try self.executeStatementInternal(stmt);
-                },
-                else => {
-                    tl.lockRead(io);
-                    defer tl.unlockRead(io);
-                    return try self.executeStatementInternal(stmt);
-                },
+
+            // The lock mode this statement needs. An INSERT normally takes WRITE (concurrent
+            // inserters allowed), but on a table that has an INSERT trigger it takes EXCLUSIVE: the
+            // trigger may issue nested DML on the same table (embed-wasm.md 11.6), and holding
+            // EXCLUSIVE means that nested statement can safely BORROW this hold even under concurrency.
+            const mode: TableLockMode = switch (stmt) {
+                .insert => if (self.tableHasTriggerFor(tname, .INSERT)) .exclusive else .write,
+                .update, .delete => .exclusive,
+                else => .read,
+            };
+
+            // Re-entrant borrow (embed-wasm.md 11.6): if an enclosing statement on this thread
+            // already holds this table's lock (a trigger's kaidb_exec re-entering), do NOT re-acquire
+            // the non-reentrant GroupLock; run under the hold the outer statement already has.
+            const key: *const anyopaque = @ptrCast(tl);
+            const borrow = tableLockHeld(key);
+            if (!borrow) {
+                switch (mode) {
+                    .read => tl.lockRead(io),
+                    .write => tl.lockWrite(io),
+                    .exclusive => tl.lockExclusive(io),
+                }
+                pushTableLock(key);
             }
+            defer if (!borrow) {
+                popTableLock(key);
+                switch (mode) {
+                    .read => tl.unlockRead(io),
+                    .write => tl.unlockWrite(io),
+                    .exclusive => tl.unlockExclusive(io),
+                }
+            };
+            return try self.executeStatementInternal(stmt);
         }
 
         if (is_read) {
@@ -7355,6 +7417,14 @@ pub const QueryExecutor = struct {
         if (wasm_trigger_depth > MAX_TRIGGER_DEPTH) return error.TriggerRecursionTooDeep;
 
         query_iter.active_wasm_registry = &self.db.wasm_functions;
+        // Give the trigger's function an in-process query context so it can call kaidb_exec to read
+        // and write data (embed-wasm.md 11.6); restore the previous value so nested trigger fires
+        // (a trigger whose kaidb_exec fires another trigger) re-establish it correctly on unwind.
+        var ec = self.inProcExecCtx();
+        const prev_ec = query_iter.active_exec_ctx;
+        query_iter.active_exec_ctx = &ec;
+        defer query_iter.active_exec_ctx = prev_ec;
+
         var data_slice = [1]query_iter.TableRow{tr};
         var tables_slice = [1][]const u8{table.name};
         const row = query_iter.Row{ .tables = tables_slice[0..], .data = data_slice[0..] };
