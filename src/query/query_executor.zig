@@ -5766,7 +5766,7 @@ pub const QueryExecutor = struct {
                 // Persist so the UDF survives restart (embed-wasm.md M1). Best-effort: the
                 // in-memory registration already succeeded; a failed write only means it will
                 // not survive a restart, so warn rather than fail the statement.
-                self.db.persistWasmFunction(upper, bytes, cf.returns_string) catch |err|
+                self.db.persistWasmFunction(upper, bytes, cf.returns_string, self.current_tx_id orelse 1) catch |err|
                     std.log.warn("CREATE FUNCTION {s}: persistence failed: {any}", .{ upper, err });
                 return QueryResponse{ .rows_affected = 1 };
             },
@@ -5774,7 +5774,7 @@ pub const QueryExecutor = struct {
                 const upper = try std.ascii.allocUpperString(self.allocator, df.name);
                 defer self.allocator.free(upper);
                 _ = self.db.wasm_functions.drop(upper);
-                self.db.removeWasmFunction(upper);
+                self.db.removeWasmFunction(upper, self.current_tx_id orelse 1);
                 return QueryResponse{ .rows_affected = 1 };
             },
             .create_aggregate => |ca| {
@@ -5792,7 +5792,7 @@ pub const QueryExecutor = struct {
                 defer self.allocator.free(upper);
                 self.db.wasm_aggregates.register(upper, bytes, .{}) catch
                     return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CREATE AGGREGATE: module failed to decode, validate, or is missing accumulate/finalise") };
-                self.db.persistWasmAggregate(upper, bytes) catch |err|
+                self.db.persistWasmAggregate(upper, bytes, self.current_tx_id orelse 1) catch |err|
                     std.log.warn("CREATE AGGREGATE {s}: persistence failed: {any}", .{ upper, err });
                 return QueryResponse{ .rows_affected = 1 };
             },
@@ -5800,7 +5800,7 @@ pub const QueryExecutor = struct {
                 const upper = try std.ascii.allocUpperString(self.allocator, da.name);
                 defer self.allocator.free(upper);
                 _ = self.db.wasm_aggregates.drop(upper);
-                self.db.removeWasmAggregate(upper);
+                self.db.removeWasmAggregate(upper, self.current_tx_id orelse 1);
                 return QueryResponse{ .rows_affected = 1 };
             },
             .create_procedure => |cp| {
@@ -5817,7 +5817,7 @@ pub const QueryExecutor = struct {
                 defer self.allocator.free(upper);
                 self.db.wasm_procedures.register(upper, bytes, .{}, false) catch
                     return QueryResponse{ .error_message = try self.allocator.dupe(u8, "CREATE PROCEDURE: module failed to decode or validate") };
-                self.db.persistWasmProcedure(upper, bytes) catch |err|
+                self.db.persistWasmProcedure(upper, bytes, self.current_tx_id orelse 1) catch |err|
                     std.log.warn("CREATE PROCEDURE {s}: persistence failed: {any}", .{ upper, err });
                 return QueryResponse{ .rows_affected = 1 };
             },
@@ -5825,7 +5825,7 @@ pub const QueryExecutor = struct {
                 const upper = try std.ascii.allocUpperString(self.allocator, dp.name);
                 defer self.allocator.free(upper);
                 _ = self.db.wasm_procedures.drop(upper);
-                self.db.removeWasmProcedure(upper);
+                self.db.removeWasmProcedure(upper, self.current_tx_id orelse 1);
                 return QueryResponse{ .rows_affected = 1 };
             },
             .call => |c| return self.executeCall(c),
@@ -5844,14 +5844,14 @@ pub const QueryExecutor = struct {
                     .event = ct.event,
                     .table_name = ct.table_name,
                     .function_name = upper_fn,
-                }) catch |err|
+                }, self.current_tx_id orelse 1) catch |err|
                     return QueryResponse{ .error_message = try std.fmt.allocPrint(self.allocator, "CREATE TRIGGER failed: {any}", .{err}) };
                 return QueryResponse{ .rows_affected = 1 };
             },
             .drop_trigger => |dt| {
                 const upper = try std.ascii.allocUpperString(self.allocator, dt.name);
                 defer self.allocator.free(upper);
-                self.db.unregisterTrigger(upper);
+                self.db.unregisterTrigger(upper, self.current_tx_id orelse 1);
                 return QueryResponse{ .rows_affected = 1 };
             },
             .drop_table => |dt| {

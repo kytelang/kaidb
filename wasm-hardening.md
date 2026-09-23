@@ -18,7 +18,7 @@ concurrency, security, and resource-safety properties a shipped feature needs. I
 | Determinism (canonical NaN, no clock/RNG/WASI) | Done, gated (differential + replay tests) |
 | Fuzzing of decode / validate / execute | Done, gated; SQL trigger/proc paths and the official WASM conformance suite are not yet fuzzed |
 | Per-call resource metering | Done; no per-statement or per-query ceiling |
-| Persistence of modules and triggers | File-backed (`.wasm` / `.twasm` / `.wagg` / `.wproc` / `.wtrig`), reloaded on open. NOT catalog / WAL / doublewrite, NOT replicated |
+| Persistence of modules and triggers | Done. Rows in the `sys.wasm_modules` catalog btree, so a CREATE / DROP is WAL-logged, doublewrite-protected, crash-consistent (recovery redoes each row generically), transactional (rolled back with its statement), and replicated to followers. Reloaded from the table on open |
 | Concurrency (registry mutation vs concurrent reads) | Mutation-vs-read is serialised by the database `rw_lock` (DDL exclusive, reads shared); the registry pointer is now `threadlocal` (P0-2 done). Moving it fully off ambient state remains |
 | Authorization on UDF / trigger DDL | When security is enabled, registering a function / aggregate / procedure / trigger requires `.admin`; `CALL` requires `.write`. No finer-grained per-object privilege yet. When security is disabled (default embedded mode) all DDL is open, as it is for every statement |
 | Trigger events | INSERT, UPDATE, and DELETE all fire (BEFORE can veto). Recursion/fan-out limits still pending |
@@ -27,14 +27,18 @@ concurrency, security, and resource-safety properties a shipped feature needs. I
 
 ### P0, correctness and durability blockers
 
-1. **Catalog / WAL persistence, not loose files.** Functions, aggregates, procedures, and
-   triggers persist as loose files under `<base_dir>/udf/`, outside the catalog, the WAL, and
-   doublewrite. So registration is not crash-consistent (a crash between the in-memory register
-   and the file write diverges them), not transactional (a rolled-back statement still leaves the
-   file), and not replicated (a follower never receives a UDF or trigger over the WAL ship path).
-   The design (`embed-wasm.md` section 9, item 1) already calls for module source to live in the
-   catalog, WAL-backed and doublewrite-protected. This is the single biggest item. The `.wtrig`
-   binary format additionally has no version tag or checksum.
+1. **Catalog / WAL persistence, not loose files.** _Done._ Functions, aggregates, procedures, and
+   triggers no longer persist as loose files under `<base_dir>/udf/`. They are rows in a new
+   `sys.wasm_modules` catalog btree, keyed by a one-char kind tag (`F`/`A`/`P`/`T`) plus the
+   upper-cased name; a module row holds `[flags u8][module bytes]` (flags bit0 = returns_string, the
+   large module bytes spilling to overflow pages) and a trigger row holds
+   `[timing][event][table][fn]`. Writing through the btree gives everything the loose files lacked:
+   WAL durability, doublewrite protection, crash-consistency (recovery redoes each row generically
+   via `applyCatalogRecord`), transactional rollback with the enclosing statement, and follower
+   replication (the leader ships the rows over the WAL path and the follower applies them into its
+   own `sys.wasm_modules` tree, then rebuilds its registries). Reloaded from the table on open by
+   `loadWasmModules`. A remaining refinement is a version tag / checksum on the row value; the redo
+   path and the search-based load already reject a structurally bad row rather than crashing.
 
 2. **Concurrency: guard the registries and the global registry pointer.** _Done._ Verified that
    the mutation-versus-read race cannot occur: DDL (`CREATE` / `DROP FUNCTION` / `AGGREGATE` /
@@ -120,23 +124,26 @@ concurrency, security, and resource-safety properties a shipped feature needs. I
 
 ## Progress
 
-Implemented and gated so far: P0-2 (threadlocal registry pointer; rw_lock already serialises
-mutation vs read), P0-3 (trigger-depth guard), P1-4 (admin authorises UDF/trigger DDL, CALL needs
-write), P1-5 instance cap, P1-6 (result-buffer error instead of truncation), P1-7 (module-size and
-registry-count caps), P1-8 (UPDATE and DELETE triggers fire), and P2-11 (`sys.wasm_functions` /
-`sys.wasm_triggers` views).
+Implemented and gated so far: P0-1 (module and trigger persistence moved into the `sys.wasm_modules`
+catalog btree, so a CREATE / DROP is WAL-logged, doublewrite-protected, crash-consistent,
+transactional, and replicated to followers; a restart-persistence test and a follower-replication
+test gate it), P0-2 (threadlocal registry pointer; rw_lock already serialises mutation vs read),
+P0-3 (trigger-depth guard), P1-4 (admin authorises UDF/trigger DDL, CALL needs write), P1-5 instance
+cap, P1-6 (result-buffer error instead of truncation), P1-7 (module-size and registry-count caps),
+P1-8 (UPDATE and DELETE triggers fire), and P2-11 (`sys.wasm_functions` / `sys.wasm_triggers` views).
 
 Remaining, in rough priority order:
 
-1. **P0-1: move persistence into the catalog and WAL** (the largest item, and the one that most
-   moves the subsystem toward production: it makes registration crash-consistent, transactional,
-   and replicated). This deserves its own focused pass.
-2. **P1-9: bind the row ABI by name or stamp a schema version** so `ALTER TABLE` cannot silently
+1. **P1-9: bind the row ABI by name or stamp a schema version** so `ALTER TABLE` cannot silently
    shift column indices under a UDF. This is a design choice (a name-based ABI change versus a
    version stamp), not a quick edit.
-3. **P1-5 (remaining): a per-statement fuel ceiling** on top of the per-call budget.
-4. **P1-10 and the in-process query interface (design section 11)**, which unlocks DML from
+2. **P1-5 (remaining): a per-statement fuel ceiling** on top of the per-call budget.
+3. **P1-10 and the in-process query interface (design section 11)**, which unlocks DML from
    procedures and AFTER triggers.
-5. **P2-12 (surface persistence failures) and P2-13 (fuzz the SQL trigger/procedure paths, vendor
-   the WebAssembly conformance suite).** P2-12 largely closes once P0-1 folds persistence into the
-   WAL.
+4. **P2-13 (fuzz the SQL trigger/procedure paths, vendor the WebAssembly conformance suite).**
+5. **P0-1 follow-up: a version tag / checksum on the `sys.wasm_modules` row value.** The row format
+   is currently unversioned; the load and redo paths reject a structurally bad row rather than
+   crashing, but a stamped version would make a format change forward-safe. P2-12 (surface
+   persistence failures to the client) is now largely moot: a failed write is a failed WAL append
+   inside the statement's transaction, so it rolls the statement back rather than silently diverging
+   from disk.

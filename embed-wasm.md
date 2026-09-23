@@ -1083,15 +1083,17 @@ shipped feature needs.
 
 **P0, correctness and durability blockers:**
 
-1. **Catalog/WAL persistence, not loose files.** Functions, aggregates, procedures (`.wasm` /
-   `.twasm` / `.wagg` / `.wproc`) and triggers (`.wtrig`) persist as loose files under
-   `<base_dir>/udf/`, outside the catalog, the WAL, and doublewrite. So registration is not
-   crash-consistent (a crash between the in-memory register and the file write diverges them),
-   not transactional (a rolled-back statement still leaves the file), and not replicated
-   (followers never receive a UDF or trigger over the WAL ship path). The design (section 9,
-   item 1) already calls for module source to live in the catalog, WAL-backed and
-   doublewrite-protected. This is the single biggest item: it is a durability and HA
-   correctness gap, and the `.wtrig` binary format additionally has no version tag or checksum.
+1. **Catalog/WAL persistence, not loose files.** _Done._ Functions, aggregates, procedures, and
+   triggers no longer persist as loose files under `<base_dir>/udf/`. They are rows in a new
+   `sys.wasm_modules` catalog btree (keyed by a one-char kind tag plus the upper-cased name; a
+   module value is `[flags u8][module bytes]`, a trigger value is `[timing][event][table][fn]`,
+   with large module bytes spilling to overflow pages). Writing through the btree makes a
+   CREATE/DROP WAL-logged, doublewrite-protected, crash-consistent (recovery redoes each row
+   generically via `applyCatalogRecord`), transactional (rolled back with its statement), and
+   replicated (the leader ships the rows, the follower applies them into its own tree and rebuilds
+   its registries). Reloaded on open by `loadWasmModules`. This realises the design in section 9,
+   item 1. Remaining refinement: a version tag / checksum on the row value (the load and redo paths
+   already reject a structurally bad row rather than crash).
 2. **Concurrency: guard the registries and the global registry pointer.** DDL
    (`CREATE`/`DROP FUNCTION`/`AGGREGATE`/`PROCEDURE`/`TRIGGER`, `registerTrigger`) mutates the
    in-memory registries and the trigger list with no lock, while queries read them

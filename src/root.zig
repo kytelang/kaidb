@@ -7135,3 +7135,76 @@ test "wasm introspection: sys.wasm_functions and sys.wasm_triggers list register
         try std.testing.expectEqualStrings("CHECKAMOUNT", res.rows[0][4]);
     }
 }
+
+test "wasm replication: a CREATE FUNCTION and its DROP reach a follower (P0-1 follower path)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+
+    const leader_path = "test_wasm_repl_leader.db";
+    const follower_path = "test_wasm_repl_follower.db";
+    const leader_wal = "test_wasm_repl_leader_wal";
+    const follower_wal = "test_wasm_repl_follower_wal";
+    defer Io.Dir.deleteFile(.cwd(), io, leader_path) catch {};
+    defer Io.Dir.deleteFile(.cwd(), io, follower_path) catch {};
+    Io.Dir.deleteTree(.cwd(), io, leader_wal) catch {};
+    Io.Dir.deleteTree(.cwd(), io, follower_wal) catch {};
+    defer Io.Dir.deleteTree(.cwd(), io, leader_wal) catch {};
+    defer Io.Dir.deleteTree(.cwd(), io, follower_wal) catch {};
+
+    var cap = ReplCapture{ .allocator = allocator };
+    defer cap.deinit();
+
+    var leader = try Database.open(allocator, io, leader_path, 64, leader_wal);
+    defer leader.close();
+    try std.testing.expect(leader.wal != null);
+    if (leader.wal) |w| {
+        w.ship_callback = &ReplCapture.cb;
+        w.replication_manager = &cap;
+    }
+    var lex = QueryExecutor.init(allocator, leader);
+    defer lex.deinit();
+
+    const h = struct {
+        fn q(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+        fn count(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !usize {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+            return res.rows.len;
+        }
+    };
+
+    const fn_hex = comptime std.fmt.bytesToHex(@embedFile("query/testdata_udf.wasm"), .lower);
+    try h.q(&lex, allocator, "CREATE FUNCTION DBL LANGUAGE wasm AS '" ++ fn_hex ++ "'");
+    try h.q(&lex, allocator, "CREATE TABLE t (x INT PRIMARY KEY)");
+    try h.q(&lex, allocator, "INSERT INTO t (x) VALUES (21)");
+    try h.q(&lex, allocator, "INSERT INTO t (x) VALUES (42)");
+    try std.testing.expect(cap.records.items.len > 0);
+
+    var follower = try Database.open(allocator, io, follower_path, 64, follower_wal);
+    defer follower.close();
+    _ = try follower.applyStream(cap.records.items);
+
+    // The UDF replicated: the follower has DBL in its registry and can evaluate the predicate.
+    try std.testing.expect(follower.wasm_functions.get("DBL") != null);
+    var fex = QueryExecutor.init(allocator, follower);
+    defer fex.deinit();
+    // DBL(x) = 42 holds only for x = 21, so the replicated wasm predicate selects exactly one row.
+    try std.testing.expectEqual(@as(usize, 1), try h.count(&fex, allocator, "SELECT x FROM t WHERE DBL(x) = 42"));
+
+    // A DROP on the leader replicates too: after re-applying the (now longer) stream, the
+    // follower's registry no longer has DBL, so the predicate excludes every row.
+    try h.q(&lex, allocator, "DROP FUNCTION DBL");
+    _ = try follower.applyStream(cap.records.items);
+    try std.testing.expect(follower.wasm_functions.get("DBL") == null);
+    try std.testing.expectEqual(@as(usize, 0), try h.count(&fex, allocator, "SELECT x FROM t WHERE DBL(x) = 42"));
+}
