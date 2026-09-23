@@ -552,60 +552,240 @@ with no network hop at all. The kaidb wire protocol already is the serialisation
 application and the engine. The only thing that changes in-process is the transport: instead
 of a TCP socket, the driver moves the same frames through linear memory and a host call.
 
-### 11.1 The transport-agnostic driver and the `wasm` DSN flag
+### 11.1 The driver plays two roles for one feature
 
-The `kyte-kaidb` driver speaks the kaidb binary protocol over a socket today. We make the
-transport a strategy, selected by a connection-string parameter:
+For a single `CALL myproc(...)`, or one `INSERT` that fires a trigger, the same driver appears
+at two different layers, and it is worth drawing the topology before the mechanics:
 
 ```
-kaidb://user:pass@host:3009/db                 # normal: TCP socket
+Client process (Kyte app)                    kaidb process
++-------------------------+                  +---------------------------------------+
+| KyteDriver.connect(     |                  |  QueryExecutor (thread T, tx = X)     |
+|   "kaidb://...:3009/db") |   TCP frames     |    executes INSERT / CALL             |
+|  Transport = Socket -----+---------------->|    fires trigger / runs procedure:    |
+|                         |  (async, reactor)|      zware Instance (the guest)       |
++-------------------------+                  |        driver compiled INTO the guest |
+                                             |          KyteDriver.connect(          |
+   role 1: the outer client                 |            "kaidb://local/db?wasm=true")|
+                                             |            Transport = Memory --+     |
+                                             |          kaidb_exec(ptr, len) <-+     |
+                                             |            re-enters QueryExecutor    |
+                                             |            on thread T, tx = X (sync) |
+                                             +---------------------------------------+
+                                                role 2: in-process guest, same txn
+```
+
+Role 1 is the ordinary client, driver over a socket. Role 2 is the trigger, stored procedure,
+or function body: it is a wasm module running inside kaidb's embedded engine, and when its code
+reads or writes data it uses the **same driver API**, compiled into the guest, whose transport
+is linear memory rather than a socket. The wire format, the codec, `typemap`, the ORM, and the
+`query`/`exec` loops are byte-for-byte identical across both roles. Only the transport differs,
+and the `wasm=true` DSN flag selects it. A procedure that does `conn.query("SELECT ...")` is the
+same program whether it runs as a remote client or inside the database.
+
+### 11.2 The transport seam: one interface, two backends
+
+Today `KyteConnection` holds a bare `io: aio.AsyncIO` plus a `BtReader`, and `proto.sendFrame` /
+`BtReader.fill` call `io.sendStr` / `io.recvInto` directly. That is the exact seam to abstract.
+The connection owns a `Transport` instead of a raw `io`:
+
+```
+// proto.ky (or a new transport.ky)
+pub trait Transport {
+    // Send one fully-framed request; return bytes sent (<0 = lost). Socket parks on the reactor;
+    // Memory writes the frame into guest memory, traps to the host, returns synchronously.
+    async fn send(self, frame: string): int;
+    // Fill the read buffer with the next available response bytes (<=0 = EOF/closed).
+    async fn recv(self, dst: long, cap: int): int;
+    fn close(self): void;
+}
+
+struct SocketTransport impl Transport { io: aio.AsyncIO; ... }   // today's aio path, unchanged
+struct MemoryTransport impl Transport { respPtr: long; respLen: int; respPos: int; ... }
+```
+
+`KyteConnection` becomes `{ transport: Transport, reader: BtReader, prepared, busy }`, and
+`BtReader` reads through `transport.recv` rather than `io.recvInto`. Nothing above the transport
+changes: the `busy`-guarded request/response loops in `query`/`exec`/`queryPrepared` stay as they
+are. `recv` is kept (rather than a single `roundtrip(req) -> resp`) because a response is a stream
+of frames (`T`, then N * `D`, then `C`, then `Z`), and the existing loop already decodes them
+incrementally with a zero-copy `DataRow` path; `MemoryTransport.recv` just hands out slices of the
+one response blob the host returned, so the loop above it is untouched.
+
+### 11.3 The `wasm` DSN flag and connect()
+
+```
+kaidb://user:pass@host:3009/db                 # socket mode (wasm=false, the default)
 kaidb://localhost/db?wasm=true                 # in-process: linear-memory host calls
 ```
 
-When `wasm=true`:
+`ConnectionOptions` gains `wasm: bool`, parsed from `wasm=true` in `connection.ky`. `connect`
+branches on it:
 
-- The driver does **not** open a socket. There is no `host:port` to reach; the driver is
-  running as a wasm guest inside the kaidb process.
-- To send a request, the driver encodes the same protocol frame it would have written to a
-  socket (via the shared `src/proto/wire.zig` codec), places it in its own guest linear
-  memory, and calls a host import, for example `kaidb_exec(ptr, len) -> i64` (packed
-  response `ptr`/`len`).
-- kaidb, as the host, reads the frame out of the guest memory (bounds-checked exactly as in
-  section 6.4), executes it against storage on the calling thread and the current
-  transaction, encodes the response, writes it back into guest memory (through the guest
-  allocator), and returns the pointer and length.
-- The driver decodes the response frame with the same codec and returns rows to the
-  application, identical result shapes to the socket path.
+- **Socket mode** (`wasm=false`): the path today. Parse host/port/creds, open `aio`/`asynctls`,
+  run the startup + auth handshake, build a `SocketTransport`.
+- **Memory mode** (`wasm=true`): open **no** socket and run **no** handshake. Host, port, and
+  credentials in the DSN are ignored (identity is inherited, see 11.7). Build a `MemoryTransport`.
+  `connect` is effectively free. The DSN is a fixed constant the in-process template injects.
 
-The important property: **the wire format is unchanged.** Socket mode and in-process mode
-share one codec and one protocol. The driver has two back ends behind one interface, and
-the DSN flag chooses. Nothing above the transport in the driver, connection handling, query
-building, row binding, the ORM, needs to know which transport is in use.
+The same `KyteDriver().connect(dsn)` an application writes works in both worlds; only the string
+differs.
 
-### 11.2 Why this is synchronous, and why that matters
+### 11.4 The host-import ABI
 
-Over a socket, a query is asynchronous: the driver awaits bytes from the network on the
-reactor. In-process, the host call is **synchronous**: `kaidb_exec` traps into kaidb, which
-services the request inline and returns. There is no waiting, no reactor, no suspension. The
-guest calls a function and gets an answer, the same way a normal function call returns.
+The guest already exports `kaidb_alloc(size) -> ptr` and `memory` (used today for string UDFs). The
+in-process transport needs exactly one new host import on top of that. The ABI uses a
+**guest-provided response buffer** rather than a host-allocated one:
 
-This is the linchpin that connects to section 12: because the in-process transport is a
-plain synchronous host call, the driver's `wasm=true` path contains no `await` and needs no
-async runtime. A Kyte program that uses only synchronous data access can therefore be
-compiled to wasm and run inside kaidb without solving the async-in-wasm problem at all. The
-hardest blocker for Kyte-to-wasm (the reactor and stack switching) simply does not appear on
-this path, because the thing it existed to do (wait for I/O) is now an immediate host call.
+```
+// Host import, resolved by host.expose(&store, session) BEFORE instantiate, the same mechanism
+// that binds col_i64/col_bytes/... for a row-facing UDF.
+kaidb_exec(req_ptr: i32, req_len: i32, resp_ptr: i32, resp_cap: i32) -> i32
+//   >= 0            : response length, written into [resp_ptr, resp_ptr + n)
+//   < 0 (e.g. -N)   : response did not fit; N is the length needed, so the guest grows its
+//                     buffer and retries (matching the driver's bounded read-buffer + refill loop)
+```
 
-### 11.3 Trust boundary
+Round-trip, host side:
 
-An in-process guest is still untrusted code and runs under the full section 5 metering, the
-section 6.4 bounds discipline, and the section 7 determinism rules. The difference from a
-scalar UDF is only that its host-import set additionally includes `kaidb_exec` (and its
-companions), which lets it issue queries. Those queries run under the same authorisation and
-transaction the guest was invoked with, so an in-process guest cannot reach data its caller
-could not. Nested queries from a guest are serviced synchronously and re-enter the executor
-on the same thread, so re-entrancy and transaction visibility must be handled explicitly
-(an open question, section 16).
+1. Bounds-check `[req_ptr, req_ptr + req_len)` and `[resp_ptr, resp_ptr + resp_cap)` against the
+   guest's linear memory, the same discipline `udf.zig` already applies
+   (`if (ptr + len > buf.len) return OutOfBoundsMemoryAccess`).
+2. Read the request frame out (or borrow it in place) and feed it to the engine on **this thread,
+   this transaction** (see 11.6) via `executeNested`, which decodes the request frame, runs it, and
+   encodes the response frame set (`RowDescription` / `DataRow*` / `CommandComplete` /
+   `ReadyForQuery`, or `ErrorResponse`) with the **same `src/proto/wire.zig` codec** the socket
+   server uses.
+3. If the encoded response fits `resp_cap`, copy it into `[resp_ptr, ...)` bounds-checked and return
+   its length; otherwise return the negative needed length and let the guest grow and retry.
+
+**Why the guest provides the buffer, not the host.** The alternative (host calls the guest's
+`kaidb_alloc` to place the response, returning a packed `(ptr << 32) | len`) requires re-entering
+the VM to invoke a guest export from *inside* a host-function callback, mid-`kaidb_exec`. That
+nested VM invocation is fragile in the interpreter and easy to get wrong. Handing the host a
+pre-sized guest buffer keeps the whole call a single, non-re-entrant host trap: the host only reads
+and writes linear memory (both bounds-checked), never calls back into the guest. It also mirrors the
+socket transport's existing bounded read-buffer-plus-refill loop, so the driver's grow-and-retry is
+the same shape it already has.
+
+Memory ownership stays clean: **the guest owns its memory; the host only ever reads/writes linear
+memory it has bounds-checked, and never holds a guest pointer past the call.** Companion imports (a
+streaming `kaidb_exec_open` / `kaidb_fetch` for result sets too large to buffer, `kaidb_exec_prepared`)
+can follow; the v1 ABI is the single `kaidb_exec` with a fully-materialised response, which covers
+procedures and triggers whose queries return bounded rows.
+
+### 11.5 Why this is synchronous, and the async-in-wasm boundary
+
+Over a socket, a query is asynchronous: the driver awaits bytes on the reactor. In-process,
+`kaidb_exec` is a **synchronous trap**: it services the request inline and returns, no suspension.
+`MemoryTransport.send` performs the trap and stashes the returned blob; `MemoryTransport.recv` then
+yields slices of that blob and returns `<=0` at the end. No await ever actually suspends on this
+path.
+
+The honest caveat: the driver's methods are declared `async fn`, and compiling an `async fn` to
+wasm at all is the open section 12 blocker (the reactor and stack switching). Two ways through, in
+preference order:
+
+1. **Synchronous transport, degenerate awaits.** `MemoryTransport.send`/`recv` complete
+   immediately, so every `await` on this path resolves with no suspension point. If the Kyte-to-wasm
+   backend can lower an `async fn` whose awaits never suspend into a straight-line function (no
+   frame heap, no reactor), the *same* driver source compiles for both targets. This is the clean
+   end state and it is a compiler capability, not a driver change. It is the assumed default.
+2. **A `sync` sibling path selected at wasm build time.** If (1) is not ready, generate
+   `querySync` / `execSync` that call `transport.send`/`recv` without `await` and share the codec.
+   Uglier (two entry points) but it unblocks the in-process feature before the async-in-wasm work
+   lands. This is the fallback.
+
+Either way the synchronicity lives in the transport, and shipping role 2 for the synchronous data
+subset does not require first solving async-in-wasm.
+
+### 11.6 Re-entrancy, transaction visibility, and locking
+
+This is the part sections 11 and 16 previously left open, and it is the real correctness content.
+A BEFORE-INSERT trigger's guest calling `kaidb_exec("SELECT ... FROM the_same_table")` re-enters
+the executor **while the outer INSERT is mid-flight and holding locks**. The rules:
+
+- **Same thread, same `current_tx_id`.** The host services `kaidb_exec` on the calling thread and
+  threads the outer statement's transaction id into the nested `QueryExecutor` invocation. MVCC then
+  does the right thing for free: the nested query sees the transaction's snapshot **plus its own
+  uncommitted writes** (read-your-writes), and a BEFORE trigger correctly does **not** see the row
+  not yet inserted.
+- **Locks are re-entrant per (thread, txn), not per call.** kaidb takes a per-table `GroupLock`
+  (read/write/exclusive) and the db-wide `rw_lock` per statement. A nested statement needing a lock
+  the outer already holds would self-deadlock, so lock acquisition becomes **re-entrant for the same
+  transaction on the same thread**: the nested statement recognises the lock is already held for
+  this txn and borrows it instead of re-acquiring. This is bounded and localised to `tableLock` /
+  the executor's lock-scoping, keyed on `current_tx_id` plus the thread id. It is required even for
+  a read: a nested `SELECT` on a table the outer `UPDATE` holds exclusively would otherwise block on
+  itself.
+- **Depth is bounded by the existing guard plus one more.** The threadlocal `wasm_trigger_depth`
+  cap (`MAX_TRIGGER_DEPTH` = 8, from hardening P0-3) already bounds trigger -> query -> trigger
+  cycles and returns `error.TriggerRecursionTooDeep`. A parallel `wasm_exec_depth` bounds plain
+  `kaidb_exec` nesting that does not pass through a trigger, so a runaway procedure recursing through
+  `kaidb_exec` is bounded too, before the native stack is at risk.
+- **BEFORE triggers become write-capable, gated by phase.** With in-process DML available, a BEFORE
+  trigger *can* now issue writes. The safe v1 allows reads and writes to *other* tables and rejects a
+  write to the table whose DML is in flight (it would recurse the trigger and fight the outer row
+  image). AFTER triggers may write freely within the same txn. This supersedes the current
+  "procedures and AFTER triggers are validation and compute only" note and should be stated in the
+  user docs when it lands.
+
+### 11.7 Authorisation is inherited, never re-supplied
+
+The `wasm=true` DSN carries no real credentials and the memory transport runs no auth handshake. The
+nested query runs under the **same security principal the guest was invoked with**: the host binds
+the invoking session's identity to the guest at `host.expose` time, and `kaidb_exec` runs the nested
+statement under it. The consequence is the correct one: an in-process guest **cannot reach data its
+caller could not**. A `user=` / `password=` in a wasm DSN is ignored (and may be rejected, to avoid
+a false impression of privilege escalation).
+
+### 11.8 Errors and the trust boundary
+
+A failed nested query returns an `ErrorResponse` ('E') frame in the response blob, exactly as over
+the wire, so the driver's existing `f.ftype == 69 -> decodeError` path surfaces it as a `DbError`
+with SQLSTATE. A host-side fault (a bounds violation, a guest OOM on `kaidb_alloc`) traps the guest
+under the section 5 metering, which aborts the enclosing UDF/trigger and, for a BEFORE trigger,
+vetoes the DML. Nothing partial leaks because the whole thing is one transaction. An in-process guest
+otherwise runs under the full section 5 metering, the section 6.4 bounds discipline, and the section
+7 determinism rules; the only addition to its import set is `kaidb_exec`.
+
+### 11.9 Change plan and phasing
+
+Driver (`kyte-kaidb`):
+
+- `connection.ky`: add `wasm: bool` to `ConnectionOptions` and parse `wasm=true`.
+- `proto.ky` / new `transport.ky`: define `Transport`; extract today's aio path into
+  `SocketTransport`; add `MemoryTransport` with the `kaidb_exec` extern and the guest-alloc/free
+  handling. `BtReader` reads via `transport.recv`.
+- `kaidb.ky`: `KyteConnection` holds a `Transport`; `connect` branches on `opts.wasm`; if forced
+  onto path 11.5(2), add `querySync` / `execSync`.
+
+Engine (`kaidb`):
+
+- `src/wasm/host.zig` (the `expose` surface): register `kaidb_exec` alongside the `col_*` imports,
+  carrying a pointer to the invoking session / txn context.
+- `src/wasm/udf.zig`: an in-process instantiation variant that additionally exposes `kaidb_exec`.
+- `src/query/query_executor.zig`: a re-entrant `executeNested(frameBytes, session, tx_id)` that
+  decodes a wire frame, runs it, and re-encodes the response; the per-(thread, txn) re-entrant lock
+  borrow; and the `wasm_exec_depth` guard.
+- `src/proto/wire.zig`: reused as-is; no wire-format change.
+
+Phases, in dependency order:
+
+1. **Driver transport seam** (socket behaviour identical, `MemoryTransport` stubbed). Pure
+   structure, fully offline-gatable.
+2. **Engine host ABI**: `kaidb_exec` + `executeNested` + lock re-entrancy + depth guard, gated by a
+   Zig in-process test that instantiates a guest issuing a hand-built frame and asserts the returned
+   frame, the resulting table state, and the same-txn visibility rules. This is the substantive,
+   shippable slice and it needs **no** wasm toolchain.
+3. **Driver `MemoryTransport` real body** + the `wasm=true` connect path.
+4. **End-to-end**, once Kyte-to-wasm (the synchronous subset, section 12) can compile the driver:
+   compile a tiny procedure that does `conn.query` under `wasm=true`, register it, `CALL` it, assert
+   rows.
+
+Phases 1 and 2 are fully implementable and gatable today; only phase 4 waits on the async-in-wasm
+compile work, so the compiler dependency does not block the engine-side re-entrancy machinery, which
+is the part with real correctness content.
 
 ## 12. Compiling Kyte to wasm: the synchronous subset
 
@@ -1064,11 +1244,15 @@ Test and hardening plan:
   replica mid-upgrade, the persisted cache is per-node regenerable (fine), but we must
   confirm that UDF output stays bit-identical across engine versions, or gate UDF execution
   on a matched engine version during rolling upgrades.
-- **In-process re-entrancy.** When an in-process guest (section 11) issues a query through
-  `kaidb_exec`, that query re-enters the executor on the same thread and inside the guest's
-  transaction. We must define the visibility (does the guest see its own uncommitted writes),
-  the recursion depth limit, and whether a guest query may itself invoke another wasm guest,
-  before this path ships.
+- **In-process re-entrancy.** _Resolved in the design (section 11.6); implementation pending._
+  A `kaidb_exec` from an in-process guest re-enters the executor on the same thread inside the
+  guest's transaction: the nested statement runs under the outer `current_tx_id`, so MVCC gives it
+  read-your-writes (a BEFORE trigger does not see the pending row); locks become re-entrant per
+  (thread, txn) so a nested statement borrows a lock the outer holds instead of self-deadlocking;
+  depth is bounded by the existing `wasm_trigger_depth` plus a new `wasm_exec_depth`; and a guest
+  query may fire another guest (a trigger), bounded by those same counters. The remaining open sub-
+  question is whether a BEFORE trigger may write the very table whose DML is in flight; the safe v1
+  rejects it.
 - **Self-hosted backend.** The tail-call requirement pins us to the LLVM backend. If kaidb
   ever wants the self-hosted backend for faster debug builds, the WASM path needs a fallback
   dispatch (a plain switch) behind a build flag. Not needed now, noted.
