@@ -29,6 +29,17 @@ pub const Policy = struct {
 pub const MAX_MODULE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB of wasm is already a very large UDF
 pub const MAX_REGISTERED: usize = 1024; // per registry (functions, aggregates, procedures)
 
+/// Reject at registration a module whose declared INITIAL linear memory exceeds the per-call page
+/// cap (embed-wasm.md section 5.3). This matters because `instance.instantiate()` allocates and
+/// zeroes the declared `min` pages up front, BEFORE `limitMemoryPages` clamps future growth, so an
+/// unchecked large `min` (the decoder allows up to 65536 pages = 4 GiB) is a per-call host-RAM DoS,
+/// and row-facing UDFs spin a fresh instance per row. Enforcing it here, once, keeps the memory cap
+/// meaningful for every guest-invocation path.
+fn rejectOversizedInitialMemory(module: *zware.Module, policy: Policy) !void {
+    if (module.memories.list.items.len == 0) return;
+    if (module.memories.list.items[0].limits.min > policy.memory_pages) return error.ModuleMemoryTooLarge;
+}
+
 /// A decoded wasm module registered as a scalar function. Immutable after `init`, so one
 /// `WasmScalarFn` can be shared across kaidb's query threads and reused for every row.
 pub const WasmScalarFn = struct {
@@ -64,6 +75,8 @@ pub const WasmScalarFn = struct {
         var module = zware.Module.init(alloc, owned);
         errdefer module.deinit();
         try module.decode();
+
+        try rejectOversizedInitialMemory(&module, policy);
 
         // Classify the module by its imports (embed-wasm.md M3). A UDF that imports nothing is a
         // self-contained scalar UDF. A UDF that imports only the allowlisted `kaidb.*` column
@@ -410,6 +423,8 @@ pub const WasmAggFn = struct {
         var module = zware.Module.init(alloc, owned);
         errdefer module.deinit();
         try module.decode();
+
+        try rejectOversizedInitialMemory(&module, policy);
 
         // An aggregate is self-contained: it folds a value passed as a parameter and keeps its
         // own state, so it imports nothing. Reject any import (a clock, WASI, randomness, or the

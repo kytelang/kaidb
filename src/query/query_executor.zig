@@ -4439,6 +4439,16 @@ pub const QueryExecutor = struct {
             defer self.rwUnlockShared(io);
             return try self.executeStatementInternal(stmt);
         } else {
+            // This branch needs the db rw_lock EXCLUSIVE (DDL, or a multi-table / no-single-table
+            // write). A nested in-process statement (a trigger's kaidb_exec, wasm_exec_depth > 0)
+            // skips rw_lock acquisition, which is only safe when the outer holds a strong-enough
+            // mode. A trigger's outer DML holds rw_lock merely SHARED, so a nested exclusive-needing
+            // statement would under-lock and race concurrent readers/writers. Reject it rather than
+            // corrupt the catalog (embed-wasm.md 11.6; matches the v1 posture of refusing what the
+            // in-process path cannot yet do safely). Top-level statements are unaffected.
+            if (wasm_exec_depth > 0) {
+                return QueryResponse{ .error_message = try self.allocator.dupe(u8, "in-process nested statement cannot run DDL or a multi-table write") };
+            }
             self.rwLock(io);
             defer self.rwUnlock(io);
             return try self.executeStatementInternal(stmt);

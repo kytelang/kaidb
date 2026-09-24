@@ -731,6 +731,13 @@ pub const Database = struct {
         const tree = try self.getTableTree(WASM_DEFS_TABLE);
         _ = tree.delete(key) catch {};
         try tree.insert(key, value);
+        // Persist the (possibly new) root page id into sys.objects, exactly as the DML/index write
+        // paths do via updateTableRootPageId. A large module row's insert can split the btree root
+        // (root_page_id changes); without this a checkpoint/clean-close hardens the split pages but
+        // sys.objects still records the OLD root, and a reopen reads a stale root, silently losing
+        // part of the registered-module/trigger catalog. updateTableRootPageId early-returns when the
+        // root did not move, so this is cheap on the common path.
+        try self.updateTableRootPageId(WASM_DEFS_TABLE, tree.root_page_id, tx_id);
         if (self.wal) |wal| {
             const lsn = self.reserveLsn();
             try wal.append(.{
@@ -749,6 +756,8 @@ pub const Database = struct {
     fn delWasmDefRow(self: *Database, key: []const u8, tx_id: u64) !void {
         const tree = try self.getTableTree(WASM_DEFS_TABLE);
         _ = tree.delete(key) catch {};
+        // A delete can collapse the btree root; persist the new root so a reopen is not misrooted.
+        try self.updateTableRootPageId(WASM_DEFS_TABLE, tree.root_page_id, tx_id);
         if (self.wal) |wal| {
             const lsn = self.reserveLsn();
             try wal.append(.{
@@ -2428,6 +2437,15 @@ pub const Database = struct {
             tid_name.deinit();
         }
 
+        // The catalog / tree-cache / wasm-registry teardown and rebuild below reallocates structures
+        // that reader threads (SELECTs served by a read replica) walk while holding rw_lock SHARED.
+        // Hold rw_lock EXCLUSIVE for the whole apply so a concurrent reader can never observe a freed
+        // BPlusTree, a freed TableMetadata, or a half-rebuilt registry (same discipline as vacuum and
+        // checkpoint, which also mutate the catalog under this lock).
+        const apply_io = self.pool.pager.io;
+        self.rw_lock.lock(apply_io);
+        defer self.rw_lock.unlock(apply_io);
+
         for (records) |rec| {
             if (!committed_txns.contains(rec.tx_id)) continue;
             if (rec.kind == .insert and std.mem.eql(u8, rec.table_name, "sys.tables")) {
@@ -2483,6 +2501,11 @@ pub const Database = struct {
                 },
                 else => {},
             }
+            // Persist a root split/collapse into the follower's own sys.objects, so a follower
+            // restart is not misrooted (mirrors putWasmDefRow on the leader).
+            if (self.getTableTree(WASM_DEFS_TABLE)) |t2|
+                self.updateTableRootPageId(WASM_DEFS_TABLE, t2.root_page_id, rec.tx_id) catch {}
+            else |_| {}
         }
         if (wasm_touched) self.reloadWasmRegistries();
 
