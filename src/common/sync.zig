@@ -286,4 +286,34 @@ pub const GroupLock = struct {
         self.wakeSuccessors(io);
         self.mutex.unlock(io);
     }
+
+    // Non-blocking variants: take the lock in the given mode only if it is admissible right now,
+    // returning false (without parking) otherwise. Used for a nested in-process statement that
+    // already holds another table's lock, so it must never BLOCK while holding one (the AB/BA
+    // deadlock precondition); it aborts on contention instead. The admission predicates mirror the
+    // blocking `lock*` methods exactly, and the caller releases with the matching `unlock*`.
+
+    pub fn tryLockRead(self: *GroupLock, io: Io) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.mode < 0 or self.exclusive_active or self.writer_waiters > 0 or self.exclusive_waiters > 0) return false;
+        self.mode += 1;
+        return true;
+    }
+
+    pub fn tryLockWrite(self: *GroupLock, io: Io) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.mode > 0 or self.exclusive_active or self.exclusive_waiters > 0) return false;
+        self.mode -= 1;
+        return true;
+    }
+
+    pub fn tryLockExclusive(self: *GroupLock, io: Io) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.mode != 0 or self.exclusive_active) return false;
+        self.exclusive_active = true;
+        return true;
+    }
 };

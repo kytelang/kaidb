@@ -782,6 +782,10 @@ pub const QueryExecutor = struct {
     /// (autocommit). [`executeWrapped`] opens an implicit transaction around a
     /// single statement when this is null.
     current_tx_id: ?u64 = null,
+    /// The current request's session token (hex), captured in [`execute`] so an in-process nested
+    /// statement can be authorised under the caller's principal (embed-wasm.md 11.7). Borrowed for
+    /// the request only; null when no token was supplied.
+    cur_token: ?[]const u8 = null,
     /// Projection pushdown: when non-null, [`getVisibleVersion`] materialises
     /// ONLY these columns of a scanned row instead of every column. Set (and
     /// restored) by the SELECT drain for simple single-table reads where the
@@ -3826,6 +3830,15 @@ pub const QueryExecutor = struct {
         // valid for the query; setting it every execute is a cheap idempotent store.
         query_iter.active_wasm_registry = &self.db.wasm_functions;
 
+        // Remember this request's session token so an in-process nested statement (a trigger /
+        // procedure's kaidb_exec) can run under the SAME principal (embed-wasm.md 11.7): runNestedFrame
+        // threads self.cur_token back into its execute(), so the nested statement is authorised under
+        // the caller's grants rather than being denied for a missing token. Saved/restored so nesting
+        // is balanced (the nested execute re-sets it to the same value).
+        const saved_cur_token = self.cur_token;
+        self.cur_token = req.session_token;
+        defer self.cur_token = saved_cur_token;
+
         // Record end-to-end latency of every top-level query into the shared
         // histogram, on all return/error paths. Monotonic clock; nanoseconds.
         const lat_io = self.db.pool.pager.io;
@@ -3903,6 +3916,94 @@ pub const QueryExecutor = struct {
     ///    finalisation.
     /// Transaction-boundary statements (BEGIN/COMMIT/...) bypass the autocommit
     /// wrapper and go straight to [`executeStatement`].
+    /// Authorise a DML statement against every table it references (embed-wasm.md / security review
+    /// finding C1). A SELECT is checked for SELECT on its driving table, all JOINed tables, and every
+    /// table reachable through WHERE / HAVING / JOIN-ON / aggregate-arg subqueries. An UPDATE/DELETE
+    /// is checked for its write privilege on the target and SELECT on any table its WHERE subqueries
+    /// read. `session` is a `*const SecurityManager.Session`. Returns `error.PermissionDenied` /
+    /// `error.Unauthenticated` on a denial (or `error.OutOfMemory` from the table collection).
+    fn authorizeDml(self: *QueryExecutor, session: anytype, stmt: ast.Statement) !void {
+        const sm = self.db.security_manager;
+        var tables = std.ArrayList([]const u8).empty;
+        defer tables.deinit(self.allocator);
+        switch (stmt) {
+            .select => |sel| {
+                try collectSelectTables(&sel, &tables, self.allocator);
+                for (tables.items) |t| try sm.checkObjectPermission(session, t, "SELECT");
+            },
+            .insert => |ins| try sm.checkObjectPermission(session, ins.table_name, "INSERT"),
+            .update => |upd| {
+                try sm.checkObjectPermission(session, upd.table_name, "UPDATE");
+                if (upd.where_expr) |w| try collectExprTables(w, &tables, self.allocator);
+                for (tables.items) |t| try sm.checkObjectPermission(session, t, "SELECT");
+            },
+            .delete => |del| {
+                try sm.checkObjectPermission(session, del.table_name, "DELETE");
+                if (del.where_expr) |w| try collectExprTables(w, &tables, self.allocator);
+                for (tables.items) |t| try sm.checkObjectPermission(session, t, "SELECT");
+            },
+            else => {},
+        }
+    }
+
+    /// Append every table a SELECT references (driving table, JOINed tables, and any table reachable
+    /// through its predicate / aggregate-arg subqueries). Recurses into nested SELECTs.
+    fn collectSelectTables(sel: *const ast.SelectStmt, out: *std.ArrayList([]const u8), a: Allocator) std.mem.Allocator.Error!void {
+        try out.append(a, sel.table_name);
+        for (sel.joins) |j| {
+            try out.append(a, j.right_table);
+            try collectExprTables(j.on_expr, out, a);
+        }
+        if (sel.where_expr) |w| try collectExprTables(w, out, a);
+        if (sel.having_expr) |h| try collectExprTables(h, out, a);
+        for (sel.projections) |p| switch (p.expr) {
+            .aggregate => |agg| switch (agg.argument) {
+                .expression => |e| try collectExprTables(e, out, a),
+                else => {},
+            },
+            else => {},
+        };
+    }
+
+    /// Append every table an expression can read through a (scalar or IN) subquery, recursively.
+    fn collectExprTables(e: *const ast.Expr, out: *std.ArrayList([]const u8), a: Allocator) std.mem.Allocator.Error!void {
+        switch (e.*) {
+            .subquery => |s| try collectSelectTables(s, out, a),
+            .in_subquery => |isq| {
+                try collectExprTables(isq.operand, out, a);
+                try collectSelectTables(isq.subquery, out, a);
+            },
+            .binary_op => |b| {
+                try collectExprTables(b.left, out, a);
+                try collectExprTables(b.right, out, a);
+            },
+            .unary_not => |u| try collectExprTables(u, out, a),
+            .is_null => |n| try collectExprTables(n.operand, out, a),
+            .in_list => |il| {
+                try collectExprTables(il.operand, out, a);
+                for (il.items) |it| try collectExprTables(it, out, a);
+            },
+            .like => |l| {
+                try collectExprTables(l.operand, out, a);
+                try collectExprTables(l.pattern, out, a);
+            },
+            .between => |bt| {
+                try collectExprTables(bt.operand, out, a);
+                try collectExprTables(bt.lo, out, a);
+                try collectExprTables(bt.hi, out, a);
+            },
+            .func_call => |fc| for (fc.args) |arg| try collectExprTables(arg, out, a),
+            .case_expr => |c| {
+                for (c.whens) |w| {
+                    try collectExprTables(w.cond, out, a);
+                    try collectExprTables(w.result, out, a);
+                }
+                if (c.else_result) |er| try collectExprTables(er, out, a);
+            },
+            else => {},
+        }
+    }
+
     fn executeWrapped(self: *QueryExecutor, req: QueryRequest) anyerror!QueryResponse {
         if (std.mem.startsWith(u8, req.sql, "SET FENCE EPOCH ")) {
             if (try self.adminGate(req)) |deny| return deny;
@@ -4063,23 +4164,13 @@ pub const QueryExecutor = struct {
                     };
 
                     switch (stmt) {
-                        .select => |sel| {
-                            self.db.security_manager.checkObjectPermission(&session, sel.table_name, "SELECT") catch {
-                                return QueryResponse{ .error_message = try self.allocator.dupe(u8, "Permission Denied") };
-                            };
-                        },
-                        .insert => |ins| {
-                            self.db.security_manager.checkObjectPermission(&session, ins.table_name, "INSERT") catch {
-                                return QueryResponse{ .error_message = try self.allocator.dupe(u8, "Permission Denied") };
-                            };
-                        },
-                        .update => |upd| {
-                            self.db.security_manager.checkObjectPermission(&session, upd.table_name, "UPDATE") catch {
-                                return QueryResponse{ .error_message = try self.allocator.dupe(u8, "Permission Denied") };
-                            };
-                        },
-                        .delete => |del| {
-                            self.db.security_manager.checkObjectPermission(&session, del.table_name, "DELETE") catch {
+                        .select, .insert, .update, .delete => {
+                            // Authorise EVERY table the statement reads or writes, not just the primary
+                            // one: a SELECT's JOINed and subquery tables, and an UPDATE/DELETE's
+                            // WHERE-subquery reads, are all checked, so a grant on one table cannot be
+                            // used to reach another through a JOIN or `IN (SELECT ...)`.
+                            self.authorizeDml(&session, stmt) catch |err| {
+                                if (err == error.OutOfMemory) return err;
                                 return QueryResponse{ .error_message = try self.allocator.dupe(u8, "Permission Denied") };
                             };
                         },
@@ -4223,7 +4314,11 @@ pub const QueryExecutor = struct {
             self.deadline_ms = saved_deadline;
         }
 
-        const resp = self.execute(.{ .sql = sql }) catch |err| {
+        // Run under the caller's session token so the nested statement is authorised as the caller
+        // (embed-wasm.md 11.7): with the security manager enabled it inherits the caller's grants and
+        // is object-checked (including every table it joins/subqueries), rather than being denied for
+        // a missing token or bypassing authorisation.
+        const resp = self.execute(.{ .sql = sql, .session_token = self.cur_token }) catch |err| {
             var buf: [160]u8 = undefined;
             const m = std.fmt.bufPrint(&buf, "XX000:in-process execution error: {s}", .{@errorName(err)}) catch "XX000:in-process execution error";
             return encodeNestedInto(self.allocator, out, .{ .err = m });
@@ -4416,10 +4511,24 @@ pub const QueryExecutor = struct {
             const key: *const anyopaque = @ptrCast(tl);
             const borrow = tableLockHeld(key);
             if (!borrow) {
-                switch (mode) {
-                    .read => tl.lockRead(io),
-                    .write => tl.lockWrite(io),
-                    .exclusive => tl.lockExclusive(io),
+                if (wasm_exec_depth > 0) {
+                    // A nested in-process statement (a trigger's kaidb_exec) already holds the outer
+                    // statement's table lock. Blocking here to acquire a DIFFERENT table's lock is the
+                    // AB/BA deadlock precondition (security review B3): two sessions could each hold one
+                    // table and wait on the other. Acquire no-wait instead and abort on contention; a
+                    // non-contended acquisition (e.g. a trigger writing an audit table) still succeeds.
+                    const got = switch (mode) {
+                        .read => tl.tryLockRead(io),
+                        .write => tl.tryLockWrite(io),
+                        .exclusive => tl.tryLockExclusive(io),
+                    };
+                    if (!got) return QueryResponse{ .error_message = try self.allocator.dupe(u8, "in-process nested statement aborted: table lock busy (deadlock avoidance)") };
+                } else {
+                    switch (mode) {
+                        .read => tl.lockRead(io),
+                        .write => tl.lockWrite(io),
+                        .exclusive => tl.lockExclusive(io),
+                    }
                 }
                 pushTableLock(key);
             }

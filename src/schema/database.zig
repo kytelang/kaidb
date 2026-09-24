@@ -134,6 +134,9 @@ const WasmAggRegistry = @import("../wasm/registry.zig").AggRegistry;
 /// durability, doublewrite protection, crash-consistency, and follower replication, replacing the
 /// former loose `.w*` files.
 pub const WASM_DEFS_TABLE = "sys.wasm_modules";
+/// DoS cap on the number of registered DML triggers (security review D5), parallel to the wasm
+/// registries' MAX_REGISTERED. A CREATE TRIGGER past this is rejected.
+pub const MAX_TRIGGERS: usize = 1024;
 pub const WASM_KIND_FUNCTION: u8 = 'F';
 pub const WASM_KIND_AGGREGATE: u8 = 'A';
 pub const WASM_KIND_PROCEDURE: u8 = 'P';
@@ -827,6 +830,14 @@ pub const Database = struct {
     /// persisted value is `[timing u8][event u8][table_len u32][table][fn_len u32][fn]`, keyed by
     /// the trigger's (upper-cased) name.
     pub fn registerTrigger(self: *Database, def: TriggerDef, tx_id: u64) !void {
+        // DoS cap (security review D5): bound the number of registered triggers, mirroring the
+        // per-registry MAX_REGISTERED cap on functions/aggregates/procedures. Replacing an existing
+        // same-named trigger is always allowed; a genuinely NEW trigger past the cap is rejected.
+        const exists = for (self.wasm_triggers.items) |t| {
+            if (std.mem.eql(u8, t.name, def.name)) break true;
+        } else false;
+        if (!exists and self.wasm_triggers.items.len >= MAX_TRIGGERS) return error.TooManyTriggers;
+
         // Replace an existing same-named trigger.
         self.unregisterTrigger(def.name, tx_id);
         const owned = TriggerDef{

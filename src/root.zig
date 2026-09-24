@@ -7434,3 +7434,110 @@ test "wasm in-process trigger: a BEFORE INSERT trigger writes its own table via 
         try std.testing.expectEqualStrings("0", res.rows[1][1]);
     }
 }
+
+test "authz C1: JOIN and subquery tables are permission-checked, not just the primary" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_authz_c1.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+    var db = try Database.open(allocator, io, db_path, 64, null);
+    defer db.close();
+    db.security_manager.enabled = true;
+    var exec = QueryExecutor.init(allocator, db);
+    defer exec.deinit();
+
+    const login = struct {
+        fn tok(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) ![]u8 {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+            return a.dupe(u8, res.rows[0][0]);
+        }
+    };
+    const admin = try login.tok(&exec, allocator, "LOGIN admin 'admin'");
+    defer allocator.free(admin);
+
+    const okAs = struct {
+        fn run(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8, token: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql, .session_token = token });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+    };
+    try okAs.run(&exec, allocator, "CREATE TABLE t1 (id INT PRIMARY KEY, v INT)", admin);
+    try okAs.run(&exec, allocator, "CREATE TABLE t2 (id INT PRIMARY KEY, secret INT)", admin);
+    try okAs.run(&exec, allocator, "INSERT INTO t1 (id, v) VALUES (1, 10)", admin);
+    try okAs.run(&exec, allocator, "INSERT INTO t2 (id, secret) VALUES (1, 999)", admin);
+    // A user with NO global privileges (role 'none') and a single object grant on t1 only.
+    try okAs.run(&exec, allocator, "CREATE USER guest IDENTIFIED BY 'gpw' ROLE 'none'", admin);
+    try okAs.run(&exec, allocator, "GRANT SELECT ON t1 TO guest", admin);
+    const guest = try login.tok(&exec, allocator, "LOGIN guest 'gpw'");
+    defer allocator.free(guest);
+
+    // Allowed: reading the granted table.
+    try okAs.run(&exec, allocator, "SELECT id FROM t1", guest);
+
+    const denied = struct {
+        fn run(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8, token: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql, .session_token = token });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message != null);
+            try std.testing.expect(std.mem.indexOf(u8, res.error_message.?, "Permission Denied") != null);
+        }
+    };
+    // Denied: reaching t2 through a JOIN, an IN-subquery, or directly (no grant, no global read).
+    try denied.run(&exec, allocator, "SELECT t1.id FROM t1 JOIN t2 ON t1.id = t2.id", guest);
+    try denied.run(&exec, allocator, "SELECT id FROM t1 WHERE id IN (SELECT id FROM t2)", guest);
+    try denied.run(&exec, allocator, "SELECT id FROM t2", guest);
+}
+
+test "SQL escaping: a doubled single-quote is one embedded apostrophe (not a broken literal)" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const db_path = "test_sql_quote.db";
+    defer Io.Dir.deleteFile(.cwd(), io, db_path) catch {};
+
+    const Database = @import("schema.zig").Database;
+    const QueryExecutor = @import("query/query_executor.zig").QueryExecutor;
+    var db = try Database.open(allocator, io, db_path, 64, null);
+    defer db.close();
+    var exec = QueryExecutor.init(allocator, db);
+    defer exec.deinit();
+
+    const q = struct {
+        fn run(e: *QueryExecutor, a: std.mem.Allocator, sql: []const u8) !void {
+            const res = try e.execute(.{ .sql = sql });
+            defer freeResp(a, res);
+            try std.testing.expect(res.error_message == null);
+        }
+    };
+    try q.run(&exec, allocator, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
+    // 'O''Brien' is the SQL literal for the 8-char string O'Brien.
+    try q.run(&exec, allocator, "INSERT INTO t (id, name) VALUES (1, 'O''Brien')");
+
+    // Stored and read back with a single apostrophe.
+    {
+        const res = try exec.execute(.{ .sql = "SELECT name FROM t WHERE id = 1" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+        try std.testing.expectEqual(@as(usize, 1), res.rows.len);
+        try std.testing.expectEqualStrings("O'Brien", res.rows[0][0]);
+    }
+    // The same escaped literal matches in a predicate (the emitter/lexer now agree).
+    {
+        const res = try exec.execute(.{ .sql = "SELECT id FROM t WHERE name = 'O''Brien'" });
+        defer freeResp(allocator, res);
+        try std.testing.expect(res.error_message == null);
+        try std.testing.expectEqual(@as(usize, 1), res.rows.len);
+        try std.testing.expectEqualStrings("1", res.rows[0][0]);
+    }
+}

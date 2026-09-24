@@ -185,6 +185,25 @@ pub const Parser = struct {
         return self.source[tok.start..(tok.start + tok.len)];
     }
 
+    /// The materialised value of a STRING token: like [`sliceText`], but collapses each escaped
+    /// doubled quote `''` back to a single `'` (the SQL-standard escape the lexer preserves in the
+    /// span, and which the param emitter in `proto/command.zig` produces for a `'` in a bound value).
+    /// When the span has no `''` it returns the borrowed source slice unchanged (the common, zero-copy
+    /// case); otherwise it allocates the collapsed value from the parser arena, which owns it for the
+    /// life of the tree. This is what makes `WHERE name = 'O''Brien'` bind/compare as `O'Brien`.
+    fn stringValue(self: *Parser, tok: Token) ![]const u8 {
+        const raw = self.source[tok.start..(tok.start + tok.len)];
+        if (std.mem.indexOfScalar(u8, raw, '\'') == null) return raw;
+        const a = self.arena.allocator();
+        var out = std.ArrayList(u8).empty;
+        var i: usize = 0;
+        while (i < raw.len) : (i += 1) {
+            try out.append(a, raw[i]);
+            if (raw[i] == '\'' and i + 1 < raw.len and raw[i + 1] == '\'') i += 1; // skip the paired quote
+        }
+        return out.items;
+    }
+
     /// Parses a wasm-backed generated-column expression `fn(col {, col})` after the `AS`
     /// keyword (embed-wasm.md M4) and returns its raw source text as a borrowed slice (for
     /// example `DBL(x)`). The text is stored in the catalog and re-parsed at insert time to
@@ -514,7 +533,7 @@ pub const Parser = struct {
             },
             .STRING => {
                 self.eat();
-                node.* = .{ .literal_text = self.sliceText(tok) };
+                node.* = .{ .literal_text = try self.stringValue(tok) };
                 return node;
             },
             .PLACEHOLDER => {

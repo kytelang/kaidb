@@ -369,14 +369,26 @@ pub const Lexer = struct {
     /// Consumes the leading `'`, records the span of the inner text (quotes
     /// excluded), then consumes the closing `'` if present. An unterminated
     /// string is tolerated, not an error: the loop stops at end of input and
-    /// the token covers everything up to there. There is currently no escape or
-    /// doubled-quote (`''`) handling, so the first inner `'` always ends the
-    /// literal. Returns a [`TokenType.STRING`] token; the error union exists to
-    /// match [`Lexer.nextToken`]'s signature and is never actually returned.
+    /// the token covers everything up to there. A doubled quote (`''`) is an
+    /// escaped single quote INSIDE the literal (SQL standard), so it does not
+    /// terminate the string; both quotes are consumed and the span keeps them
+    /// literally, to be collapsed to a single `'` when the value is materialised
+    /// (see the parser's `stringValue`). This must agree with the param emitter
+    /// (`proto/command.zig`), which escapes a `'` in a bound value by doubling it.
+    /// Returns a [`TokenType.STRING`] token; the error union exists to match
+    /// [`Lexer.nextToken`]'s signature and is never actually returned.
     fn readString(self: *Lexer) !Token {
         self.advance();
         const start = self.pos;
-        while (self.peek() != 0 and self.peek() != '\'') {
+        while (self.peek() != 0) {
+            if (self.peek() == '\'') {
+                if (self.peekNext() == '\'') {
+                    self.advance();
+                    self.advance();
+                    continue;
+                }
+                break; // a lone quote closes the literal
+            }
             self.advance();
         }
         const token = Token{
